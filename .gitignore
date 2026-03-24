@@ -1,0 +1,27 @@
+*.tar
+*.tar.*
+*.jar
+*.exe
+*.msi
+*.deb
+*.zip
+*.tgz
+*.log
+*.log.*
+*.sig
+
+pkg/
+src/
+.env
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+ 
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
