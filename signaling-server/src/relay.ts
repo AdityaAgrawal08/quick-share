@@ -10,6 +10,12 @@ const RELAY_TYPES = new Set(['offer', 'answer', 'ice'])
 // A 64KB cap stops malicious large messages from blocking the event loop.
 const MAX_WS_MSG_BYTES = 64 * 1024 // 64 KB
 
+// FIX 10: WebSocket message rate limiting per connection.
+// Prevents a malicious actor from flooding the relay with offer/answer/ICE.
+// Limit: 100 messages per minute per connection.
+const RATE_LIMIT_WINDOW_MS = 60 * 1000  // 1 minute
+const RATE_LIMIT_MAX_MSGS   = 100
+
 interface PeerContext {
   code: string | null
   role: PeerRole | null
@@ -17,9 +23,32 @@ interface PeerContext {
 }
 
 export function handleConnection(ws: WebSocket, _req: IncomingMessage): void {
-  const ctx: PeerContext = { code: null, role: null, peerId: null }
+  const ctx: PeerContext = { code: null, role: null, peerId: null };
+
+  // Heartbeat: mark as alive on pong
+  (ws as any).isAlive = true
+  ws.on('pong', () => {
+    (ws as any).isAlive = true
+  })
+
+  // Rate limiting: track message count per window
+  let messageCount = 0
+  let windowStart = Date.now()
 
   ws.on('message', (raw) => {
+    // FIX 10: Rate limit messages per connection
+    const now = Date.now()
+    if (now - windowStart > RATE_LIMIT_WINDOW_MS) {
+      messageCount = 0
+      windowStart = now
+    }
+    messageCount++
+    
+    if (messageCount > RATE_LIMIT_MAX_MSGS) {
+      console.warn(`[relay] rate limit exceeded (${messageCount} msg/min) — closing connection`)
+      ws.close(1008, 'Rate limit exceeded')
+      return
+    }
     // FIX 1: Reject oversized messages before JSON.parse
     const msgLength = Buffer.isBuffer(raw) ? raw.length : Buffer.byteLength(raw.toString())
     if (msgLength > MAX_WS_MSG_BYTES) {

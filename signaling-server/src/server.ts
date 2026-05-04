@@ -29,8 +29,27 @@ if (fs.existsSync(envPath)) {
 
 const PORT             = parseInt(process.env.PORT ?? '3001', 10)
 const TTL_MS           = parseInt(process.env.SESSION_TTL_MS ?? '86400000', 10)
-const ALLOWED_ORIGINS  = (process.env.ALLOWED_ORIGINS ?? '').split(',').map((s) => s.trim())
+const ALLOWED_ORIGINS  = (process.env.ALLOWED_ORIGINS ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
 const STORED_MAX_BYTES = 10 * 1024 * 1024
+
+type IceServer = {
+  urls: string | string[]
+  username?: string
+  credential?: string
+}
+
+let storedModeEnabled = false
+
+function requireStoredMode(_req: Request, res: Response, next: NextFunction) {
+  if (!storedModeEnabled) {
+    res.status(503).json({ error: 'stored_mode_disabled', message: 'Stored mode requires MongoDB (set MONGODB_URI)' })
+    return
+  }
+  next()
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -82,16 +101,53 @@ app.use(express.json())
 // CORS
 app.use((req: Request, res: Response, next: NextFunction) => {
   const origin = req.headers.origin ?? ''
+  
+  // If no origin header, don't set CORS headers (block the request)
+  if (!origin) {
+    next()
+    return
+  }
+  
   if (
     ALLOWED_ORIGINS.length === 0 ||
     ALLOWED_ORIGINS.includes('*') ||
     ALLOWED_ORIGINS.includes(origin)
   ) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*')
+    res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS')
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
   }
   if (req.method === 'OPTIONS') { res.sendStatus(204); return }
+  next()
+})
+
+// Security: enforce allowed Origin on unsafe methods.
+// This mitigates browser-based CSRF without requiring cookies/tokens.
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const origin = req.headers.origin
+  const method = req.method.toUpperCase()
+
+  if (!origin) {
+    next()
+    return
+  }
+
+  const isUnsafe = method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE'
+  if (!isUnsafe) {
+    next()
+    return
+  }
+
+  const allowed =
+    ALLOWED_ORIGINS.length === 0 ||
+    ALLOWED_ORIGINS.includes('*') ||
+    ALLOWED_ORIGINS.includes(origin)
+
+  if (!allowed) {
+    res.status(403).json({ error: 'Origin not allowed' })
+    return
+  }
+
   next()
 })
 
@@ -163,6 +219,7 @@ async function generateUniqueStoredCode(): Promise<string> {
 app.post(
   '/publish',
   publishLimiter,
+  requireStoredMode,
   upload.array('files'),
   async (req: Request, res: Response) => {
     try {
@@ -238,6 +295,7 @@ app.post(
 app.patch(
   '/publish/:code',
   patchLimiter,
+  requireStoredMode,
   upload.array('files'),
   async (req: Request, res: Response) => {
     try {
@@ -319,6 +377,13 @@ app.get('/retrieve/:code', retrieveLimiter, async (req: Request, res: Response) 
       return
     }
 
+    // If Mongo isn't configured, only live sessions can be retrieved.
+    if (!storedModeEnabled) {
+      const liveSession = getSession(code)
+      res.status(404).json({ error: liveSession ? 'live_session' : 'not_found' })
+      return
+    }
+
     // FIX 5: Single DB query — check expiresAt in JS to avoid a second round trip.
     const session = await StoredSession.findOne({ code }).lean()
 
@@ -358,6 +423,11 @@ app.get('/retrieve/:code', retrieveLimiter, async (req: Request, res: Response) 
 
 app.get('/file/:fileId/:token', fileLimiter, async (req: Request, res: Response) => {
   try {
+    if (!storedModeEnabled) {
+      res.status(503).json({ error: 'stored_mode_disabled' })
+      return
+    }
+
     const fileIdParam = req.params['fileId'] as string
     const tokenParam  = req.params['token']  as string
 
@@ -406,6 +476,19 @@ app.get('/file/:fileId/:token', fileLimiter, async (req: Request, res: Response)
   }
 })
 
+// ── GET /ice-servers — fetch ICE servers for WebRTC ──────────────────────────
+// Returns STUN servers always. TURN can be added here with dynamic credential fetching.
+// Phase 8: Integrate with Metered.ca or Cloudflare TURN for NAT traversal.
+
+app.get('/ice-servers', (req: Request, res: Response) => {
+  const iceServers: IceServer[] = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    // TODO Phase 8: Add TURN servers from env config
+    // { urls: 'turn:...', username: '...', credential: '...' },
+  ]
+  res.json({ iceServers })
+})
 // ── POST /session — live mode ─────────────────────────────────────────────────
 
 app.post('/session', sessionLimiter, (req: Request, res: Response) => {
@@ -427,6 +510,7 @@ app.get('/health', (_req: Request, res: Response) => {
     status:             'ok',
     activeLiveSessions: activeSessions(),
     mongoState:         mongoose.connection.readyState,
+    storedModeEnabled,
     uptime:             process.uptime(),
   })
 })
@@ -450,11 +534,32 @@ const wss = new WebSocketServer({
 wss.on('connection', handleConnection)
 wss.on('error', (err) => console.error('[wss] error:', err))
 
+// ── WebSocket Heartbeat ───────────────────────────────────────────────────────
+// Send ping every 30s to detect dead connections. Clients should respond with pong.
+const HEARTBEAT_INTERVAL_MS = 30 * 1000
+
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if ((ws as any).isAlive === false) {
+      ws.terminate()
+      return
+    }
+    (ws as any).isAlive = false
+    ws.ping()
+  })
+}, HEARTBEAT_INTERVAL_MS)
+if (heartbeatInterval.unref) heartbeatInterval.unref()
+
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 async function start() {
   try {
-    await connectDB()
+    if (process.env.MONGODB_URI) {
+      await connectDB()
+      storedModeEnabled = true
+    } else {
+      console.warn('[server] MONGODB_URI not set — starting in live-only mode (stored mode disabled)')
+    }
     server.listen(PORT, () => {
       console.log(`[server] running on :${PORT}`)
       console.log(`[server] stored mode: ≤${STORED_MAX_BYTES / 1024 / 1024} MB`)

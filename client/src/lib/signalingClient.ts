@@ -55,7 +55,7 @@ export class SignalingClient {
       }
     }
 
-    ws.onclose = (event) => {
+    ws.onclose = (_event) => {
       this.ws = null
 
       if (this.intentionalClose) {

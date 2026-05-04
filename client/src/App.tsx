@@ -93,6 +93,8 @@ export default function App() {
   const [joining, setJoining]             = useState(false)
   const [joinError, setJoinError]         = useState('')
   const [countdown, setCountdown]         = useState('')
+  const [storedEnabled, setStoredEnabled] = useState(true)
+  const [publishError, setPublishError]   = useState('')
 
   const sigRef            = useRef<SignalingClient | null>(null)
   const rtcMapRef         = useRef<Map<string, WebRTCManager>>(new Map())
@@ -119,8 +121,23 @@ export default function App() {
     }
   }, [])
 
+  useEffect(() => {
+    // Detect whether server has Mongo configured (stored mode enabled).
+    fetch(`${API_URL}/health`)
+      .then(r => r.json())
+      .then((data: { storedModeEnabled?: boolean }) => {
+        if (typeof data.storedModeEnabled === 'boolean') setStoredEnabled(data.storedModeEnabled)
+      })
+      .catch(() => {
+        // Ignore; default stays true.
+      })
+  }, [])
+
   const totalBytes     = files.reduce((s, f) => s + f.size, 0)
-  const mode: PublishMode = publishedMode === 'stored' ? 'stored' : publishedMode === 'live' ? 'live' : totalBytes <= STORED_MAX ? 'stored' : 'live'
+  const mode: PublishMode =
+    publishedMode === 'stored' ? 'stored' :
+    publishedMode === 'live' ? 'live' :
+    (!storedEnabled ? 'live' : totalBytes <= STORED_MAX ? 'stored' : 'live')
   const hasPayload     = text.trim().length > 0 || files.length > 0
   const openRecipients = recipients.filter(r => r.channelState === 'open')
 
@@ -151,6 +168,7 @@ export default function App() {
   async function handleStoredPublish() {
     if (!hasPayload) return
     setPublishing(true)
+    setPublishError('')
     setUploadPercent(null)
     const isUpdate = publishedMode === 'stored' && code !== ''
     try {
@@ -172,6 +190,7 @@ export default function App() {
       })
       setUploadPercent(null)
       if (data.error) {
+        setPublishError(data.error)
         if (data.error.includes('not found') && isUpdate) { setCode(''); setPublishedMode(null) }
         setPublishing(false)
         return
@@ -181,21 +200,36 @@ export default function App() {
       setPublishedMode('stored')
     } catch {
       setUploadPercent(null)
+      setPublishError('Network error. Check your connection.')
     }
     setPublishing(false)
   }
 
   async function handleLivePublish() {
     setPublishing(true)
+    setPublishError('')
     await fetchIceServers()
     try {
-      const res  = await fetch(`${API_URL}/session`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ttlMs: 24 * 60 * 60 * 1000 }) })
+      const res  = await fetch(`${API_URL}/session`, { 
+        method: 'POST', 
+        headers: { 
+          'Content-Type': 'application/json',
+        }, 
+        body: JSON.stringify({ ttlMs: 24 * 60 * 60 * 1000 }) 
+      })
       const data = await res.json()
+      if (!res.ok) {
+        setPublishError((data as any)?.error ?? 'Failed to create session')
+        setPublishing(false)
+        return
+      }
       setCode(data.code)
       setPublishedMode('live')
       setExpiresAt(data.expiresAt)
       startSignaling(data.code, 'publisher')
-    } catch { /* connection error handled by UI state */ }
+    } catch {
+      setPublishError('Network error. Check your connection.')
+    }
     setPublishing(false)
   }
 
@@ -455,6 +489,7 @@ export default function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        html { scroll-behavior: smooth; }
         html, body { background: ${T.bg}; color: ${T.text}; font-family: ${T.sans}; min-height: 100vh; -webkit-text-size-adjust: 100%; }
         input, textarea, button, select { font-family: inherit; }
         button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
@@ -550,9 +585,20 @@ export default function App() {
               {mode === 'stored' && <TtlSlider />}
             </Card>
 
-            <Btn primary onClick={() => mode === 'stored' ? handleStoredPublish() : handleLivePublish()} disabled={!hasPayload || publishing} style={{ width: '100%', padding: '13px', minHeight: '48px' }}>
+            <Btn
+              primary
+              onClick={() => mode === 'stored' ? handleStoredPublish() : handleLivePublish()}
+              disabled={(mode === 'stored' && !hasPayload) || publishing}
+              style={{ width: '100%', padding: '13px', minHeight: '48px' }}
+            >
               {publishing ? <><Spinner /> Publishing...</> : 'Publish'}
             </Btn>
+
+            {publishError && (
+              <div style={{ marginTop: '10px', fontSize: '13px', color: T.red }}>
+                {publishError}
+              </div>
+            )}
           </div>
         )}
 

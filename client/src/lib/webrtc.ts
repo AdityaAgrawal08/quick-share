@@ -1,7 +1,7 @@
 import { SignalingClient } from './signalingClient'
 import type { SignalMessage, PeerRole } from '../types'
 
-const ICE_SERVERS: RTCIceServer[] = [
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
 ]
@@ -14,6 +14,7 @@ interface WebRTCManagerOptions {
   // Publisher uses it to tag outgoing signals; recipient uses it to tag signals back.
   peerId: string
   signalingClient: SignalingClient
+  iceServers?: RTCIceServer[]
   onChannelStateChange: (state: ChannelState) => void
   onChannelMessage?: (data: string | ArrayBuffer) => void
 }
@@ -24,26 +25,57 @@ export class WebRTCManager {
   private opts: WebRTCManagerOptions
   private pendingCandidates: RTCIceCandidateInit[] = []
   private remoteDescriptionSet = false
+  private gatheredCandidateTypes = new Set<string>()  // Track candidate types for debugging
 
   constructor(opts: WebRTCManagerOptions) {
     this.opts = opts
   }
 
   async start(): Promise<void> {
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    const servers = this.opts.iceServers ?? DEFAULT_ICE_SERVERS
+    this.pc = new RTCPeerConnection({ iceServers: servers })
 
     this.pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
+        const candidateType = candidate.type ?? 'unknown' // 'host', 'srflx', 'relay', 'prflx'
+        this.gatheredCandidateTypes.add(candidateType)
+        console.log(`[webrtc:${this.opts.peerId.slice(0, 8)}] ICE candidate: ${candidateType} (gathered: ${Array.from(this.gatheredCandidateTypes).join(',')})`)
+        
         this.opts.signalingClient.send({
           type: 'ice',
           payload: candidate.toJSON(),
           peerId: this.opts.peerId,
         })
+      } else {
+        // null candidate = candidate gathering complete
+        const types = Array.from(this.gatheredCandidateTypes)
+        if (types.length === 0) {
+          console.warn('[webrtc] No ICE candidates gathered — network interface may be unavailable')
+        } else if (!types.includes('host') && !types.includes('srflx')) {
+          console.warn('[webrtc] Only relay candidates gathered — may indicate NAT issue, TURN fallback in effect')
+        }
+        console.log(`[webrtc:${this.opts.peerId.slice(0, 8)}] ICE gathering complete: ${types.join(',')}`)
       }
     }
 
     this.pc.oniceconnectionstatechange = () => {
-      console.log(`[webrtc:${this.opts.peerId.slice(0, 8)}] ICE:`, this.pc?.iceConnectionState)
+      const state = this.pc?.iceConnectionState
+      console.log(`[webrtc:${this.opts.peerId.slice(0, 8)}] ICE:`, state)
+      
+      // FIX 7: Detect specific ICE failure modes
+      if (state === 'failed') {
+        // ICE failed to establish any connection. Possible reasons:
+        // - NAT/firewall blocking UDP
+        // - Symmetric NAT (needs TURN)
+        // - Misconfigured STUN/TURN
+        // - Network routing issue
+        console.error('[webrtc] ICE connection failed — possible NAT/firewall issue, TURN may be required')
+        this.opts.onChannelStateChange('error')
+      } else if (state === 'disconnected') {
+        // Connection was working but temporarily disconnected
+        // May recover or may fail completely
+        console.warn('[webrtc] ICE disconnected — network may be unstable')
+      }
     }
 
     this.pc.onconnectionstatechange = () => {
@@ -154,6 +186,7 @@ export class WebRTCManager {
     this.pc = null
     this.remoteDescriptionSet = false
     this.pendingCandidates = []
+    this.gatheredCandidateTypes.clear()
   }
 
   private setupChannel(channel: RTCDataChannel): void {
