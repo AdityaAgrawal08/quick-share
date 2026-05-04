@@ -34,6 +34,8 @@ const ALLOWED_ORIGINS  = (process.env.ALLOWED_ORIGINS ?? '')
   .map((s) => s.trim())
   .filter(Boolean)
 const STORED_MAX_BYTES = 10 * 1024 * 1024
+const STORED_TTL_MIN_MS = 10 * 60 * 1000
+const STORED_TTL_MAX_MS = 60 * 60 * 1000
 
 type IceServer = {
   urls: string | string[]
@@ -80,6 +82,14 @@ function isE11000(err: unknown): boolean {
     'code' in err &&
     (err as { code: unknown }).code === 11000
   )
+}
+
+function clampStoredTtlMs(ttlMs: number): number {
+  return Math.min(Math.max(ttlMs, STORED_TTL_MIN_MS), STORED_TTL_MAX_MS)
+}
+
+function getTextBytes(text: string): number {
+  return Buffer.byteLength(text, 'utf8')
 }
 
 // ── Multer ────────────────────────────────────────────────────────────────────
@@ -225,15 +235,12 @@ app.post(
     try {
       const text         = typeof req.body.text === 'string' ? req.body.text : ''
       const parsedTtl    = parseInt(req.body.ttlMs ?? '3600000', 10)
-      const ttlMs        = Math.min(
-        Math.max(Number.isNaN(parsedTtl) ? 3600000 : parsedTtl, 60 * 1000),
-        TTL_MS
-      )
+      const ttlMs        = clampStoredTtlMs(Number.isNaN(parsedTtl) ? STORED_TTL_MAX_MS : parsedTtl)
       const uploadedFiles = (req.files as Express.Multer.File[] | undefined) ?? []
 
-      const totalBytes = uploadedFiles.reduce((sum, f) => sum + f.size, 0)
+      const totalBytes = uploadedFiles.reduce((sum, f) => sum + f.size, 0) + getTextBytes(text)
       if (totalBytes > STORED_MAX_BYTES) {
-        res.status(400).json({ error: 'Total file size exceeds 10 MB limit for stored mode' })
+        res.status(400).json({ error: 'Total payload exceeds 10 MB limit for stored mode' })
         return
       }
 
@@ -307,15 +314,12 @@ app.patch(
 
       const text         = typeof req.body.text === 'string' ? req.body.text : ''
       const parsedTtl    = parseInt(req.body.ttlMs ?? '3600000', 10)
-      const ttlMs        = Math.min(
-        Math.max(Number.isNaN(parsedTtl) ? 3600000 : parsedTtl, 60 * 1000),
-        TTL_MS
-      )
+      const ttlMs        = clampStoredTtlMs(Number.isNaN(parsedTtl) ? STORED_TTL_MAX_MS : parsedTtl)
       const uploadedFiles = (req.files as Express.Multer.File[] | undefined) ?? []
 
-      const totalBytes = uploadedFiles.reduce((sum, f) => sum + f.size, 0)
+      const totalBytes = uploadedFiles.reduce((sum, f) => sum + f.size, 0) + getTextBytes(text)
       if (totalBytes > STORED_MAX_BYTES) {
-        res.status(400).json({ error: 'Total file size exceeds 10 MB limit for stored mode' })
+        res.status(400).json({ error: 'Total payload exceeds 10 MB limit for stored mode' })
         return
       }
 

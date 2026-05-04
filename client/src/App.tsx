@@ -7,8 +7,8 @@ import type { SignalMessage, PeerRole } from './types'
 
 const API_URL       = import.meta.env.VITE_API_URL ?? 'http://localhost:3001'
 const SIGNALING_URL = API_URL.replace(/^http/, 'ws')
-const TTL_MIN       = 60
-const TTL_MAX       = 24 * 60 * 60
+const STORED_TTL_MIN = 10 * 60
+const STORED_TTL_MAX = 60 * 60
 const STORED_MAX    = 10 * 1024 * 1024
 
 function formatTTL(s: number): string {
@@ -21,6 +21,16 @@ function formatBytes(b: number): string {
   if (b < 1024) return `${b} B`
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`
   return `${(b / 1024 / 1024).toFixed(1)} MB`
+}
+
+function getTextBytes(text: string): number {
+  return new TextEncoder().encode(text).length
+}
+
+function splitStoredTtl(seconds: number): { hours: number; minutes: number } {
+  const clamped = Math.min(Math.max(seconds, STORED_TTL_MIN), STORED_TTL_MAX)
+  if (clamped >= STORED_TTL_MAX) return { hours: 1, minutes: 0 }
+  return { hours: 0, minutes: Math.max(10, Math.round(clamped / 60)) }
 }
 
 function formatCountdown(ms: number): string {
@@ -76,7 +86,7 @@ export default function App() {
   const [inputCode, setInputCode]     = useState('')
   const [text, setText]               = useState('')
   const [files, setFiles]             = useState<File[]>([])
-  const [ttlSeconds, setTtlSeconds]   = useState(3600)
+  const [ttlSeconds, setTtlSeconds]   = useState(STORED_TTL_MAX)
   const [publishing, setPublishing]   = useState(false)
   const [uploadPercent, setUploadPercent] = useState<number | null>(null)
   const [publishedMode, setPublishedMode] = useState<PublishMode | null>(null)
@@ -134,10 +144,12 @@ export default function App() {
   }, [])
 
   const totalBytes     = files.reduce((s, f) => s + f.size, 0)
+  const textBytes      = getTextBytes(text)
+  const payloadBytes   = totalBytes + textBytes
   const mode: PublishMode =
     publishedMode === 'stored' ? 'stored' :
     publishedMode === 'live' ? 'live' :
-    (!storedEnabled ? 'live' : totalBytes <= STORED_MAX ? 'stored' : 'live')
+    payloadBytes <= STORED_MAX ? 'stored' : 'live'
   const hasPayload     = text.trim().length > 0 || files.length > 0
   const openRecipients = recipients.filter(r => r.channelState === 'open')
 
@@ -165,6 +177,22 @@ export default function App() {
     e.target.value = ''
   }
 
+  function clampStoredTtl(seconds: number): number {
+    return Math.min(Math.max(seconds, STORED_TTL_MIN), STORED_TTL_MAX)
+  }
+
+  function setStoredDuration(hoursValue: number, minutesValue: number) {
+    const hours = Number.isFinite(hoursValue) ? Math.max(0, Math.min(1, Math.trunc(hoursValue))) : 0
+    const minutes = Number.isFinite(minutesValue) ? Math.max(0, Math.min(59, Math.trunc(minutesValue))) : 0
+
+    if (hours >= 1) {
+      setTtlSeconds(STORED_TTL_MAX)
+      return
+    }
+
+    setTtlSeconds(clampStoredTtl(Math.max(10, minutes) * 60))
+  }
+
   async function handleStoredPublish() {
     if (!hasPayload) return
     setPublishing(true)
@@ -174,7 +202,7 @@ export default function App() {
     try {
       const form = new FormData()
       form.append('text', text)
-      form.append('ttlMs', String(ttlSeconds * 1000))
+      form.append('ttlMs', String(clampStoredTtl(ttlSeconds) * 1000))
       files.forEach(f => form.append('files', f))
       const url    = isUpdate ? `${API_URL}/publish/${code}` : `${API_URL}/publish`
       const method = isUpdate ? 'PATCH' : 'POST'
@@ -462,26 +490,84 @@ export default function App() {
           </Pill>
         ))}
         <div style={{ width: '100%', fontSize: '12px', color: T.muted, marginTop: '2px' }}>
-          {formatBytes(totalBytes)}{totalBytes > STORED_MAX && <span style={{ color: T.amber, marginLeft: '8px' }}>↑ live mode</span>}
+          {formatBytes(payloadBytes)} total{payloadBytes > STORED_MAX && <span style={{ color: T.amber, marginLeft: '8px' }}>↑ live mode</span>}
         </div>
       </div>
     )
   }
 
-  function TtlSlider() {
+  function DurationPicker() {
+    const parts = splitStoredTtl(ttlSeconds)
+
     return (
       <div style={{ marginTop: '14px' }}>
-        <div style={{ fontSize: '12px', color: T.muted, marginBottom: '6px' }}>
-          Duration: <span style={{ color: T.text, fontFamily: T.mono }}>{formatTTL(ttlSeconds)}</span>
+        <div style={{ fontSize: '12px', color: T.muted, marginBottom: '8px' }}>
+          Duration <span style={{ color: T.text, fontFamily: T.mono, marginLeft: '6px' }}>{formatTTL(ttlSeconds)}</span>
         </div>
-        <input type="range" min={TTL_MIN} max={TTL_MAX} step={60} value={ttlSeconds}
-          onChange={e => setTtlSeconds(Number(e.target.value))}
-          style={{ width: '100%', accentColor: T.accent, cursor: 'pointer' }} />
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: T.dim, marginTop: '3px' }}>
-          <span>1 min</span><span>24 hr</span>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '1fr auto 1fr',
+            gap: '10px',
+            alignItems: 'stretch',
+            padding: '10px',
+            borderRadius: T.radius,
+            border: `1px solid ${T.borderHi}`,
+            background: `linear-gradient(180deg, ${T.surface}, #0b0c0f)`,
+            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.02)',
+          }}
+        >
+          <label style={{ display: 'grid', gap: '6px' }}>
+            <span style={{ fontSize: '11px', color: T.dim, letterSpacing: '1px', textTransform: 'uppercase' }}>hr</span>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              value={parts.hours}
+              inputMode="numeric"
+              onChange={e => setStoredDuration(Number(e.target.value), parts.minutes)}
+              style={{ ...durationInputStyle(), textAlign: 'center', fontFamily: T.mono }}
+            />
+          </label>
+
+          <div style={{ display: 'flex', alignItems: 'end', justifyContent: 'center', paddingBottom: '12px', color: T.dim, fontFamily: T.mono }}>
+            :
+          </div>
+
+          <label style={{ display: 'grid', gap: '6px' }}>
+            <span style={{ fontSize: '11px', color: T.dim, letterSpacing: '1px', textTransform: 'uppercase' }}>min</span>
+            <input
+              type="number"
+              min={0}
+              max={59}
+              value={parts.minutes}
+              inputMode="numeric"
+              onChange={e => setStoredDuration(parts.hours, Number(e.target.value))}
+              style={{ ...durationInputStyle(), textAlign: 'center', fontFamily: T.mono }}
+            />
+          </label>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: T.dim, marginTop: '4px' }}>
+          <span>10 min</span>
+          <span>1 hr</span>
         </div>
       </div>
     )
+  }
+
+  function durationInputStyle(): React.CSSProperties {
+    return {
+      width: '100%',
+      minHeight: '56px',
+      borderRadius: T.radiusSm,
+      border: `1px solid ${T.border}`,
+      background: '#090a0d',
+      color: T.text,
+      fontSize: '20px',
+      fontWeight: 600,
+      outline: 'none',
+      padding: '0 12px',
+    }
   }
 
   return (
@@ -579,10 +665,15 @@ export default function App() {
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: mode === 'stored' ? T.green : T.amber, flexShrink: 0 }} />
                 <span style={{ fontSize: '13px', color: mode === 'stored' ? T.green : T.amber }}>
-                  {mode === 'stored' ? 'Stored — disconnect after publishing' : 'Live — stay connected while recipients join'}
+                  {mode === 'stored' ? 'Stored in MongoDB — you can leave after publishing' : 'Live — stay connected while recipients join'}
                 </span>
               </div>
-              {mode === 'stored' && <TtlSlider />}
+              {mode === 'stored' && <DurationPicker />}
+              {!storedEnabled && mode === 'stored' && (
+                <div style={{ marginTop: '10px', fontSize: '12px', color: T.amber }}>
+                  MongoDB is not enabled on the server right now, so stored publishing is unavailable until it is connected.
+                </div>
+              )}
             </Card>
 
             <Btn
@@ -620,7 +711,7 @@ export default function App() {
                   {countdown === 'Expired' ? '⚠ Expired' : `Expires in ${countdown}`}
                 </div>
               )}
-              <div style={{ marginTop: '6px', fontSize: '12px', color: T.dim }}>You can close this tab. Edit below to update.</div>
+              <div style={{ marginTop: '6px', fontSize: '12px', color: T.dim }}>You can close this tab. Edit below to update the stored session.</div>
             </Card>
 
             <Card>
@@ -635,9 +726,9 @@ export default function App() {
                 <input type="file" multiple onChange={handleFileChange} style={{ color: T.muted, fontSize: '13px', width: '100%' }} />
                 {files.length > 0 && <FilePills fileList={files} onRemove={i => setFiles(prev => prev.filter((_, j) => j !== i))} />}
               </div>
-              <TtlSlider />
-              {totalBytes > STORED_MAX && (
-                <div style={{ marginTop: '10px', fontSize: '12px', color: T.red }}>Total files exceed 10 MB — remove some files.</div>
+              <DurationPicker />
+              {payloadBytes > STORED_MAX && (
+                <div style={{ marginTop: '10px', fontSize: '12px', color: T.red }}>Total payload exceeds 10 MB — switch to live mode or reduce content.</div>
               )}
               {uploadPercent !== null && (
                 <div style={{ marginTop: '12px' }}>
@@ -645,7 +736,7 @@ export default function App() {
                   <div style={{ fontSize: '11px', color: T.muted, marginTop: '4px' }}>Uploading {uploadPercent}%</div>
                 </div>
               )}
-              <Btn primary onClick={handleStoredPublish} disabled={!hasPayload || publishing || totalBytes > STORED_MAX} style={{ width: '100%', marginTop: '14px', minHeight: '44px' }}>
+              <Btn primary onClick={handleStoredPublish} disabled={!hasPayload || publishing || payloadBytes > STORED_MAX} style={{ width: '100%', marginTop: '14px', minHeight: '44px' }}>
                 {publishing ? <><Spinner /> Updating...</> : 'Publish update'}
               </Btn>
             </Card>
