@@ -27,6 +27,8 @@ export interface TransferProgress {
   bytesDone: number
   percent: number
   currentFile: string | null
+  speed?: number        // bytes/sec
+  timeRemaining?: number // seconds
 }
 
 export type SendProgressCallback = (progress: TransferProgress) => void
@@ -71,6 +73,7 @@ export async function sendTransfer(
 
   let chunksDone = 0
   let bytesDone = 0
+  const startTime = Date.now()
 
   try {
     for (const file of files) {
@@ -101,6 +104,11 @@ export async function sendTransfer(
         bytesDone += buffer.byteLength
         offset += buffer.byteLength
 
+        const elapsedSec = (Date.now() - startTime) / 1000
+        const speed = elapsedSec > 0 ? bytesDone / elapsedSec : 0
+        const remainingBytes = totalBytes - bytesDone
+        const timeRemaining = speed > 0 ? remainingBytes / speed : 0
+
         onProgress({
           chunksTotal: totalChunks,
           chunksDone,
@@ -108,6 +116,8 @@ export async function sendTransfer(
           bytesDone,
           percent: Math.round((bytesDone / totalBytes) * 100),
           currentFile: file.name,
+          speed,
+          timeRemaining,
         })
       }
     }
@@ -185,6 +195,7 @@ export class TransferReceiver {
   private onAbort: (reason: string) => void
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null
   private lastChunkTime = 0
+  private startTime = 0
 
   constructor(
     onProgress: ReceiveProgressCallback,
@@ -256,6 +267,7 @@ export class TransferReceiver {
       this.totalBytesDone = 0
       this.totalChunksDone = 0
       this.finalized = false
+      this.startTime = Date.now()
       this.resetInactivityTimer()  // Start timeout when metadata arrives
       console.log('[transfer] meta received:', msg.files.map((f) => f.name))
     }
@@ -292,6 +304,11 @@ export class TransferReceiver {
     const percent = totalBytes > 0 ? Math.round((this.totalBytesDone / totalBytes) * 100) : 100
     const currentFileName = files[Math.min(this.currentFileIndex, files.length - 1)]?.name ?? null
 
+    const elapsedSec = (Date.now() - this.startTime) / 1000
+    const speed = elapsedSec > 0 ? this.totalBytesDone / elapsedSec : 0
+    const remainingBytes = totalBytes - this.totalBytesDone
+    const timeRemaining = speed > 0 ? remainingBytes / speed : 0
+
     this.onProgress({
       chunksTotal: this.meta.totalChunks,
       chunksDone: this.totalChunksDone,
@@ -299,6 +316,8 @@ export class TransferReceiver {
       bytesDone: this.totalBytesDone,
       percent,
       currentFile: currentFileName,
+      speed,
+      timeRemaining,
     })
   }
 

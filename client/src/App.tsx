@@ -3,6 +3,7 @@ import { QRCodeSVG } from 'qrcode.react'
 import { SignalingClient } from './lib/signalingClient'
 import { WebRTCManager, type ChannelState } from './lib/webrtc'
 import { TransferReceiver, sendTransfer, type TransferProgress, type ReceivedTransfer, type ReceivedFile } from './lib/transfer'
+import { encrypt, decrypt, arrayBufferToBase64, base64ToArrayBuffer } from './lib/crypto'
 import type { SignalMessage, PeerRole } from './types'
 
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001'
@@ -21,6 +22,18 @@ function formatBytes(b: number): string {
   if (b < 1024) return `${b} B`
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`
   return `${(b / 1024 / 1024).toFixed(1)} MB`
+}
+
+function formatSpeed(bps: number): string {
+  if (bps > 1024 * 1024) return `${(bps / 1024 / 1024).toFixed(1)} MB/s`
+  if (bps > 1024) return `${(bps / 1024).toFixed(1)} KB/s`
+  return `${Math.round(bps)} B/s`
+}
+
+function formatRemaining(seconds: number): string {
+  if (seconds > 3600) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
+  if (seconds > 60) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`
+  return `${Math.round(seconds)}s`
 }
 
 function getTextBytes(text: string): number {
@@ -71,11 +84,14 @@ export default function App() {
   const [inputCode, setInputCode] = useState('')
   const [text, setText] = useState('')
   const [files, setFiles] = useState<File[]>([])
-  const [ttlSeconds, setTtlSeconds] = useState(STORED_TTL_MAX)
+  const [ttlSeconds, setTtlSeconds] = useState(3600)
   const [publishing, setPublishing] = useState(false)
   const [publishedMode, setPublishedMode] = useState<PublishMode | null>(null)
   const [expiresAt, setExpiresAt] = useState<number | null>(null)
   const [copiedCode, setCopiedCode] = useState(false)
+  const [copiedLink, setCopiedLink] = useState(false)
+  const [copiedPassword, setCopiedPassword] = useState(false)
+  const [showPassword, setShowPassword] = useState(false)
   const [sigState, setSigState] = useState('disconnected')
   const [recipients, setRecipients] = useState<RecipientConn[]>([])
   const [channelState, setChannelState] = useState<ChannelState>('idle')
@@ -89,6 +105,7 @@ export default function App() {
   const [publishError, setPublishError] = useState('')
   const [password, setPassword] = useState('')
   const [inputPassword, setInputPassword] = useState('')
+  const [burnOnRead, setBurnOnRead] = useState(false)
   const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('qs_theme') as any) || 'dark')
 
   const sigRef = useRef<SignalingClient | null>(null)
@@ -99,6 +116,8 @@ export default function App() {
   const p2pEverLiveRef = useRef(false)
   const iceServersRef = useRef<RTCIceServer[]>([])
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const linkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const passwordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (!expiresAt) { setCountdown(''); return }
@@ -157,7 +176,8 @@ export default function App() {
       publishedMode === 'live' ? 'live' :
         (payloadBytes <= STORED_MAX) ? 'stored' : 'live'
 
-  const effectiveMode = (mode === 'stored' && !storedEnabled) ? 'live' : mode
+  const effectiveMode = mode
+  const storedModeBlocked = mode === 'stored' && !storedEnabled
   const hasPayload = text.trim().length > 0 || files.length > 0
 
   function copyCode() {
@@ -173,6 +193,37 @@ export default function App() {
     setCopiedCode(true)
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
     copyTimerRef.current = setTimeout(() => setCopiedCode(false), 2000)
+  }
+
+  function copyLink() {
+    if (!code) return
+    const url = `${window.location.origin}/${code}`
+    navigator.clipboard.writeText(url).catch(() => {
+      const el = document.createElement('textarea')
+      el.value = url
+      document.body.appendChild(el)
+      el.select()
+      document.execCommand('copy')
+      document.body.removeChild(el)
+    })
+    setCopiedLink(true)
+    if (linkTimerRef.current) clearTimeout(linkTimerRef.current)
+    linkTimerRef.current = setTimeout(() => setCopiedLink(false), 2000)
+  }
+
+  function copyPassword() {
+    if (!password) return
+    navigator.clipboard.writeText(password).catch(() => {
+      const el = document.createElement('textarea')
+      el.value = password
+      document.body.appendChild(el)
+      el.select()
+      document.execCommand('copy')
+      document.body.removeChild(el)
+    })
+    setCopiedPassword(true)
+    if (passwordTimerRef.current) clearTimeout(passwordTimerRef.current)
+    passwordTimerRef.current = setTimeout(() => setCopiedPassword(false), 2000)
   }
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -198,21 +249,47 @@ export default function App() {
 
   async function handleStoredPublish() {
     if (!hasPayload) return
+    if (!storedEnabled) {
+      setPublishError('Stored mode requires MongoDB. Set MONGODB_URI and restart the server.')
+      return
+    }
     setPublishing(true)
     setPublishError('')
     const isUpdate = publishedMode === 'stored' && code !== ''
     try {
       const form = new FormData()
-      form.append('text', text)
+      
+      // E2EE: Encrypt text if password is set
+      let finalText = text
+      if (password) {
+        const encryptedText = await encrypt(text, password)
+        finalText = arrayBufferToBase64(encryptedText)
+      }
+      form.append('text', finalText)
       form.append('ttlMs', String(clampStoredTtl(ttlSeconds) * 1000))
       if (password) form.append('password', password)
-      files.forEach(f => form.append('files', f))
+      form.append('burnOnRead', String(burnOnRead))
+      
+      // E2EE: Encrypt each file if password is set
+      for (const f of files) {
+        if (password) {
+          const buffer = await f.arrayBuffer()
+          const encrypted = await encrypt(buffer, password)
+          form.append('files', new Blob([encrypted]), f.name)
+        } else {
+          form.append('files', f)
+        }
+      }
+      
       const url = isUpdate ? `${API_URL}/publish/${code}` : `${API_URL}/publish`
       const method = isUpdate ? 'PATCH' : 'POST'
 
-      const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string }>((resolve, reject) => {
+      const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string; details?: string }>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         xhr.open(method, url)
+        if (password) {
+          xhr.setRequestHeader('x-session-password', password)
+        }
         if (files.length > 0) {
           xhr.upload.onprogress = () => {}
         }
@@ -231,7 +308,7 @@ export default function App() {
       })
 
       if (data.error) {
-        setPublishError(data.error)
+        setPublishError(data.details ? `${data.error}: ${data.details}` : data.error)
         if (data.error.includes('not found') && isUpdate) { setCode(''); setPublishedMode(null) }
         setPublishing(false)
         return
@@ -257,7 +334,7 @@ export default function App() {
       })
       const data = await res.json()
       if (!res.ok) {
-        setPublishError(data?.error ?? 'Failed to create session')
+        setPublishError(data?.details ? `${data.error ?? 'Failed to create session'}: ${data.details}` : (data?.error ?? 'Failed to create session'))
         setPublishing(false)
         return
       }
@@ -299,6 +376,16 @@ export default function App() {
       const res = await fetch(`${API_URL}/retrieve/${inputCode}`, { headers })
       if (res.ok) {
         const data: RetrievedPayload = await res.json()
+        
+        // E2EE: Decrypt text if password was used
+        if (inputPassword && data.text) {
+          try {
+            data.text = await decrypt(base64ToArrayBuffer(data.text), inputPassword, true) as string
+          } catch (e) {
+            console.warn('[crypto] text decryption failed', e)
+          }
+        }
+        
         setStoredPayload(data)
         setCode(inputCode)
         setExpiresAt(data.expiresAt)
@@ -335,39 +422,78 @@ export default function App() {
     setJoining(false)
   }
 
+  function isSafeToPreview(mimeType: string): boolean {
+    if (!mimeType) return false
+    const safeTypes = [
+      'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml',
+      'video/mp4', 'video/webm', 'video/ogg',
+      'audio/mpeg', 'audio/wav', 'audio/ogg',
+      'application/pdf', 'text/plain', 'text/markdown'
+    ]
+    return safeTypes.includes(mimeType)
+  }
+
   function handleStoredDownload(f: StoredFileInfo) {
     const url = `${API_URL}/file/${f.fileId}/${f.token}`
     const headers: any = {}
     if (inputPassword) headers['x-session-password'] = inputPassword
 
-    // For password protected files, we must fetch with headers first
-    if (inputPassword) {
-      fetch(url, { headers })
-        .then(res => res.blob())
-        .then(blob => {
-          const u = URL.createObjectURL(blob)
-          anchorDownload(u, f.name)
-          setTimeout(() => URL.revokeObjectURL(u), 1000)
-        })
-        .catch(() => alert('Failed to download file. Check password.'))
-    } else {
-      anchorDownload(url, f.name)
-    }
+    // For stored files, we always need to check if they are encrypted
+    fetch(url, { headers })
+      .then(res => {
+        if (!res.ok) throw new Error()
+        return res.blob()
+      })
+      .then(async blob => {
+        let finalBlob = blob
+        if (inputPassword) {
+          try {
+            const buffer = await blob.arrayBuffer()
+            const decrypted = await decrypt(buffer, inputPassword, false) as ArrayBuffer
+            finalBlob = new Blob([decrypted], { type: f.mimeType })
+          } catch (e) {
+            console.error('[crypto] decryption failed', e)
+            alert('Decryption failed. The file might be corrupted or the password incorrect.')
+            return
+          }
+        }
+        const u = URL.createObjectURL(finalBlob)
+        anchorDownload(u, f.name)
+        setTimeout(() => URL.revokeObjectURL(u), 1000)
+      })
+      .catch(() => alert('Failed to download file. Check password or connection.'))
   }
 
   function handleStoredPreview(f: StoredFileInfo) {
-    if (inputPassword) {
-      const headers: any = {}
-      headers['x-session-password'] = inputPassword
-      fetch(`${API_URL}/file/${f.fileId}/${f.token}`, { headers })
-        .then(res => res.blob())
-        .then(blob => {
-          const u = URL.createObjectURL(blob)
-          window.open(u, '_blank')
-        })
-    } else {
-      window.open(`${API_URL}/file/${f.fileId}/${f.token}`, '_blank', 'noopener')
+    if (!isSafeToPreview(f.mimeType)) {
+      handleStoredDownload(f)
+      return
     }
+
+    const headers: any = {}
+    if (inputPassword) headers['x-session-password'] = inputPassword
+
+    fetch(`${API_URL}/file/${f.fileId}/${f.token}`, { headers })
+      .then(res => {
+        if (!res.ok) throw new Error()
+        return res.blob()
+      })
+      .then(async blob => {
+        let finalBlob = blob
+        if (inputPassword) {
+          try {
+            const buffer = await blob.arrayBuffer()
+            const decrypted = await decrypt(buffer, inputPassword, false) as ArrayBuffer
+            finalBlob = new Blob([decrypted], { type: f.mimeType })
+          } catch (e) {
+            console.error('[crypto] decryption failed', e)
+            return
+          }
+        }
+        const u = URL.createObjectURL(finalBlob)
+        window.open(u, '_blank')
+      })
+      .catch(() => alert('Failed to preview file.'))
   }
 
   function handleLiveDownload(f: ReceivedFile) {
@@ -668,6 +794,21 @@ export default function App() {
                 />
                 <Icon name="lock" size={16} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-dim)' }} />
               </div>
+              
+              {effectiveMode === 'stored' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', marginTop: '1rem' }} onClick={() => setBurnOnRead(!burnOnRead)}>
+                  <div style={{ 
+                    width: '32px', height: '18px', background: burnOnRead ? 'var(--accent)' : 'var(--border)', 
+                    borderRadius: '100px', position: 'relative', transition: 'var(--transition)' 
+                  }}>
+                    <div style={{ 
+                      width: '12px', height: '12px', background: '#fff', borderRadius: '50%', 
+                      position: 'absolute', top: '3px', left: burnOnRead ? '17px' : '3px', transition: 'var(--transition)' 
+                    }} />
+                  </div>
+                  <span style={{ fontSize: '0.8125rem', fontWeight: 600 }}>Burn after first retrieval</span>
+                </div>
+              )}
             </div>
             <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px', padding: '1rem', background: 'var(--surface-hi)', borderRadius: 'var(--radius)' }}>
               <Icon name={effectiveMode === 'stored' ? 'cloud' : 'zap'} size={20} style={{ color: 'var(--accent)', marginTop: '2px' }} />
@@ -680,6 +821,11 @@ export default function App() {
                     ? 'Encrypted on our servers. Access anytime until expiry.' 
                     : 'Direct device-to-device. Keep this tab open to transfer.'}
                 </p>
+                {storedModeBlocked && (
+                  <p style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--error)', lineHeight: '1.4' }}>
+                    Stored mode is unavailable until MongoDB is configured.
+                  </p>
+                )}
               </div>
             </div>
             {effectiveMode === 'stored' && (
@@ -707,14 +853,33 @@ export default function App() {
           <Card style={{ textAlign: 'center' }}>
             <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '1.5rem' }}>Session Live</label>
             <div style={{ fontFamily: 'var(--font-mono)', fontSize: '3.5rem', fontWeight: 800, letterSpacing: '0.1em', color: 'var(--text)', marginBottom: '1.5rem' }}>{code}</div>
+
+            <div style={{ marginBottom: '1.5rem', padding: '1rem', borderRadius: 'var(--radius)', background: 'var(--bg)', border: '1px solid var(--border)', textAlign: 'left' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' }}>
+                <div>
+                  <label style={{ display: 'block', fontSize: '0.7rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-dim)', marginBottom: '0.35rem' }}>Sender Password</label>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.95rem', color: 'var(--text)' }}>
+                    {showPassword ? password : '••••••••'}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                  <Btn small onClick={() => setShowPassword(v => !v)} secondary>{showPassword ? 'Hide' : 'Show'}</Btn>
+                  <Btn small onClick={copyPassword} secondary>{copiedPassword ? 'Copied' : 'Copy'}</Btn>
+                </div>
+              </div>
+            </div>
             
             <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', marginBottom: '2rem' }}>
               <Btn onClick={copyCode} style={{ flex: 1 }}>
                 <Icon name={copiedCode ? 'check' : 'copy'} size={16} />
                 {copiedCode ? 'Copied' : 'Copy Code'}
               </Btn>
-              <Btn onClick={reset} style={{ flex: 1 }}>New Session</Btn>
+              <Btn onClick={copyLink} style={{ flex: 1 }}>
+                <Icon name={copiedLink ? 'check' : 'link'} size={16} />
+                {copiedLink ? 'Link Copied' : 'Copy Link'}
+              </Btn>
             </div>
+            <Btn onClick={reset} style={{ width: '100%', marginBottom: '2rem' }} secondary>Launch New Session</Btn>
 
             <div style={{ background: '#fff', padding: '1.5rem', borderRadius: 'var(--radius)', display: 'inline-block', marginBottom: '1rem' }}>
               <QRCodeSVG value={qrUrl} size={160} level="H" />
@@ -737,14 +902,37 @@ export default function App() {
                 <Icon name="zap" size={14} style={{ marginLeft: 'auto', color: 'var(--text-dim)' }} />
               </div>
 
-              <div style={{ textAlign: 'center', padding: '2rem', background: 'var(--bg)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
-                <p style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '0.5rem' }}>
+              <div style={{ textAlign: 'center', padding: '1.5rem', background: 'var(--bg)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+                <p style={{ fontSize: '1rem', fontWeight: 700, marginBottom: '0.5rem' }}>
                   {recipients.length === 0 ? 'Waiting for recipients...' : `${recipients.length} User(s) Connected`}
                 </p>
-                {recipients.some(r => r.sendProgress) && (
-                  <div style={{ marginTop: '1.5rem' }}>
-                    <p style={{ fontSize: '0.875rem', color: 'var(--accent)', marginBottom: '0.75rem', fontWeight: 600 }}>Transferring data...</p>
-                    <ProgressBar percent={recipients.find(r => r.sendProgress)?.sendProgress?.percent || 0} />
+                
+                {recipients.length > 0 && (
+                  <div style={{ marginTop: '1.5rem', textAlign: 'left' }}>
+                    <label style={{ display: 'block', fontSize: '0.7rem', fontWeight: 800, textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: '1rem', letterSpacing: '0.05em' }}>Recipient Progress</label>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                      {recipients.map(r => (
+                        <div key={r.peerId} style={{ padding: '0.75rem', background: 'var(--surface)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: r.sendProgress ? '8px' : '0' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: r.channelState === 'open' ? 'var(--success)' : 'var(--text-dim)' }} />
+                              <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>Peer {r.peerId.slice(0, 4)}</span>
+                            </div>
+                            <div style={{ textAlign: 'right' }}>
+                              <div style={{ fontSize: '0.7rem', color: r.sendProgress ? 'var(--accent)' : 'var(--text-dim)', fontWeight: 600 }}>
+                                {r.sendProgress ? `${r.sendProgress.percent}%` : r.lastSentAt ? 'Complete' : 'Idle'}
+                              </div>
+                              {r.sendProgress && r.sendProgress.speed && (
+                                <div style={{ fontSize: '0.65rem', color: 'var(--text-dim)', marginTop: '2px' }}>
+                                  {formatSpeed(r.sendProgress.speed)} • {formatRemaining(r.sendProgress.timeRemaining || 0)} left
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                          {r.sendProgress && <ProgressBar percent={r.sendProgress.percent} />}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
@@ -773,9 +961,16 @@ export default function App() {
             {recvProgress && (
               <div style={{ marginBottom: '2rem' }}>
                 <ProgressBar percent={recvProgress.percent} />
-                <p style={{ fontSize: '0.8125rem', color: 'var(--text-dim)', marginTop: '0.75rem', fontWeight: 500 }}>
-                  {recvProgress.currentFile}
-                </p>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '0.75rem' }}>
+                  <p style={{ fontSize: '0.8125rem', color: 'var(--text-dim)', fontWeight: 500 }}>
+                    {recvProgress.currentFile}
+                  </p>
+                  {recvProgress.speed && (
+                    <p style={{ fontSize: '0.8125rem', color: 'var(--accent)', fontWeight: 600 }}>
+                      {formatSpeed(recvProgress.speed)} • {formatRemaining(recvProgress.timeRemaining || 0)}
+                    </p>
+                  )}
+                </div>
               </div>
             )}
 
@@ -935,15 +1130,15 @@ function Card({ children, className = '', onClick, style }: { children: React.Re
   )
 }
 
-function Btn({ children, primary, small, disabled, onClick, style, className = '' }: {
-  children: React.ReactNode; primary?: boolean; small?: boolean
+function Btn({ children, primary, secondary, small, disabled, onClick, style, className = '' }: {
+  children: React.ReactNode; primary?: boolean; secondary?: boolean; small?: boolean
   disabled?: boolean; onClick?: () => void; style?: React.CSSProperties; className?: string
 }) {
   return (
     <button
       onClick={onClick}
       disabled={disabled}
-      className={`btn ${primary ? 'btn-primary' : 'btn-secondary'} ${className}`}
+      className={`btn ${primary ? 'btn-primary' : (secondary ? 'btn-secondary' : '')} ${className}`}
       style={{
         padding: small ? '0.5rem 1rem' : undefined,
         fontSize: small ? '0.8rem' : undefined,
@@ -955,7 +1150,7 @@ function Btn({ children, primary, small, disabled, onClick, style, className = '
   )
 }
 
-function Icon({ name, size = 20, style }: { name: 'rocket' | 'lock' | 'cloud' | 'shield' | 'zap' | 'file' | 'copy' | 'check' | 'sun' | 'moon', size?: number, style?: React.CSSProperties }) {
+function Icon({ name, size = 20, style }: { name: 'rocket' | 'lock' | 'cloud' | 'shield' | 'zap' | 'file' | 'copy' | 'check' | 'sun' | 'moon' | 'link', size?: number, style?: React.CSSProperties }) {
   const icons = {
     rocket: <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.71-2.13.09-2.91a2.18 2.18 0 0 0-3.09-.09zm9.24-9.25L10.03 11l-1.42-1.42 3.71-3.71A5.002 5.002 0 0 1 18 5c0 2.21-1.79 4-4 4a5.002 5.002 0 0 1-4.26-2.25zm.76 10.75l1.42 1.42-3.71 3.71A5.002 5.002 0 0 1 6 19c0-2.21 1.79-4 4-4a5.002 5.002 0 0 1 4.26 2.25l3.74-3.75zM14 11l5-5m-1 5l5-5" />,
     lock: <><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></>,
@@ -966,7 +1161,8 @@ function Icon({ name, size = 20, style }: { name: 'rocket' | 'lock' | 'cloud' | 
     copy: <><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></>,
     check: <polyline points="20 6 9 17 4 12" />,
     sun: <><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.07" x2="5.64" y2="17.66" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></>,
-    moon: <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+    moon: <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />,
+    link: <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
   }
   return (
     <svg width={size} height={size} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
