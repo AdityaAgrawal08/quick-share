@@ -17,6 +17,7 @@ export interface Session {
   expiresAt: number
   ttlTimer: ReturnType<typeof setTimeout>
   idleTimer: ReturnType<typeof setTimeout> | null  // FIX 7: cleared when publisher joins
+  passwordHash?: string // For mandatory P2P password protection
 }
 
 export type SignalType =

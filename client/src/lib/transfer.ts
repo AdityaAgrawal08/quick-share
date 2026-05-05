@@ -183,6 +183,8 @@ export class TransferReceiver {
   private onProgress: ReceiveProgressCallback
   private onComplete: (result: ReceivedTransfer) => void
   private onAbort: (reason: string) => void
+  private inactivityTimer: ReturnType<typeof setTimeout> | null = null
+  private lastChunkTime = 0
 
   constructor(
     onProgress: ReceiveProgressCallback,
@@ -205,6 +207,7 @@ export class TransferReceiver {
   // FIX 4: Called when the DataChannel closes mid-transfer.
   // If a transfer was in progress, notify the recipient it was aborted.
   abort(reason: string): void {
+    this.clearInactivityTimer()
     if (this.finalized) return
     if (!this.meta) return // No transfer was in progress — no-op
 
@@ -212,6 +215,28 @@ export class TransferReceiver {
     console.log('[transfer] aborted:', reason)
     this.onAbort(reason)
     this.reset()
+  }
+
+  private clearInactivityTimer(): void {
+    if (this.inactivityTimer) {
+      clearTimeout(this.inactivityTimer)
+      this.inactivityTimer = null
+    }
+  }
+
+  // FIX 9: Inactivity timeout — if publisher crashes after meta but before all chunks.
+  // Set a 30s timeout when meta is received. Reset on each chunk. Abort if timeout fires.
+  private resetInactivityTimer(): void {
+    this.clearInactivityTimer()
+    this.lastChunkTime = Date.now()
+    
+    this.inactivityTimer = setTimeout(() => {
+      if (!this.finalized && this.meta && this.totalChunksDone < this.meta.totalChunks) {
+        const elapsed = Date.now() - this.lastChunkTime
+        console.warn(`[transfer] inactivity timeout — no chunks for ${elapsed}ms`)
+        this.abort(`No data received for 30 seconds — publisher may have disconnected`)
+      }
+    }, 30000)
   }
 
   private handleJSON(raw: string): void {
@@ -231,6 +256,7 @@ export class TransferReceiver {
       this.totalBytesDone = 0
       this.totalChunksDone = 0
       this.finalized = false
+      this.resetInactivityTimer()  // Start timeout when metadata arrives
       console.log('[transfer] meta received:', msg.files.map((f) => f.name))
     }
 
@@ -249,6 +275,9 @@ export class TransferReceiver {
     if (!this.meta || this.finalized) return
     const files = this.meta.files
     if (this.currentFileIndex >= files.length) return
+
+    // Reset inactivity timer on each chunk received
+    this.resetInactivityTimer()
 
     this.fileChunks[this.currentFileIndex].push(buffer)
     this.fileBytesDone[this.currentFileIndex] += buffer.byteLength
@@ -274,6 +303,7 @@ export class TransferReceiver {
   }
 
   private finalize(): void {
+    this.clearInactivityTimer()
     if (!this.meta || this.finalized) return
     this.finalized = true
 

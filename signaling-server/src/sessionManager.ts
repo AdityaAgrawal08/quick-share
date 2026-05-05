@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws'
 import { Session, Peer, PeerRole, SignalMessage } from './types'
 import { randomInt, randomUUID } from 'crypto'
+import logger from './logger'
 
 const sessions = new Map<string, Session>()
 const CODE_LENGTH = 6
@@ -27,7 +28,7 @@ function generateUniqueCode(): string {
   throw new Error('Failed to generate unique session code')
 }
 
-export function createSession(ttlMs: number): string {
+export function createSession(ttlMs: number, passwordHash?: string): string {
   const code = generateUniqueCode()
 
   const timer = setTimeout(() => expireSession(code), ttlMs)
@@ -55,6 +56,7 @@ export function createSession(ttlMs: number): string {
     expiresAt: Date.now() + ttlMs,
     ttlTimer: timer,
     idleTimer,
+    passwordHash,
   }
 
   sessions.set(code, session)
@@ -80,13 +82,13 @@ export function addPeer(code: string, role: PeerRole, ws: WebSocket): { session:
       clearTimeout(session.idleTimer)
       session.idleTimer = null
     }
-    console.log(`[session] publisher joined ${code}`)
+    logger.info({ code }, 'Publisher joined session')
     return { session, peer }
 
   } else {
     // FIX 2: Enforce recipient cap before adding
     if (session.recipients.size >= MAX_RECIPIENTS_PER_SESSION) {
-      console.warn(`[session] recipient limit reached for ${code} (${MAX_RECIPIENTS_PER_SESSION})`)
+      logger.warn({ code, limit: MAX_RECIPIENTS_PER_SESSION }, 'Recipient limit reached')
       return null
     }
 
