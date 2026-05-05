@@ -11,7 +11,9 @@ const scrypt = promisify(crypto.scrypt)
 async function verifyPassword(password: string, stored: string): Promise<boolean> {
   const [salt, key] = stored.split(':')
   const derivedKey = (await scrypt(password, salt, 64)) as Buffer
-  return derivedKey.toString('hex') === key
+  const derivedKeyHex = derivedKey.toString('hex')
+  if (derivedKeyHex.length !== key.length) return false
+  return crypto.timingSafeEqual(Buffer.from(derivedKeyHex), Buffer.from(key))
 }
 
 const RELAY_TYPES = new Set(['offer', 'answer', 'ice'])
@@ -31,6 +33,16 @@ const RATE_LIMIT_MAX_MSGS   = 100
 const FAILED_ATTEMPTS_LIMIT = 10
 const FAILED_ATTEMPTS_WINDOW = 15 * 60 * 1000 // 15 minutes
 const failedAttempts = new Map<string, { count: number, resetAt: number }>()
+
+// Periodically clean up expired records to prevent memory leak
+setInterval(() => {
+  const now = Date.now()
+  for (const [ip, record] of failedAttempts.entries()) {
+    if (now > record.resetAt) {
+      failedAttempts.delete(ip)
+    }
+  }
+}, 60 * 60 * 1000).unref()
 
 function isBruteForcing(ip: string): boolean {
   const record = failedAttempts.get(ip)

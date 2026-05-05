@@ -27,6 +27,7 @@ function required(key: string): string {
 export const CONFIG = {
   PORT:             parseInt(process.env.PORT ?? '3001', 10),
   MONGODB_URI:      process.env.MONGODB_URI, // Optional, enables stored mode
+  MONGODB_TLS_INSECURE: process.env.MONGODB_TLS_INSECURE === 'true' || process.env.MONGODB_TLS_INSECURE === '1',
   ALLOWED_ORIGINS:  (process.env.ALLOWED_ORIGINS ?? '*')
     .split(',')
     .map((s) => s.trim())
@@ -55,5 +56,6 @@ logger.info({
   msg: 'Configuration loaded',
   port: CONFIG.PORT,
   origins: CONFIG.ALLOWED_ORIGINS,
-  storedMode: !!CONFIG.MONGODB_URI 
+  storedMode: !!CONFIG.MONGODB_URI,
+  mongoTlsInsecure: CONFIG.MONGODB_TLS_INSECURE
 })

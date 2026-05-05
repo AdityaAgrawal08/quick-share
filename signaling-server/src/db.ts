@@ -6,6 +6,12 @@ import { Readable } from 'stream'
 import { CONFIG } from './config'
 
 let bucket: GridFSBucket | null = null
+const MONGOOSE_OPTIONS = {
+  serverSelectionTimeoutMS: 5000,
+  connectTimeoutMS: 5000,
+  socketTimeoutMS: 10000,
+  retryWrites: true,
+}
 
 // In-memory map of active expiry timers: code → NodeJS.Timeout
 const expiryTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -19,18 +25,58 @@ export async function connectDB(): Promise<void> {
   const uri = CONFIG.MONGODB_URI
   if (!uri) throw new Error('MONGODB_URI not set in environment')
 
-  await mongoose.connect(uri, {
-    serverSelectionTimeoutMS: 5000,
-    connectTimeoutMS: 5000,
-  })
-  const db = mongoose.connection.db
-  if (!db) throw new Error('MongoDB connection has no db object')
-  bucket = new GridFSBucket(db, { bucketName: 'sharefiles' })
-  logger.info('[db] MongoDB connected and GridFS initialised')
+  await mongoose.connect(uri, getMongoOptions())
+  await refreshBucket('connected')
 
   // On startup: recover timers and clean up any orphaned data from a
   // previous server crash. Order matters: orphan scan first, then timers.
   await runMaintenance()
+}
+
+export async function reconnectDB(): Promise<void> {
+  const uri = CONFIG.MONGODB_URI
+  if (!uri) throw new Error('MONGODB_URI not set in environment')
+
+  try {
+    await mongoose.disconnect()
+  } catch {
+    // ignore disconnect failures; we'll attempt a fresh connect below
+  }
+
+  await mongoose.connect(uri, getMongoOptions())
+  await refreshBucket('reconnected')
+}
+
+function getMongoOptions() {
+  if (!CONFIG.MONGODB_TLS_INSECURE) return MONGOOSE_OPTIONS
+
+  return {
+    ...MONGOOSE_OPTIONS,
+    tlsInsecure: true,
+    tlsAllowInvalidCertificates: true,
+    tlsAllowInvalidHostnames: true,
+  }
+}
+
+function refreshBucket(state: 'connected' | 'reconnected'): void {
+  const db = mongoose.connection.db
+  if (!db) throw new Error('MongoDB connection has no db object')
+  bucket = new GridFSBucket(db, { bucketName: 'sharefiles' })
+  logger.info(`[db] MongoDB ${state} and GridFS initialised`)
+}
+
+export function isRetryableMongoError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false
+
+  const anyErr = err as { message?: unknown; code?: unknown; name?: unknown; cause?: unknown }
+  const message = typeof anyErr.message === 'string' ? anyErr.message : ''
+  const name = typeof anyErr.name === 'string' ? anyErr.name : ''
+  const code = typeof anyErr.code === 'string' || typeof anyErr.code === 'number' ? String(anyErr.code) : ''
+
+  if (['MongoNetworkError', 'MongoServerSelectionError', 'MongoNotConnectedError'].includes(name)) return true
+  if (['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE'].includes(code)) return true
+
+  return /tlsv1 alert internal error|SSL routines|socket hang up|buffering timed out|connection (?:closed|dropped|reset)|topology is closed/i.test(message)
 }
 
 export function getBucket(): GridFSBucket {
@@ -144,10 +190,10 @@ async function cleanupOrphanedGridFSFiles(): Promise<void> {
       const batch = fileIds.slice(i, i + BATCH_SIZE)
       const referencedDocs = await StoredSession.find({ 
         'files.gridfsId': { $in: batch } 
-      }).project({ 'files.gridfsId': 1 }).lean()
+      }).select('files.gridfsId').lean()
 
       const referencedIds = new Set(
-        referencedDocs.flatMap(doc => doc.files.map(f => f.gridfsId.toString()))
+        referencedDocs.flatMap((doc: any) => doc.files.map((f: any) => f.gridfsId.toString()))
       )
 
       for (const id of batch) {
@@ -247,6 +293,7 @@ export interface IStoredSession {
   expiresAt: Date
   createdAt: Date
   password?: string // Optional hashed password
+  burnOnRead?: boolean
 }
 
 const storedSessionSchema = new mongoose.Schema<IStoredSession>({
@@ -259,6 +306,7 @@ const storedSessionSchema = new mongoose.Schema<IStoredSession>({
     gridfsId: mongoose.Schema.Types.ObjectId,
     token:    { type: String, required: true },
   }],
+  burnOnRead: { type: Boolean, default: false },
   // NO expires: 0 here — MongoDB TTL is intentionally removed.
   // If MongoDB TTL deletes the session doc before our Node timer fires,
   // we lose the gridfsIds and GridFS files leak permanently.
