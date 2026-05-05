@@ -174,10 +174,10 @@ export default function App() {
   const mode: PublishMode =
     publishedMode === 'stored' ? 'stored' :
       publishedMode === 'live' ? 'live' :
+        (!storedEnabled) ? 'live' :
         (payloadBytes <= STORED_MAX) ? 'stored' : 'live'
 
   const effectiveMode = mode
-  const storedModeBlocked = mode === 'stored' && !storedEnabled
   const hasPayload = text.trim().length > 0 || files.length > 0
 
   function copyCode() {
@@ -803,9 +803,9 @@ export default function App() {
                     ? 'Encrypted on our servers. Access anytime until expiry.' 
                     : 'Direct device-to-device. Keep this tab open to transfer.'}
                 </p>
-                {storedModeBlocked && (
-                  <p style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--error)', lineHeight: '1.4' }}>
-                    Stored mode is unavailable until MongoDB is configured.
+                {!storedEnabled && !publishedMode && (
+                  <p style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--warning, #eab308)', lineHeight: '1.4' }}>
+                    Cloud storage is currently unavailable. Falling back to Live P2P mode.
                   </p>
                 )}
               </div>
