@@ -422,23 +422,12 @@ export default function App() {
     setJoining(false)
   }
 
-  function isSafeToPreview(mimeType: string): boolean {
-    if (!mimeType) return false
-    const safeTypes = [
-      'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml',
-      'video/mp4', 'video/webm', 'video/ogg',
-      'audio/mpeg', 'audio/wav', 'audio/ogg',
-      'application/pdf', 'text/plain', 'text/markdown'
-    ]
-    return safeTypes.includes(mimeType)
-  }
-
   function handleStoredDownload(f: StoredFileInfo) {
     const url = `${API_URL}/file/${f.fileId}/${f.token}`
     const headers: any = {}
     if (inputPassword) headers['x-session-password'] = inputPassword
 
-    // For stored files, we always need to check if they are encrypted
+    // Download should always save the file instead of opening a preview.
     fetch(url, { headers })
       .then(res => {
         if (!res.ok) throw new Error()
@@ -465,11 +454,6 @@ export default function App() {
   }
 
   function handleStoredPreview(f: StoredFileInfo) {
-    if (!isSafeToPreview(f.mimeType)) {
-      handleStoredDownload(f)
-      return
-    }
-
     const headers: any = {}
     if (inputPassword) headers['x-session-password'] = inputPassword
 
@@ -487,11 +471,13 @@ export default function App() {
             finalBlob = new Blob([decrypted], { type: f.mimeType })
           } catch (e) {
             console.error('[crypto] decryption failed', e)
+            alert('Failed to preview file. The file might be corrupted or the password incorrect.')
             return
           }
         }
         const u = URL.createObjectURL(finalBlob)
-        window.open(u, '_blank')
+        window.open(u, '_blank', 'noopener')
+        setTimeout(() => URL.revokeObjectURL(u), 60000)
       })
       .catch(() => alert('Failed to preview file.'))
   }
@@ -671,7 +657,7 @@ export default function App() {
   function channelLabel(state: ChannelState) {
     if (state === 'open') return 'Live'
     if (state === 'connecting') return 'Connecting...'
-    if (state === 'idle') return 'Waiting...'
+    if (state === 'idle') return sigState === 'connected' ? 'Connected, waiting for sender...' : 'Waiting...'
     if (state === 'error') return 'Error'
     return state
   }
@@ -950,8 +936,10 @@ export default function App() {
         <section className="animate-fade">
           <Card style={{ textAlign: 'center' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', justifyContent: 'center', marginBottom: '1.5rem' }}>
-              <Icon name="zap" size={16} style={{ color: channelState === 'open' ? 'var(--success)' : 'var(--error)' }} />
-              <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-dim)' }}>P2P {channelLabel(channelState)}</span>
+              <Icon name={storedPayload ? 'cloud' : 'zap'} size={16} style={{ color: storedPayload ? 'var(--accent)' : (channelState === 'open' ? 'var(--success)' : 'var(--error)') }} />
+              <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-dim)' }}>
+                {storedPayload ? 'Stored Session' : `P2P ${channelLabel(channelState)}`}
+              </span>
             </div>
             
             <h2 style={{ fontSize: '1.5rem', fontWeight: 800, marginBottom: '2rem' }}>
