@@ -5,11 +5,11 @@ import { WebRTCManager, type ChannelState } from './lib/webrtc'
 import { TransferReceiver, sendTransfer, type TransferProgress, type ReceivedTransfer, type ReceivedFile } from './lib/transfer'
 import type { SignalMessage, PeerRole } from './types'
 
-const API_URL       = import.meta.env.VITE_API_URL ?? 'http://localhost:3001'
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001'
 const SIGNALING_URL = API_URL.replace(/^http/, 'ws')
-const STORED_TTL_MIN = 10 * 60
-const STORED_TTL_MAX = 60 * 60
-const STORED_MAX    = 10 * 1024 * 1024
+const STORED_TTL_MIN = 1 * 60
+const STORED_TTL_MAX = 10 * 60 * 60
+const STORED_MAX = 10 * 1024 * 1024
 
 function formatTTL(s: number): string {
   if (s < 3600) return `${Math.round(s / 60)} min`
@@ -29,8 +29,9 @@ function getTextBytes(text: string): number {
 
 function splitStoredTtl(seconds: number): { hours: number; minutes: number } {
   const clamped = Math.min(Math.max(seconds, STORED_TTL_MIN), STORED_TTL_MAX)
-  if (clamped >= STORED_TTL_MAX) return { hours: 1, minutes: 0 }
-  return { hours: 0, minutes: Math.max(10, Math.round(clamped / 60)) }
+  const h = Math.floor(clamped / 3600)
+  const m = Math.round((clamped % 3600) / 60)
+  return { hours: h, minutes: m }
 }
 
 function formatCountdown(ms: number): string {
@@ -57,63 +58,47 @@ type PublishMode = 'stored' | 'live'
 interface StoredFileInfo { name: string; mimeType: string; size: number; fileId: string; token: string }
 interface RetrievedPayload { mode: 'stored'; text: string; expiresAt: number; files: StoredFileInfo[] }
 interface RecipientConn {
-  peerId: string; displayName: string; rtc: WebRTCManager
+  peerId: string; rtc: WebRTCManager
   channelState: ChannelState; sendProgress: TransferProgress | null; lastSentAt: number | null
 }
 
-const T = {
-  bg:       '#08090a',
-  surface:  '#0f1013',
-  border:   '#1e2024',
-  borderHi: '#2e3138',
-  text:     '#e8e9eb',
-  muted:    '#6b7280',
-  dim:      '#3d4047',
-  accent:   '#00c2ff',
-  accentDim:'#003d52',
-  green:    '#22c55e',
-  amber:    '#f59e0b',
-  red:      '#ef4444',
-  radius:   '8px',
-  radiusSm: '5px',
-  mono:     "'IBM Plex Mono', 'Fira Code', monospace",
-  sans:     "'DM Sans', system-ui, sans-serif",
-}
+
+
 
 export default function App() {
-  const [view, setView]               = useState<'home' | 'publish' | 'join'>('home')
-  const [code, setCode]               = useState('')
-  const [inputCode, setInputCode]     = useState('')
-  const [text, setText]               = useState('')
-  const [files, setFiles]             = useState<File[]>([])
-  const [ttlSeconds, setTtlSeconds]   = useState(STORED_TTL_MAX)
-  const [publishing, setPublishing]   = useState(false)
-  const [uploadPercent, setUploadPercent] = useState<number | null>(null)
+  const [view, setView] = useState<'home' | 'publish' | 'join'>('home')
+  const [code, setCode] = useState('')
+  const [inputCode, setInputCode] = useState('')
+  const [text, setText] = useState('')
+  const [files, setFiles] = useState<File[]>([])
+  const [ttlSeconds, setTtlSeconds] = useState(STORED_TTL_MAX)
+  const [publishing, setPublishing] = useState(false)
   const [publishedMode, setPublishedMode] = useState<PublishMode | null>(null)
-  const [expiresAt, setExpiresAt]     = useState<number | null>(null)
-  const [copiedCode, setCopiedCode]   = useState(false)
-  const [sigState, setSigState]       = useState('disconnected')
-  const [recipients, setRecipients]   = useState<RecipientConn[]>([])
-  const [recipientName, setRecipientName] = useState('')
-  const [channelState, setChannelState]   = useState<ChannelState>('idle')
-  const [recvProgress, setRecvProgress]   = useState<TransferProgress | null>(null)
-  const [received, setReceived]           = useState<ReceivedTransfer | null>(null)
+  const [expiresAt, setExpiresAt] = useState<number | null>(null)
+  const [copiedCode, setCopiedCode] = useState(false)
+  const [sigState, setSigState] = useState('disconnected')
+  const [recipients, setRecipients] = useState<RecipientConn[]>([])
+  const [channelState, setChannelState] = useState<ChannelState>('idle')
+  const [recvProgress, setRecvProgress] = useState<TransferProgress | null>(null)
+  const [received, setReceived] = useState<ReceivedTransfer | null>(null)
   const [storedPayload, setStoredPayload] = useState<RetrievedPayload | null>(null)
-  const [transferError, setTransferError] = useState<string | null>(null)
-  const [joining, setJoining]             = useState(false)
-  const [joinError, setJoinError]         = useState('')
-  const [countdown, setCountdown]         = useState('')
+  const [joining, setJoining] = useState(false)
+  const [joinError, setJoinError] = useState('')
+  const [countdown, setCountdown] = useState('')
   const [storedEnabled, setStoredEnabled] = useState(true)
-  const [publishError, setPublishError]   = useState('')
+  const [publishError, setPublishError] = useState('')
+  const [password, setPassword] = useState('')
+  const [inputPassword, setInputPassword] = useState('')
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('qs_theme') as any) || 'dark')
 
-  const sigRef            = useRef<SignalingClient | null>(null)
-  const rtcMapRef         = useRef<Map<string, WebRTCManager>>(new Map())
-  const rtcRef            = useRef<WebRTCManager | null>(null)
-  const receiverRef       = useRef<TransferReceiver | null>(null)
+  const sigRef = useRef<SignalingClient | null>(null)
+  const rtcMapRef = useRef<Map<string, WebRTCManager>>(new Map())
+  const rtcRef = useRef<WebRTCManager | null>(null)
+  const receiverRef = useRef<TransferReceiver | null>(null)
   const recipientCountRef = useRef(0)
-  const p2pEverLiveRef    = useRef(false)
-  const iceServersRef     = useRef<RTCIceServer[]>([])
-  const copyTimerRef      = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const p2pEverLiveRef = useRef(false)
+  const iceServersRef = useRef<RTCIceServer[]>([])
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (!expiresAt) { setCountdown(''); return }
@@ -124,6 +109,23 @@ export default function App() {
   }, [expiresAt])
 
   useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('qs_theme', theme)
+  }, [theme])
+
+  // Prevent accidental reloads during active live sessions
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (publishedMode === 'live' && sigState === 'connected') {
+        e.preventDefault()
+        e.returnValue = ''
+      }
+    }
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload)
+  }, [publishedMode, sigState])
+
+  useEffect(() => {
     const path = window.location.pathname.replace(/^\//, '').trim()
     if (/^\d{6}$/.test(path)) {
       setInputCode(path)
@@ -132,26 +134,31 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    // Detect whether server has Mongo configured (stored mode enabled).
-    fetch(`${API_URL}/health`)
-      .then(r => r.json())
-      .then((data: { storedModeEnabled?: boolean }) => {
-        if (typeof data.storedModeEnabled === 'boolean') setStoredEnabled(data.storedModeEnabled)
-      })
-      .catch(() => {
-        // Ignore; default stays true.
-      })
+    // Initial health check to verify if stored mode is supported by the server.
+    const checkStatus = async () => {
+      try {
+        const r = await fetch(`${API_URL}/health`)
+        const data = await r.json()
+        if (typeof data.storedModeEnabled === 'boolean') {
+          setStoredEnabled(data.storedModeEnabled)
+        }
+      } catch (err) {
+        console.warn('[health] check failed, assuming optimistic support')
+      }
+    }
+    checkStatus()
   }, [])
 
-  const totalBytes     = files.reduce((s, f) => s + f.size, 0)
-  const textBytes      = getTextBytes(text)
-  const payloadBytes   = totalBytes + textBytes
+  const totalBytes = files.reduce((s, f) => s + f.size, 0)
+  const textBytes = getTextBytes(text)
+  const payloadBytes = totalBytes + textBytes
   const mode: PublishMode =
     publishedMode === 'stored' ? 'stored' :
-    publishedMode === 'live' ? 'live' :
-    payloadBytes <= STORED_MAX ? 'stored' : 'live'
-  const hasPayload     = text.trim().length > 0 || files.length > 0
-  const openRecipients = recipients.filter(r => r.channelState === 'open')
+      publishedMode === 'live' ? 'live' :
+        (payloadBytes <= STORED_MAX) ? 'stored' : 'live'
+
+  const effectiveMode = (mode === 'stored' && !storedEnabled) ? 'live' : mode
+  const hasPayload = text.trim().length > 0 || files.length > 0
 
   function copyCode() {
     if (!code) return
@@ -182,41 +189,47 @@ export default function App() {
   }
 
   function setStoredDuration(hoursValue: number, minutesValue: number) {
-    const hours = Number.isFinite(hoursValue) ? Math.max(0, Math.min(1, Math.trunc(hoursValue))) : 0
+    const hours = Number.isFinite(hoursValue) ? Math.max(0, Math.min(10, Math.trunc(hoursValue))) : 0
     const minutes = Number.isFinite(minutesValue) ? Math.max(0, Math.min(59, Math.trunc(minutesValue))) : 0
 
-    if (hours >= 1) {
-      setTtlSeconds(STORED_TTL_MAX)
-      return
-    }
-
-    setTtlSeconds(clampStoredTtl(Math.max(10, minutes) * 60))
+    const totalSeconds = (hours * 3600) + (minutes * 60)
+    setTtlSeconds(clampStoredTtl(totalSeconds))
   }
 
   async function handleStoredPublish() {
     if (!hasPayload) return
     setPublishing(true)
     setPublishError('')
-    setUploadPercent(null)
     const isUpdate = publishedMode === 'stored' && code !== ''
     try {
       const form = new FormData()
       form.append('text', text)
       form.append('ttlMs', String(clampStoredTtl(ttlSeconds) * 1000))
+      if (password) form.append('password', password)
       files.forEach(f => form.append('files', f))
-      const url    = isUpdate ? `${API_URL}/publish/${code}` : `${API_URL}/publish`
+      const url = isUpdate ? `${API_URL}/publish/${code}` : `${API_URL}/publish`
       const method = isUpdate ? 'PATCH' : 'POST'
+
       const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string }>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         xhr.open(method, url)
         if (files.length > 0) {
-          xhr.upload.onprogress = e => { if (e.lengthComputable) setUploadPercent(Math.round(e.loaded / e.total * 100)) }
+          xhr.upload.onprogress = () => {}
         }
-        xhr.onload  = () => resolve(JSON.parse(xhr.responseText))
-        xhr.onerror = () => reject(new Error('Network error'))
+        xhr.onload = () => {
+          try {
+            const resp = JSON.parse(xhr.responseText)
+            if (xhr.status >= 400) resolve({ error: resp.error || 'Request failed', ...resp })
+            else resolve(resp)
+          } catch (e) {
+            reject(new Error('Invalid response from server'))
+          }
+        }
+        xhr.onerror = () => reject(new Error('Network error. The server might be offline or unreachable.'))
+        xhr.ontimeout = () => reject(new Error('Upload timed out. Please try a smaller file or a faster connection.'))
         xhr.send(form)
       })
-      setUploadPercent(null)
+
       if (data.error) {
         setPublishError(data.error)
         if (data.error.includes('not found') && isUpdate) { setCode(''); setPublishedMode(null) }
@@ -226,9 +239,8 @@ export default function App() {
       setCode(data.code)
       setExpiresAt(data.expiresAt)
       setPublishedMode('stored')
-    } catch {
-      setUploadPercent(null)
-      setPublishError('Network error. Check your connection.')
+    } catch (err: any) {
+      setPublishError(err?.message ?? 'An unexpected error occurred.')
     }
     setPublishing(false)
   }
@@ -238,16 +250,14 @@ export default function App() {
     setPublishError('')
     await fetchIceServers()
     try {
-      const res  = await fetch(`${API_URL}/session`, { 
-        method: 'POST', 
-        headers: { 
-          'Content-Type': 'application/json',
-        }, 
-        body: JSON.stringify({ ttlMs: 24 * 60 * 60 * 1000 }) 
+      const res = await fetch(`${API_URL}/session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttlMs: 24 * 60 * 60 * 1000, password })
       })
       const data = await res.json()
       if (!res.ok) {
-        setPublishError((data as any)?.error ?? 'Failed to create session')
+        setPublishError(data?.error ?? 'Failed to create session')
         setPublishing(false)
         return
       }
@@ -255,42 +265,49 @@ export default function App() {
       setPublishedMode('live')
       setExpiresAt(data.expiresAt)
       startSignaling(data.code, 'publisher')
-    } catch {
-      setPublishError('Network error. Check your connection.')
+    } catch (err: any) {
+      setPublishError('Could not connect to server. Please try again.')
     }
     setPublishing(false)
   }
 
-  async function handleSendTo(peerId: string) {
+  async function handleSendTo(peerId: string, providedRtc?: WebRTCManager) {
     if (!hasPayload) return
-    const rtc = rtcMapRef.current.get(peerId)
-    const r   = recipients.find(r => r.peerId === peerId)
-    if (!rtc || !r || r.channelState !== 'open') return
+    const rtc = providedRtc || rtcMapRef.current.get(peerId)
+    if (!rtc || rtc.getDataChannel()?.readyState !== 'open') return
+
     setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, sendProgress: null } : x))
     try {
       await sendTransfer(rtc, text, files, p => {
         setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, sendProgress: p } : x))
       })
       setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, lastSentAt: Date.now(), sendProgress: null } : x))
-    } catch { /* error visible via channel state */ }
+    } catch (err) {
+      console.error('[p2p] send error:', err)
+    }
   }
 
-  async function handleSendAll() {
-    await Promise.allSettled(openRecipients.map(r => handleSendTo(r.peerId)))
-  }
 
   async function handleJoin() {
-    if (inputCode.length !== 6) return
+    if (inputCode.length !== 6 || !inputPassword) return
     setJoining(true)
     setJoinError('')
     try {
-      const res = await fetch(`${API_URL}/retrieve/${inputCode}`)
+      const headers: any = {}
+      if (inputPassword) headers['x-session-password'] = inputPassword
+
+      const res = await fetch(`${API_URL}/retrieve/${inputCode}`, { headers })
       if (res.ok) {
         const data: RetrievedPayload = await res.json()
         setStoredPayload(data)
         setCode(inputCode)
         setExpiresAt(data.expiresAt)
         setView('join')
+        setJoining(false)
+        return
+      }
+      if (res.status === 401) {
+        setJoinError('Invalid password. Please try again.')
         setJoining(false)
         return
       }
@@ -310,16 +327,47 @@ export default function App() {
       }
       const err = await res.json()
       setJoinError(err.error ?? 'Unknown error')
-    } catch { setJoinError('Network error. Check your connection.') }
+    } catch (err: any) {
+      setJoinError(err?.message?.includes('Failed to fetch')
+        ? 'Cannot reach the server. Check your internet connection.'
+        : (err?.message ?? 'An unexpected error occurred.'));
+    }
     setJoining(false)
   }
 
   function handleStoredDownload(f: StoredFileInfo) {
-    anchorDownload(`${API_URL}/file/${f.fileId}/${f.token}`, f.name)
+    const url = `${API_URL}/file/${f.fileId}/${f.token}`
+    const headers: any = {}
+    if (inputPassword) headers['x-session-password'] = inputPassword
+
+    // For password protected files, we must fetch with headers first
+    if (inputPassword) {
+      fetch(url, { headers })
+        .then(res => res.blob())
+        .then(blob => {
+          const u = URL.createObjectURL(blob)
+          anchorDownload(u, f.name)
+          setTimeout(() => URL.revokeObjectURL(u), 1000)
+        })
+        .catch(() => alert('Failed to download file. Check password.'))
+    } else {
+      anchorDownload(url, f.name)
+    }
   }
 
   function handleStoredPreview(f: StoredFileInfo) {
-    window.open(`${API_URL}/file/${f.fileId}/${f.token}`, '_blank', 'noopener')
+    if (inputPassword) {
+      const headers: any = {}
+      headers['x-session-password'] = inputPassword
+      fetch(`${API_URL}/file/${f.fileId}/${f.token}`, { headers })
+        .then(res => res.blob())
+        .then(blob => {
+          const u = URL.createObjectURL(blob)
+          window.open(u, '_blank')
+        })
+    } else {
+      window.open(`${API_URL}/file/${f.fileId}/${f.token}`, '_blank', 'noopener')
+    }
   }
 
   function handleLiveDownload(f: ReceivedFile) {
@@ -337,7 +385,7 @@ export default function App() {
   const fetchIceServers = useCallback(async (): Promise<RTCIceServer[]> => {
     if (iceServersRef.current.length > 0) return iceServersRef.current
     try {
-      const res  = await fetch(`${API_URL}/ice-servers`)
+      const res = await fetch(`${API_URL}/ice-servers`)
       if (!res.ok) throw new Error()
       const data = await res.json() as { iceServers: RTCIceServer[] }
       iceServersRef.current = data.iceServers
@@ -352,9 +400,10 @@ export default function App() {
       serverUrl: SIGNALING_URL,
       code: sessionCode,
       role: sessionRole,
-      onOpen:  () => setSigState('connected'),
+      password: sessionRole === 'recipient' ? inputPassword : password,
+      onOpen: () => setSigState('connected'),
       onClose: () => setSigState('disconnected'),
-      onError: () => {},
+      onError: () => { },
       onMessage: msg => handleSignalingMessage(msg, sessionRole, sig),
       onReconnecting: (attempt, max) => {
         if (p2pEverLiveRef.current) { sigRef.current?.disconnect(); setSigState('offline'); return }
@@ -368,10 +417,21 @@ export default function App() {
 
   async function handleSignalingMessage(msg: SignalMessage, sessionRole: PeerRole, sig: SignalingClient) {
     if (msg.type === 'error') {
+      if (typeof msg.payload === 'string' && msg.payload === 'invalid_password') {
+        setJoinError('Invalid session password.')
+        sig.disconnect()
+        setSigState('disconnected')
+        setView('home') // Go back to enter password again
+        return
+      }
       if (typeof msg.payload === 'string' && msg.payload.startsWith('Waiting for publisher')) return
       if (typeof msg.payload === 'string' && msg.payload.startsWith('Session not found')) {
         if (p2pEverLiveRef.current) { sigRef.current?.disconnect(); setSigState('offline') }
-        else setSigState('lost')
+        else {
+          setJoinError('Session not found or expired.')
+          setSigState('lost')
+          setView('home')
+        }
         return
       }
       return
@@ -392,34 +452,30 @@ export default function App() {
       if (!peerId) return
       if (sessionRole === 'publisher') {
         recipientCountRef.current += 1
-        const autoName = `Recipient ${recipientCountRef.current}`
         const rtc = new WebRTCManager({
           role: 'publisher', peerId, signalingClient: sig,
           iceServers: iceServersRef.current.length > 0 ? iceServersRef.current : undefined,
           onChannelStateChange: state => {
-            if (state === 'open') p2pEverLiveRef.current = true
-            setRecipients(prev => prev.map(r => r.peerId === peerId ? { ...r, channelState: state } : r))
-          },
-          onChannelMessage: data => {
-            if (typeof data === 'string') {
-              try {
-                const parsed = JSON.parse(data)
-                if (parsed.type === 'name' && parsed.name?.trim()) {
-                  setRecipients(prev => prev.map(r => r.peerId === peerId ? { ...r, displayName: parsed.name.trim() } : r))
-                }
-              } catch { /* not a name message */ }
+            if (state === 'open') {
+              p2pEverLiveRef.current = true
+              handleSendTo(peerId, rtc) // AUTO-TRANSFER immediately on open
             }
+            setRecipients(prev => prev.map(r => r.peerId === peerId ? { ...r, channelState: state } : r))
           },
         })
         rtcMapRef.current.set(peerId, rtc)
-        setRecipients(prev => [...prev, { peerId, displayName: autoName, rtc, channelState: 'idle', sendProgress: null, lastSentAt: null }])
+        setRecipients(prev => {
+          const filtered = prev.filter(r => r.peerId !== peerId)
+          return [...filtered, { peerId, rtc, channelState: 'idle', sendProgress: null, lastSentAt: null }]
+        })
         await rtc.start()
       } else {
         await fetchIceServers()
+        if (rtcRef.current) rtcRef.current.close()
         const receiver = new TransferReceiver(
           p => setRecvProgress(p),
-          result => { setReceived(result); setTransferError(null) },
-          reason => { setTransferError(reason); setRecvProgress(null) }
+          result => { setReceived(result); setRecvProgress(null) },
+          reason => { setJoinError(reason); setRecvProgress(null) }
         )
         receiverRef.current = receiver
         const rtc = new WebRTCManager({
@@ -428,7 +484,6 @@ export default function App() {
           onChannelStateChange: state => {
             if (state === 'open') p2pEverLiveRef.current = true
             setChannelState(state)
-            if (state === 'open' && recipientName.trim()) rtc.send(JSON.stringify({ type: 'name', name: recipientName.trim() }))
             if ((state === 'closed' || state === 'error') && receiverRef.current) {
               receiverRef.current.abort('Publisher disconnected mid-transfer')
               receiverRef.current = null
@@ -462,512 +517,460 @@ export default function App() {
     setView('home'); setCode(''); setInputCode('')
     setText(''); setFiles([]); setTtlSeconds(3600)
     setPublishing(false); setPublishedMode(null); setExpiresAt(null)
-    setUploadPercent(null); setCopiedCode(false)
+    setCopiedCode(false)
     setSigState('disconnected'); setRecipients([])
     setChannelState('idle'); setRecvProgress(null)
-    setReceived(null); setStoredPayload(null); setTransferError(null)
-    setJoining(false); setJoinError(''); setRecipientName('')
-    setCountdown('')
+    setReceived(null); setStoredPayload(null)
+    setJoining(false); setJoinError('')
+    setCountdown(''); setPassword(''); setInputPassword('')
   }
 
   function sigColor() {
-    if (['failed','lost','expired'].includes(sigState)) return T.red
-    if (sigState.startsWith('reconnecting') || sigState === 'offline') return T.amber
-    if (sigState === 'connected') return T.green
-    return T.muted
+    if (['failed', 'lost', 'expired'].includes(sigState)) return 'var(--error)'
+    if (sigState.startsWith('reconnecting') || sigState === 'offline') return 'var(--warning)'
+    if (sigState === 'connected') return 'var(--success)'
+    return 'var(--text-dim)'
+  }
+
+  function sigLabel() {
+    if (sigState === 'connected') return 'Connected'
+    if (sigState === 'disconnected') return 'Disconnected'
+    if (sigState === 'lost') return 'Session Lost'
+    if (sigState === 'offline') return 'Offline'
+    if (sigState === 'expired') return 'Expired'
+    if (sigState.startsWith('reconnecting')) return 'Reconnecting...'
+    return sigState
+  }
+
+  function channelLabel(state: ChannelState) {
+    if (state === 'open') return 'Live'
+    if (state === 'connecting') return 'Connecting...'
+    if (state === 'idle') return 'Waiting...'
+    if (state === 'error') return 'Error'
+    return state
   }
 
   const qrUrl = `${window.location.origin}/${code}`
 
-  function FilePills({ fileList, onRemove }: { fileList: File[]; onRemove: (i: number) => void }) {
-    return (
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '8px' }}>
-        {fileList.map((f, i) => (
-          <Pill key={i}>
-            <span style={{ maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
-            <span style={{ fontSize: '11px', color: T.muted, flexShrink: 0 }}>{formatBytes(f.size)}</span>
-            <button onClick={() => onRemove(i)} style={{ background: 'none', border: 'none', color: T.red, padding: '0 2px', fontSize: '13px', lineHeight: 1, cursor: 'pointer' }}>✕</button>
-          </Pill>
-        ))}
-        <div style={{ width: '100%', fontSize: '12px', color: T.muted, marginTop: '2px' }}>
-          {formatBytes(payloadBytes)} total{payloadBytes > STORED_MAX && <span style={{ color: T.amber, marginLeft: '8px' }}>↑ live mode</span>}
+  return (
+    <div className="container animate-fade">
+      <header>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '1rem' }}>
+          <button
+            onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+            className="btn btn-secondary"
+            style={{ padding: '8px', borderRadius: '50%', width: '40px', height: '40px' }}
+          >
+            <Icon name={theme === 'dark' ? 'sun' : 'moon'} size={18} />
+          </button>
         </div>
-      </div>
-    )
-  }
-
-  function DurationPicker() {
-    const parts = splitStoredTtl(ttlSeconds)
-
-    return (
-      <div style={{ marginTop: '14px' }}>
-        <div style={{ fontSize: '12px', color: T.muted, marginBottom: '8px' }}>
-          Duration <span style={{ color: T.text, fontFamily: T.mono, marginLeft: '6px' }}>{formatTTL(ttlSeconds)}</span>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '12px', marginBottom: '1rem' }}>
+          <Icon name="rocket" size={32} style={{ color: 'var(--accent)' }} />
+          <h1>QuickShare</h1>
         </div>
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: '1fr auto 1fr',
-            gap: '10px',
-            alignItems: 'stretch',
-            padding: '10px',
-            borderRadius: T.radius,
-            border: `1px solid ${T.borderHi}`,
-            background: `linear-gradient(180deg, ${T.surface}, #0b0c0f)`,
-            boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.02)',
-          }}
-        >
-          <label style={{ display: 'grid', gap: '6px' }}>
-            <span style={{ fontSize: '11px', color: T.dim, letterSpacing: '1px', textTransform: 'uppercase' }}>hr</span>
-            <input
-              type="number"
-              min={0}
-              max={1}
-              value={parts.hours}
-              inputMode="numeric"
-              onChange={e => setStoredDuration(Number(e.target.value), parts.minutes)}
-              style={{ ...durationInputStyle(), textAlign: 'center', fontFamily: T.mono }}
-            />
-          </label>
+        <p className="subtitle">Instant, secure, peer-to-peer file sharing</p>
+      </header>
 
-          <div style={{ display: 'flex', alignItems: 'end', justifyContent: 'center', paddingBottom: '12px', color: T.dim, fontFamily: T.mono }}>
-            :
+      {view === 'home' && !publishedMode && (
+        <section className="animate-fade">
+          <div style={{ textAlign: 'center', marginBottom: '3rem' }}>
+            <Btn onClick={() => setView('publish')} primary style={{ padding: '1rem 2.5rem' }}>
+              <Icon name="zap" size={18} />
+              Start New Session
+            </Btn>
           </div>
 
-          <label style={{ display: 'grid', gap: '6px' }}>
-            <span style={{ fontSize: '11px', color: T.dim, letterSpacing: '1px', textTransform: 'uppercase' }}>min</span>
-            <input
-              type="number"
-              min={0}
-              max={59}
-              value={parts.minutes}
-              inputMode="numeric"
-              onChange={e => setStoredDuration(parts.hours, Number(e.target.value))}
-              style={{ ...durationInputStyle(), textAlign: 'center', fontFamily: T.mono }}
-            />
-          </label>
-        </div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: T.dim, marginTop: '4px' }}>
-          <span>10 min</span>
-          <span>1 hr</span>
-        </div>
-      </div>
-    )
-  }
-
-  function durationInputStyle(): React.CSSProperties {
-    return {
-      width: '100%',
-      minHeight: '56px',
-      borderRadius: T.radiusSm,
-      border: `1px solid ${T.border}`,
-      background: '#090a0d',
-      color: T.text,
-      fontSize: '20px',
-      fontWeight: 600,
-      outline: 'none',
-      padding: '0 12px',
-    }
-  }
-
-  return (
-    <>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-        html { scroll-behavior: smooth; }
-        html, body { background: ${T.bg}; color: ${T.text}; font-family: ${T.sans}; min-height: 100vh; -webkit-text-size-adjust: 100%; }
-        input, textarea, button, select { font-family: inherit; }
-        button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
-        textarea { font-size: 16px; }
-        input[type="text"], input[type="number"] { font-size: 16px; }
-        ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: ${T.dim}; border-radius: 2px; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .fade-in { animation: fadeIn 0.2s ease forwards; }
-        @media (max-width: 480px) {
-          .row-wrap { flex-wrap: wrap; }
-          .row-wrap > * { min-width: 0; flex: 1 1 100%; }
-          .row-wrap > .no-grow { flex: 0 0 auto; }
-        }
-      `}</style>
-
-      <div style={{ maxWidth: '560px', margin: '0 auto', padding: 'clamp(1.25rem, 5vw, 2.5rem) clamp(1rem, 4vw, 1.5rem) 4rem' }}>
-
-        <div style={{ marginBottom: '2rem', display: 'flex', alignItems: 'baseline', gap: '10px' }}>
-          <span style={{ fontFamily: T.mono, fontSize: '17px', fontWeight: 500, color: T.accent }}>quickshare</span>
-          <span style={{ fontSize: '12px', color: T.muted }}>private file & text transfer</span>
-        </div>
-
-        {view === 'home' && !publishedMode && (
-          <div className="fade-in">
-            <Card>
-              <Btn primary onClick={() => setView('publish')} style={{ width: '100%', padding: '13px' }}>
-                Create session
-              </Btn>
-            </Card>
-
-            <div style={{ textAlign: 'center', color: T.muted, fontSize: '13px', margin: '12px 0' }}>or join with a code</div>
-
-            <Card>
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'stretch' }} className="row-wrap">
+          <Card>
+            <div style={{ marginBottom: '1.5rem' }}>
+              <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '0.75rem' }}>Join Session</label>
+              <div style={{ display: 'flex', gap: '12px' }}>
                 <input
+                  className="input"
+                  type="text"
                   placeholder="000000"
                   value={inputCode}
                   onChange={e => setInputCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                  maxLength={6}
-                  onKeyDown={e => e.key === 'Enter' && inputCode.length === 6 && handleJoin()}
-                  style={{ ...iStyle(), fontFamily: T.mono, fontSize: '22px', letterSpacing: '6px', textAlign: 'center', width: '148px', flexShrink: 0 }}
-                  className="no-grow"
+                  onKeyDown={e => e.key === 'Enter' && handleJoin()}
+                  style={{ textAlign: 'center', fontSize: '1.25rem', fontWeight: 700, letterSpacing: '0.2em', fontFamily: 'var(--font-mono)' }}
                 />
-                <input
-                  placeholder="Your name (optional)"
-                  value={recipientName}
-                  onChange={e => setRecipientName(e.target.value)}
-                  style={{ ...iStyle(), flex: 1, minWidth: '120px' }}
-                />
-                <Btn primary onClick={handleJoin} disabled={inputCode.length !== 6 || joining} style={{ minHeight: '44px', paddingLeft: '20px', paddingRight: '20px' }} className="no-grow">
+                <Btn primary disabled={inputCode.length !== 6 || !inputPassword || joining} onClick={handleJoin} style={{ width: '80px' }}>
                   {joining ? <Spinner /> : 'Join'}
                 </Btn>
               </div>
-              {joinError && <div style={{ marginTop: '10px', fontSize: '13px', color: T.red }}>{joinError}</div>}
-            </Card>
-          </div>
-        )}
-
-        {view === 'publish' && !publishedMode && (
-          <div className="fade-in">
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-              <span style={{ fontSize: '15px', fontWeight: 500 }}>New session</span>
-              <Btn small onClick={() => setView('home')} style={{ color: T.muted }}>← Back</Btn>
             </div>
 
-            <Card>
-              <div style={{ fontSize: '12px', color: T.muted, marginBottom: '8px' }}>Text <span style={{ opacity: 0.6 }}>(optional)</span></div>
-              <textarea
-                style={{ ...iStyle({ width: '100%', height: '100px', resize: 'vertical' }), display: 'block' }}
-                placeholder="Paste text, code, links..."
-                value={text}
-                onChange={e => setText(e.target.value)}
-              />
-            </Card>
-
-            <Card>
-              <div style={{ fontSize: '12px', color: T.muted, marginBottom: '8px' }}>Files <span style={{ opacity: 0.6 }}>(optional)</span></div>
-              <input type="file" multiple onChange={handleFileChange} style={{ color: T.muted, fontSize: '13px', width: '100%' }} />
-              {files.length > 0 && <FilePills fileList={files} onRemove={i => setFiles(prev => prev.filter((_, j) => j !== i))} />}
-            </Card>
-
-            <Card>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: mode === 'stored' ? T.green : T.amber, flexShrink: 0 }} />
-                <span style={{ fontSize: '13px', color: mode === 'stored' ? T.green : T.amber }}>
-                  {mode === 'stored' ? 'Stored in MongoDB — you can leave after publishing' : 'Live — stay connected while recipients join'}
-                </span>
+            <div className="animate-fade">
+              <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '0.75rem' }}>Session Password</label>
+              <div style={{ position: 'relative' }}>
+                <input
+                  className="input"
+                  type="password"
+                  placeholder="Required for security"
+                  value={inputPassword}
+                  onChange={e => setInputPassword(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleJoin()}
+                  style={{ paddingLeft: '2.5rem' }}
+                />
+                <Icon name="lock" size={16} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-dim)' }} />
               </div>
-              {mode === 'stored' && <DurationPicker />}
-              {!storedEnabled && mode === 'stored' && (
-                <div style={{ marginTop: '10px', fontSize: '12px', color: T.amber }}>
-                  MongoDB is not enabled on the server right now, so stored publishing is unavailable until it is connected.
-                </div>
-              )}
-            </Card>
+            </div>
 
-            <Btn
-              primary
-              onClick={() => mode === 'stored' ? handleStoredPublish() : handleLivePublish()}
-              disabled={(mode === 'stored' && !hasPayload) || publishing}
-              style={{ width: '100%', padding: '13px', minHeight: '48px' }}
-            >
-              {publishing ? <><Spinner /> Publishing...</> : 'Publish'}
-            </Btn>
-
-            {publishError && (
-              <div style={{ marginTop: '10px', fontSize: '13px', color: T.red }}>
-                {publishError}
+            {joinError && (
+              <div style={{ marginTop: '1.25rem', color: 'var(--error)', fontSize: '0.875rem', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Icon name="shield" size={14} />
+                {joinError}
               </div>
             )}
+          </Card>
+        </section>
+      )}
+
+      {view === 'publish' && !publishedMode && (
+        <section className="animate-fade">
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '2rem' }}>
+            <Btn small onClick={() => setView('home')}>← Home</Btn>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Icon name="cloud" size={16} style={{ color: 'var(--accent)' }} />
+              <span style={{ fontSize: '0.875rem', fontWeight: 600 }}>Create Session</span>
+            </div>
           </div>
-        )}
 
-        {publishedMode === 'stored' && (
-          <div className="fade-in">
-            <Card style={{ textAlign: 'center', padding: '28px 20px' }}>
-              <div style={{ fontSize: '11px', letterSpacing: '2px', textTransform: 'uppercase', color: T.muted, marginBottom: '10px' }}>Your code</div>
-              <div style={{ fontFamily: T.mono, fontSize: 'clamp(36px, 10vw, 52px)', fontWeight: 500, letterSpacing: '10px', color: T.accent, marginBottom: '14px' }}>{code}</div>
-              <Btn small onClick={copyCode} style={{ marginBottom: '18px', minWidth: '90px' }}>
-                {copiedCode ? '✓ Copied' : 'Copy code'}
+          <Card>
+            <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '0.75rem' }}>Content</label>
+            <textarea
+              className="input"
+              style={{ minHeight: '120px', resize: 'vertical', marginBottom: '1.5rem' }}
+              placeholder="Paste links, text snippets, or markdown..."
+              value={text}
+              onChange={e => setText(e.target.value)}
+            />
+
+            <div style={{ position: 'relative', borderRadius: 'var(--radius)', border: '2px dashed var(--border)', padding: '1.5rem', textAlign: 'center' }}>
+              <input type="file" multiple onChange={handleFileChange} style={{ position: 'absolute', inset: 0, opacity: 0, cursor: 'pointer' }} />
+              <Icon name="file" size={24} style={{ color: 'var(--accent)', marginBottom: '8px' }} />
+              <p style={{ fontSize: '0.875rem', fontWeight: 500 }}>Drop files here or click to browse</p>
+              <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginTop: '4px' }}>Max 100MB per file</p>
+            </div>
+            {files.length > 0 && <FilePills fileList={files} onRemove={i => setFiles(prev => prev.filter((_, j) => j !== i))} />}
+          </Card>
+
+          <Card>
+            <div style={{ marginBottom: '1.5rem' }}>
+              <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '0.75rem' }}>Security</label>
+              <div style={{ position: 'relative' }}>
+                <input
+                  className="input"
+                  type="password"
+                  placeholder="Set session password"
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  style={{ paddingLeft: '2.5rem' }}
+                />
+                <Icon name="lock" size={16} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-dim)' }} />
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px', padding: '1rem', background: 'var(--surface-hi)', borderRadius: 'var(--radius)' }}>
+              <Icon name={effectiveMode === 'stored' ? 'cloud' : 'zap'} size={20} style={{ color: 'var(--accent)', marginTop: '2px' }} />
+              <div style={{ flex: 1 }}>
+                <p style={{ fontSize: '0.875rem', fontWeight: 700, marginBottom: '2px' }}>
+                  {effectiveMode === 'stored' ? 'Cloud Storage' : 'Live P2P'}
+                </p>
+                <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)', lineHeight: '1.4' }}>
+                  {effectiveMode === 'stored' 
+                    ? 'Encrypted on our servers. Access anytime until expiry.' 
+                    : 'Direct device-to-device. Keep this tab open to transfer.'}
+                </p>
+              </div>
+            </div>
+            {effectiveMode === 'stored' && (
+              <div style={{ marginTop: '1rem' }}>
+                <DurationPicker ttlSeconds={ttlSeconds} setStoredDuration={setStoredDuration} />
+              </div>
+            )}
+          </Card>
+
+          <Btn
+            primary
+            onClick={() => effectiveMode === 'stored' ? handleStoredPublish() : handleLivePublish()}
+            disabled={!hasPayload || publishing || !password}
+            style={{ width: '100%', height: '52px' }}
+          >
+            {publishing ? <Spinner /> : 'Launch Session'}
+          </Btn>
+
+          {publishError && <div style={{ marginTop: '1rem', color: 'var(--error)', textAlign: 'center', fontSize: '0.9rem' }}>{publishError}</div>}
+        </section>
+      )}
+
+      {(publishedMode === 'stored' || publishedMode === 'live') && (
+        <section className="animate-fade">
+          <Card style={{ textAlign: 'center' }}>
+            <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '1.5rem' }}>Session Live</label>
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: '3.5rem', fontWeight: 800, letterSpacing: '0.1em', color: 'var(--text)', marginBottom: '1.5rem' }}>{code}</div>
+            
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', marginBottom: '2rem' }}>
+              <Btn onClick={copyCode} style={{ flex: 1 }}>
+                <Icon name={copiedCode ? 'check' : 'copy'} size={16} />
+                {copiedCode ? 'Copied' : 'Copy Code'}
               </Btn>
-              {code && (
-                <div style={{ display: 'inline-block', padding: '12px', background: T.surface, borderRadius: T.radiusSm }}>
-                  <QRCodeSVG value={qrUrl} size={140} bgColor="transparent" fgColor={T.text} level="M" />
-                </div>
-              )}
-              {countdown && (
-                <div style={{ marginTop: '12px', fontSize: '13px', color: countdown === 'Expired' ? T.red : T.muted }}>
-                  {countdown === 'Expired' ? '⚠ Expired' : `Expires in ${countdown}`}
-                </div>
-              )}
-              <div style={{ marginTop: '6px', fontSize: '12px', color: T.dim }}>You can close this tab. Edit below to update the stored session.</div>
-            </Card>
+              <Btn onClick={reset} style={{ flex: 1 }}>New Session</Btn>
+            </div>
 
+            <div style={{ background: '#fff', padding: '1.5rem', borderRadius: 'var(--radius)', display: 'inline-block', marginBottom: '1rem' }}>
+              <QRCodeSVG value={qrUrl} size={160} level="H" />
+            </div>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>Scan to join from another device</p>
+
+            {countdown && publishedMode === 'stored' && (
+              <div style={{ marginTop: '1.5rem', fontSize: '0.875rem', fontWeight: 600, color: 'var(--accent)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}>
+                <Icon name="shield" size={14} />
+                Expires in {countdown}
+              </div>
+            )}
+          </Card>
+
+          {publishedMode === 'live' && (
             <Card>
-              <div style={{ fontSize: '12px', color: T.muted, marginBottom: '8px' }}>Update content</div>
-              <textarea
-                style={{ ...iStyle({ width: '100%', height: '90px', resize: 'vertical' }), display: 'block' }}
-                placeholder="Enter text to share..."
-                value={text}
-                onChange={e => setText(e.target.value)}
-              />
-              <div style={{ marginTop: '10px' }}>
-                <input type="file" multiple onChange={handleFileChange} style={{ color: T.muted, fontSize: '13px', width: '100%' }} />
-                {files.length > 0 && <FilePills fileList={files} onRemove={i => setFiles(prev => prev.filter((_, j) => j !== i))} />}
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '1.5rem' }}>
+                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: sigColor() }} />
+                <span style={{ fontSize: '0.875rem', fontWeight: 600, color: sigColor() }}>{sigLabel()}</span>
+                <Icon name="zap" size={14} style={{ marginLeft: 'auto', color: 'var(--text-dim)' }} />
               </div>
-              <DurationPicker />
-              {payloadBytes > STORED_MAX && (
-                <div style={{ marginTop: '10px', fontSize: '12px', color: T.red }}>Total payload exceeds 10 MB — switch to live mode or reduce content.</div>
-              )}
-              {uploadPercent !== null && (
-                <div style={{ marginTop: '12px' }}>
-                  <ProgressBar percent={uploadPercent} />
-                  <div style={{ fontSize: '11px', color: T.muted, marginTop: '4px' }}>Uploading {uploadPercent}%</div>
-                </div>
-              )}
-              <Btn primary onClick={handleStoredPublish} disabled={!hasPayload || publishing || payloadBytes > STORED_MAX} style={{ width: '100%', marginTop: '14px', minHeight: '44px' }}>
-                {publishing ? <><Spinner /> Updating...</> : 'Publish update'}
-              </Btn>
-            </Card>
-          </div>
-        )}
 
-        {publishedMode === 'live' && (
-          <div className="fade-in">
-            <Card style={{ padding: '18px 16px' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '14px' }}>
-                <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: sigColor(), flexShrink: 0, animation: sigState.startsWith('reconnecting') ? 'pulse 1.5s infinite' : 'none' }} />
-                <span style={{ fontSize: '12px', color: sigColor(), fontFamily: T.mono }}>{sigState}</span>
-                <span style={{ marginLeft: 'auto', fontSize: '11px', color: T.dim }}>Keep tab open</span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap' }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: '10px', letterSpacing: '2px', textTransform: 'uppercase', color: T.muted, marginBottom: '4px' }}>Code</div>
-                  <div style={{ fontFamily: T.mono, fontSize: 'clamp(28px, 8vw, 40px)', fontWeight: 500, letterSpacing: '8px', color: T.accent }}>{code}</div>
-                  <Btn small onClick={copyCode} style={{ marginTop: '8px' }}>{copiedCode ? '✓ Copied' : 'Copy'}</Btn>
-                </div>
-                {code && (
-                  <div style={{ padding: '8px', background: T.bg, borderRadius: T.radiusSm, flexShrink: 0 }}>
-                    <QRCodeSVG value={qrUrl} size={84} bgColor="transparent" fgColor={T.text} level="M" />
+              <div style={{ textAlign: 'center', padding: '2rem', background: 'var(--bg)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+                <p style={{ fontSize: '1.125rem', fontWeight: 700, marginBottom: '0.5rem' }}>
+                  {recipients.length === 0 ? 'Waiting for recipients...' : `${recipients.length} User(s) Connected`}
+                </p>
+                {recipients.some(r => r.sendProgress) && (
+                  <div style={{ marginTop: '1.5rem' }}>
+                    <p style={{ fontSize: '0.875rem', color: 'var(--accent)', marginBottom: '0.75rem', fontWeight: 600 }}>Transferring data...</p>
+                    <ProgressBar percent={recipients.find(r => r.sendProgress)?.sendProgress?.percent || 0} />
                   </div>
                 )}
               </div>
             </Card>
+          )}
 
-            <Card>
-              <textarea
-                style={{ ...iStyle({ width: '100%', height: '88px', resize: 'vertical' }), display: 'block', marginBottom: '10px' }}
-                placeholder="Enter text to share..."
-                value={text}
-                onChange={e => setText(e.target.value)}
-              />
-              <input type="file" multiple onChange={handleFileChange} style={{ color: T.muted, fontSize: '13px', width: '100%' }} />
-              {files.length > 0 && <FilePills fileList={files} onRemove={i => setFiles(prev => prev.filter((_, j) => j !== i))} />}
-            </Card>
-
-            <Card>
-              {recipients.length === 0 ? (
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: T.muted, fontSize: '13px' }}>
-                  <span style={{ animation: 'pulse 2s infinite' }}>⋯</span> Waiting for recipients...
-                </div>
-              ) : (
-                <>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-                    <span style={{ fontSize: '12px', color: T.muted }}>{recipients.length} recipient{recipients.length !== 1 ? 's' : ''}</span>
-                    <Btn small primary onClick={handleSendAll} disabled={!hasPayload || openRecipients.length === 0}>Send all</Btn>
-                  </div>
-                  {recipients.map(r => (
-                    <div key={r.peerId} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 0', borderTop: `1px solid ${T.border}`, flexWrap: 'wrap' }}>
-                      <div style={{ width: '7px', height: '7px', borderRadius: '50%', background: r.channelState === 'open' ? T.green : r.channelState === 'error' ? T.red : T.dim, flexShrink: 0 }} />
-                      <span style={{ flex: 1, fontSize: '13px', minWidth: '80px' }}>{r.displayName}</span>
-                      {r.sendProgress && r.sendProgress.percent < 100 && (
-                        <div style={{ flex: 1, minWidth: '100px' }}>
-                          <ProgressBar percent={r.sendProgress.percent} />
-                          <div style={{ fontSize: '11px', color: T.muted, marginTop: '2px' }}>{r.sendProgress.currentFile ?? 'Sending...'} {r.sendProgress.percent}%</div>
-                        </div>
-                      )}
-                      {r.lastSentAt && !r.sendProgress && <span style={{ fontSize: '11px', color: T.muted }}>✓ {new Date(r.lastSentAt).toLocaleTimeString()}</span>}
-                      <Btn small primary onClick={() => handleSendTo(r.peerId)} disabled={r.channelState !== 'open' || !hasPayload}>Send</Btn>
-                    </div>
-                  ))}
-                </>
-              )}
-            </Card>
+          <div style={{ marginTop: '1.5rem', textAlign: 'center' }}>
+            <Btn onClick={reset} style={{ opacity: 0.6 }}>Create another session</Btn>
           </div>
-        )}
+        </section>
+      )}
 
-        {view === 'join' && storedPayload && (
-          <div className="fade-in">
-            <Card style={{ textAlign: 'center', padding: '20px' }}>
-              <div style={{ fontSize: '11px', letterSpacing: '2px', textTransform: 'uppercase', color: T.green, marginBottom: '8px' }}>✓ Received</div>
-              <div style={{ fontFamily: T.mono, fontSize: '32px', fontWeight: 500, letterSpacing: '8px', color: T.accent }}>{code}</div>
-              {countdown && <div style={{ marginTop: '8px', fontSize: '12px', color: countdown === 'Expired' ? T.red : T.muted }}>{countdown === 'Expired' ? '⚠ Expired' : `Valid for ${countdown}`}</div>}
-            </Card>
-            {storedPayload.text && (
-              <Card>
-                <div style={{ fontSize: '12px', color: T.muted, marginBottom: '8px' }}>Text</div>
-                <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', lineHeight: 1.65, background: T.bg, padding: '12px', borderRadius: T.radiusSm }}>{storedPayload.text}</div>
-              </Card>
-            )}
-            {storedPayload.files.length > 0 && (
-              <Card>
-                <div style={{ fontSize: '12px', color: T.muted, marginBottom: '10px' }}>Files</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                  {storedPayload.files.map((f, i) => (
-                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                      <span style={{ flex: 1, fontSize: '13px', minWidth: '80px' }}>{f.name}</span>
-                      <span style={{ fontSize: '11px', color: T.muted, flexShrink: 0 }}>{formatBytes(f.size)}</span>
-                      <div style={{ display: 'flex', gap: '6px' }}>
-                        <Btn small onClick={() => handleStoredPreview(f)}>Preview</Btn>
-                        <Btn small primary onClick={() => handleStoredDownload(f)}>Download</Btn>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </Card>
-            )}
-          </div>
-        )}
-
-        {view === 'join' && !storedPayload && channelState !== 'open' && channelState !== 'error' && (
-          <Card className="fade-in" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <Spinner /><span style={{ fontSize: '13px', color: T.muted }}>Connecting to live session...</span>
-          </Card>
-        )}
-
-        {view === 'join' && !storedPayload && channelState === 'error' && !transferError && (
-          <Card className="fade-in" style={{ borderColor: T.red }}>
-            <div style={{ color: T.red, marginBottom: '8px', fontWeight: 500 }}>✕ Connection failed</div>
-            <div style={{ fontSize: '13px', color: T.muted, lineHeight: 1.55 }}>Could not establish a direct connection. This usually happens on restricted networks. Try switching to WiFi or ask the sender to try from a different network.</div>
-          </Card>
-        )}
-
-        {view === 'join' && !storedPayload && channelState === 'open' && !received && !recvProgress && !transferError && (
-          <Card className="fade-in" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <span style={{ animation: 'pulse 2s infinite', fontSize: '16px' }}>⋯</span>
-            <span style={{ fontSize: '13px', color: T.muted }}>Connected — waiting for sender...</span>
-          </Card>
-        )}
-
-        {transferError && !received && (
-          <Card className="fade-in" style={{ borderColor: T.red }}>
-            <div style={{ color: T.red, marginBottom: '6px', fontWeight: 500 }}>✕ Transfer failed</div>
-            <div style={{ fontSize: '13px', color: T.muted }}>{transferError}</div>
-          </Card>
-        )}
-
-        {recvProgress && recvProgress.percent < 100 && !received && (
-          <Card className="fade-in">
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-              <span style={{ fontSize: '13px' }}>{recvProgress.currentFile ?? 'Receiving...'}</span>
-              <span style={{ fontFamily: T.mono, fontSize: '13px', color: T.accent }}>{recvProgress.percent}%</span>
+      {/* Recipient View */}
+      {view === 'join' && (
+        <section className="animate-fade">
+          <Card style={{ textAlign: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', justifyContent: 'center', marginBottom: '1.5rem' }}>
+              <Icon name="zap" size={16} style={{ color: channelState === 'open' ? 'var(--success)' : 'var(--error)' }} />
+              <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-dim)' }}>P2P {channelLabel(channelState)}</span>
             </div>
-            <ProgressBar percent={recvProgress.percent} />
-            <div style={{ marginTop: '6px', fontSize: '11px', color: T.muted }}>{formatBytes(recvProgress.bytesDone)} / {formatBytes(recvProgress.bytesTotal)}</div>
-          </Card>
-        )}
+            
+            <h2 style={{ fontSize: '1.5rem', fontWeight: 800, marginBottom: '2rem' }}>
+              {recvProgress ? `Receiving... ${recvProgress.percent}%` : (storedPayload || received) ? 'Session Content' : 'Connecting...'}
+            </h2>
 
-        {received && (
-          <div className="fade-in">
-            <Card style={{ textAlign: 'center', padding: '18px' }}>
-              <div style={{ fontSize: '11px', letterSpacing: '2px', textTransform: 'uppercase', color: T.green, marginBottom: '8px' }}>✓ Received</div>
-              <div style={{ fontFamily: T.mono, fontSize: '32px', fontWeight: 500, letterSpacing: '8px', color: T.accent }}>{code}</div>
-            </Card>
-            {received.text && (
-              <Card>
-                <div style={{ fontSize: '12px', color: T.muted, marginBottom: '8px' }}>Text</div>
-                <div style={{ whiteSpace: 'pre-wrap', fontSize: '14px', lineHeight: 1.65, background: T.bg, padding: '12px', borderRadius: T.radiusSm }}>{received.text}</div>
-              </Card>
+            {recvProgress && (
+              <div style={{ marginBottom: '2rem' }}>
+                <ProgressBar percent={recvProgress.percent} />
+                <p style={{ fontSize: '0.8125rem', color: 'var(--text-dim)', marginTop: '0.75rem', fontWeight: 500 }}>
+                  {recvProgress.currentFile}
+                </p>
+              </div>
             )}
-            {received.files.length > 0 && (
-              <Card>
-                <div style={{ fontSize: '12px', color: T.muted, marginBottom: '10px' }}>Files</div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                  {received.files.map((f, i) => (
-                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                      <span style={{ flex: 1, fontSize: '13px', minWidth: '80px' }}>{f.name}</span>
-                      <span style={{ fontSize: '11px', color: T.muted, flexShrink: 0 }}>{formatBytes(f.blob.size)}</span>
-                      <div style={{ display: 'flex', gap: '6px' }}>
-                        <Btn small onClick={() => handleLivePreview(f)}>Preview</Btn>
-                        <Btn small primary onClick={() => handleLiveDownload(f)}>Download</Btn>
-                      </div>
+
+            {(storedPayload || received) ? (
+              <div style={{ textAlign: 'left' }}>
+                {(storedPayload?.text || received?.text) && (
+                  <div style={{ marginBottom: '2rem' }}>
+                    <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '0.75rem' }}>Message</label>
+                    <div style={{ padding: '1.25rem', background: 'var(--bg)', borderRadius: 'var(--radius)', border: '1px solid var(--border)', whiteSpace: 'pre-wrap', fontSize: '0.95rem', lineHeight: '1.6' }}>
+                      {storedPayload?.text || received?.text}
                     </div>
-                  ))}
-                </div>
-              </Card>
+                  </div>
+                )}
+
+                {(storedPayload?.files?.length || received?.files?.length) && (
+                  <div>
+                    <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '0.75rem' }}>Files</label>
+                    <div style={{ display: 'grid', gap: '12px' }}>
+                      {(storedPayload?.files || received?.files || []).map((f, i) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', background: 'var(--surface-hi)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+                          <Icon name="file" size={18} style={{ color: 'var(--accent)' }} />
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <p style={{ fontSize: '0.875rem', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</p>
+                            {'size' in f && <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>{formatBytes(f.size)}</p>}
+                          </div>
+                          <div style={{ display: 'flex', gap: '8px' }}>
+                            <Btn small onClick={() => 'fileId' in f ? handleStoredPreview(f) : handleLivePreview(f)}>View</Btn>
+                            <Btn small primary onClick={() => 'fileId' in f ? handleStoredDownload(f) : handleLiveDownload(f)}>Get</Btn>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : !recvProgress && (
+              <div style={{ padding: '2rem 0' }}>
+                <Spinner style={{ width: '32px', height: '32px', margin: '0 auto', color: 'var(--accent)' }} />
+              </div>
             )}
+          </Card>
+          
+          <div style={{ textAlign: 'center', marginTop: '2rem' }}>
+            <Btn onClick={reset} style={{ opacity: 0.7 }}>Exit Session</Btn>
           </div>
-        )}
+        </section>
+      )}
+    </div>
+  )
+}
 
-        {(view !== 'home' || publishedMode) && (
-          <div style={{ marginTop: '8px' }}>
-            <Btn small onClick={reset} style={{ color: T.muted }}>← New session</Btn>
-          </div>
-        )}
+// ── Sub-Components (Defined outside App to prevent re-mounts) ─────────────────
 
+function DurationPicker({ ttlSeconds, setStoredDuration }: { ttlSeconds: number, setStoredDuration: (h: number, m: number) => void }) {
+  const parts = splitStoredTtl(ttlSeconds)
+
+  return (
+    <div style={{ marginTop: '1rem', padding: '1rem', background: 'var(--surface-hi)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+      <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <Icon name="shield" size={14} />
+          <span>Session Expiry</span>
+        </div>
+        <span style={{ color: 'var(--accent)' }}>{formatTTL(ttlSeconds)}</span>
       </div>
-    </>
-  )
-}
-
-function Card({ children, style, className }: { children: React.ReactNode; style?: React.CSSProperties; className?: string }) {
-  return (
-    <div className={className} style={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: T.radius, padding: '16px', marginBottom: '12px', ...style }}>
-      {children}
+      <div style={{ display: 'flex', gap: '2rem', alignItems: 'center' }}>
+        <Stepper
+          value={parts.hours} min={0} max={10} label="hr"
+          onUpdate={v => setStoredDuration(v, parts.minutes)}
+        />
+        <Stepper
+          value={parts.minutes} min={0} max={59} label="min"
+          onUpdate={v => setStoredDuration(parts.hours, v)}
+        />
+      </div>
     </div>
   )
 }
 
-function Pill({ children }: { children: React.ReactNode; key?: unknown }) {
-  return (
-    <div style={{ display: 'inline-flex', alignItems: 'center', gap: '5px', background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusSm, padding: '3px 8px', fontSize: '12px' }}>
-      {children}
-    </div>
-  )
-}
-
-function Btn({ children, primary, small, disabled, onClick, style, className }: {
-  children: React.ReactNode; primary?: boolean; small?: boolean
-  disabled?: boolean; onClick?: () => void; style?: React.CSSProperties; className?: string
+function Stepper({ value, min, max, label, onUpdate }: {
+  value: number, min: number, max: number, label: string, onUpdate: (v: number) => void
 }) {
+  const timerRef = useRef<any>(null)
+  const intervalRef = useRef<any>(null)
+
+  const startChange = (delta: number) => {
+    onUpdate(Math.min(max, Math.max(min, value + delta)))
+    timerRef.current = setTimeout(() => {
+      intervalRef.current = setInterval(() => {
+        onUpdate(Math.min(max, Math.max(min, value + delta)))
+      }, 80)
+    }, 400)
+  }
+
+  const stopChange = () => {
+    if (timerRef.current) clearTimeout(timerRef.current)
+    if (intervalRef.current) clearInterval(intervalRef.current)
+  }
+
   return (
-    <button onClick={onClick} disabled={disabled} className={className} style={{
-      padding: small ? '7px 14px' : '10px 20px', fontSize: small ? '12px' : '14px', fontWeight: 500,
-      border: primary ? 'none' : `1px solid ${T.borderHi}`, borderRadius: T.radiusSm,
-      background: primary ? (disabled ? T.accentDim : T.accent) : 'transparent',
-      color: primary ? (disabled ? T.muted : '#000') : T.text,
-      opacity: disabled ? 0.5 : 1, cursor: disabled ? 'not-allowed' : 'pointer',
-      display: 'inline-flex', alignItems: 'center', gap: '6px', justifyContent: 'center',
-      minHeight: small ? '36px' : '44px', transition: 'opacity 0.15s', ...style,
-    }}>
-      {children}
-    </button>
+    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+      <button
+        className="btn btn-secondary"
+        style={{ width: '32px', height: '32px', padding: 0 }}
+        onMouseDown={() => startChange(-1)} onMouseUp={stopChange} onMouseLeave={stopChange}
+        onTouchStart={() => startChange(-1)} onTouchEnd={stopChange}
+      >−</button>
+      <div style={{ width: '32px', textAlign: 'center', fontSize: '1rem', fontWeight: 700, fontFamily: 'var(--font-mono)' }}>
+        {String(value).padStart(2, '0')}
+      </div>
+      <button
+        className="btn btn-secondary"
+        style={{ width: '32px', height: '32px', padding: 0 }}
+        onMouseDown={() => startChange(1)} onMouseUp={stopChange} onMouseLeave={stopChange}
+        onTouchStart={() => startChange(1)} onTouchEnd={stopChange}
+      >+</button>
+      <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', fontWeight: 600 }}>{label}</span>
+    </div>
   )
 }
 
 function ProgressBar({ percent }: { percent: number }) {
   return (
-    <div style={{ height: '4px', background: T.dim, borderRadius: '2px', overflow: 'hidden' }}>
-      <div style={{ height: '100%', width: `${percent}%`, background: T.accent, transition: 'width 0.1s' }} />
+    <div className="progress-bar">
+      <div className="progress-fill" style={{ width: `${percent}%` }} />
     </div>
   )
 }
 
-function Spinner() {
-  return <div style={{ width: '14px', height: '14px', border: `2px solid ${T.dim}`, borderTopColor: T.accent, borderRadius: '50%', animation: 'spin 0.7s linear infinite', flexShrink: 0 }} />
+function Spinner({ style }: { style?: React.CSSProperties }) {
+  return (
+    <svg style={{ width: '20px', height: '20px', animation: 'spin 1s linear infinite', ...style }} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+    </svg>
+  )
 }
 
-function iStyle(extra?: React.CSSProperties): React.CSSProperties {
-  return { background: T.bg, border: `1px solid ${T.border}`, borderRadius: T.radiusSm, color: T.text, padding: '10px 12px', fontSize: '14px', outline: 'none', ...extra }
+function FilePills({ fileList, onRemove }: { fileList: File[]; onRemove: (i: number) => void }) {
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginTop: '1rem' }}>
+      {fileList.map((f, i) => (
+        <div key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: '100px', padding: '4px 12px', fontSize: '0.75rem' }}>
+          <span style={{ maxWidth: '140px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+          <button onClick={() => onRemove(i)} style={{ background: 'none', border: 'none', color: 'var(--error)', cursor: 'pointer', fontWeight: 800 }}>✕</button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+
+function Card({ children, className = '', onClick, style }: { children: React.ReactNode; className?: string; onClick?: () => void; style?: React.CSSProperties }) {
+  return (
+    <div className={`card ${className}`} onClick={onClick} style={style}>
+      {children}
+    </div>
+  )
+}
+
+function Btn({ children, primary, small, disabled, onClick, style, className = '' }: {
+  children: React.ReactNode; primary?: boolean; small?: boolean
+  disabled?: boolean; onClick?: () => void; style?: React.CSSProperties; className?: string
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`btn ${primary ? 'btn-primary' : 'btn-secondary'} ${className}`}
+      style={{
+        padding: small ? '0.5rem 1rem' : undefined,
+        fontSize: small ? '0.8rem' : undefined,
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  )
+}
+
+function Icon({ name, size = 20, style }: { name: 'rocket' | 'lock' | 'cloud' | 'shield' | 'zap' | 'file' | 'copy' | 'check' | 'sun' | 'moon', size?: number, style?: React.CSSProperties }) {
+  const icons = {
+    rocket: <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.71-2.13.09-2.91a2.18 2.18 0 0 0-3.09-.09zm9.24-9.25L10.03 11l-1.42-1.42 3.71-3.71A5.002 5.002 0 0 1 18 5c0 2.21-1.79 4-4 4a5.002 5.002 0 0 1-4.26-2.25zm.76 10.75l1.42 1.42-3.71 3.71A5.002 5.002 0 0 1 6 19c0-2.21 1.79-4 4-4a5.002 5.002 0 0 1 4.26 2.25l3.74-3.75zM14 11l5-5m-1 5l5-5" />,
+    lock: <><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></>,
+    cloud: <path d="M17.5 19c2.5 0 4.5-2 4.5-4.5 0-2.2-1.6-4.1-3.7-4.4C17.8 6.6 14.7 4 11 4c-3.3 0-6.1 2.1-7.2 5.1C1.6 9.6 0 11.4 0 13.5 0 15.4 1.6 17 3.5 17h14M9 13l3-3 3 3M12 10v9" />,
+    shield: <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />,
+    zap: <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />,
+    file: <><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z" /><polyline points="13 2 13 9 20 9" /></>,
+    copy: <><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></>,
+    check: <polyline points="20 6 9 17 4 12" />,
+    sun: <><circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.07" x2="5.64" y2="17.66" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" /></>,
+    moon: <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+  }
+  return (
+    <svg width={size} height={size} style={style} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      {icons[name]}
+    </svg>
+  )
 }

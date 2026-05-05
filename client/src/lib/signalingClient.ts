@@ -12,10 +12,11 @@ interface SignalingClientOptions {
   onError?: (err: Event) => void
   onReconnecting?: (attempt: number, maxAttempts: number) => void
   onReconnectFailed?: () => void
+  password?: string
 }
 
-const RECONNECT_BASE_MS  = 1000   // 1s initial delay
-const RECONNECT_MAX_MS   = 30000  // 30s max delay
+const RECONNECT_BASE_MS = 1000   // 1s initial delay
+const RECONNECT_MAX_MS = 30000  // 30s max delay
 const RECONNECT_MAX_ATTEMPTS = 5
 
 export class SignalingClient {
@@ -42,7 +43,9 @@ export class SignalingClient {
     ws.onopen = () => {
       this.reconnectAttempt = 0  // Reset on successful connect
       // Re-send join on every (re)connect — server needs it to rebuild ctx
-      this.send({ type: 'join', payload: { code: this.opts.code, role: this.opts.role } })
+      const joinPayload: any = { code: this.opts.code, role: this.opts.role }
+      if (this.opts.password) joinPayload.password = this.opts.password
+      this.send({ type: 'join', payload: joinPayload })
       this.opts.onOpen?.()
     }
 
@@ -85,9 +88,9 @@ export class SignalingClient {
     }
 
     // Exponential backoff + jitter to avoid thundering herd
-    const exp   = Math.min(RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempt), RECONNECT_MAX_MS)
+    const exp = Math.min(RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempt), RECONNECT_MAX_MS)
     const jitter = Math.random() * 500
-    const delay  = Math.round(exp + jitter)
+    const delay = Math.round(exp + jitter)
 
     this.reconnectAttempt++
     console.log(`[signaling] reconnecting in ${delay}ms (attempt ${this.reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})`)
