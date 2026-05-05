@@ -162,7 +162,7 @@ export default function App() {
           setStoredEnabled(data.storedModeEnabled)
         }
       } catch (err) {
-        console.warn('[health] check failed, assuming optimistic support')
+        setStoredEnabled(true)
       }
     }
     checkStatus()
@@ -284,7 +284,7 @@ export default function App() {
       const url = isUpdate ? `${API_URL}/publish/${code}` : `${API_URL}/publish`
       const method = isUpdate ? 'PATCH' : 'POST'
 
-      const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string; details?: string }>((resolve, reject) => {
+      const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string }>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         xhr.open(method, url)
         if (password) {
@@ -308,7 +308,7 @@ export default function App() {
       })
 
       if (data.error) {
-        setPublishError(data.details ? `${data.error}: ${data.details}` : data.error)
+        setPublishError(data.error.includes('not found') ? 'Session not found.' : 'Could not complete publish.')
         if (data.error.includes('not found') && isUpdate) { setCode(''); setPublishedMode(null) }
         setPublishing(false)
         return
@@ -334,7 +334,7 @@ export default function App() {
       })
       const data = await res.json()
       if (!res.ok) {
-        setPublishError(data?.details ? `${data.error ?? 'Failed to create session'}: ${data.details}` : (data?.error ?? 'Failed to create session'))
+        setPublishError('Could not complete publish.')
         setPublishing(false)
         return
       }
@@ -360,7 +360,7 @@ export default function App() {
       })
       setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, lastSentAt: Date.now(), sendProgress: null } : x))
     } catch (err) {
-      console.error('[p2p] send error:', err)
+      alert('Connection issue. Please try again.')
     }
   }
 
@@ -382,7 +382,7 @@ export default function App() {
           try {
             data.text = await decrypt(base64ToArrayBuffer(data.text), inputPassword, true) as string
           } catch (e) {
-            console.warn('[crypto] text decryption failed', e)
+            setJoinError('Unable to decrypt the message.')
           }
         }
         
@@ -412,12 +412,10 @@ export default function App() {
         setJoining(false)
         return
       }
-      const err = await res.json()
-      setJoinError(err.error ?? 'Unknown error')
+      await res.json()
+      setJoinError('Could not join session.')
     } catch (err: any) {
-      setJoinError(err?.message?.includes('Failed to fetch')
-        ? 'Cannot reach the server. Check your internet connection.'
-        : (err?.message ?? 'An unexpected error occurred.'));
+      setJoinError('Server not connected.')
     }
     setJoining(false)
   }
@@ -441,8 +439,7 @@ export default function App() {
             const decrypted = await decrypt(buffer, inputPassword, false) as ArrayBuffer
             finalBlob = new Blob([decrypted], { type: f.mimeType })
           } catch (e) {
-            console.error('[crypto] decryption failed', e)
-            alert('Decryption failed. The file might be corrupted or the password incorrect.')
+            alert('Unable to open the file.')
             return
           }
         }
@@ -470,8 +467,7 @@ export default function App() {
             const decrypted = await decrypt(buffer, inputPassword, false) as ArrayBuffer
             finalBlob = new Blob([decrypted], { type: f.mimeType })
           } catch (e) {
-            console.error('[crypto] decryption failed', e)
-            alert('Failed to preview file. The file might be corrupted or the password incorrect.')
+            alert('Unable to open the file.')
             return
           }
         }
@@ -479,7 +475,7 @@ export default function App() {
         window.open(u, '_blank', 'noopener')
         setTimeout(() => URL.revokeObjectURL(u), 60000)
       })
-      .catch(() => alert('Failed to preview file.'))
+      .catch(() => alert('Server not connected.'))
   }
 
   function handleLiveDownload(f: ReceivedFile) {

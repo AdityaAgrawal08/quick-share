@@ -39,7 +39,6 @@ export class WebRTCManager {
       if (candidate) {
         const candidateType = candidate.type ?? 'unknown' // 'host', 'srflx', 'relay', 'prflx'
         this.gatheredCandidateTypes.add(candidateType)
-        console.log(`[webrtc:${this.opts.peerId.slice(0, 8)}] ICE candidate: ${candidateType} (gathered: ${Array.from(this.gatheredCandidateTypes).join(',')})`)
         
         this.opts.signalingClient.send({
           type: 'ice',
@@ -49,18 +48,12 @@ export class WebRTCManager {
       } else {
         // null candidate = candidate gathering complete
         const types = Array.from(this.gatheredCandidateTypes)
-        if (types.length === 0) {
-          console.warn('[webrtc] No ICE candidates gathered — network interface may be unavailable')
-        } else if (!types.includes('host') && !types.includes('srflx')) {
-          console.warn('[webrtc] Only relay candidates gathered — may indicate NAT issue, TURN fallback in effect')
-        }
-        console.log(`[webrtc:${this.opts.peerId.slice(0, 8)}] ICE gathering complete: ${types.join(',')}`)
+        void types
       }
     }
 
     this.pc.oniceconnectionstatechange = () => {
       const state = this.pc?.iceConnectionState
-      console.log(`[webrtc:${this.opts.peerId.slice(0, 8)}] ICE:`, state)
       
       // FIX 7: Detect specific ICE failure modes
       if (state === 'failed') {
@@ -69,18 +62,12 @@ export class WebRTCManager {
         // - Symmetric NAT (needs TURN)
         // - Misconfigured STUN/TURN
         // - Network routing issue
-        console.error('[webrtc] ICE connection failed — possible NAT/firewall issue, TURN may be required')
         this.opts.onChannelStateChange('error')
-      } else if (state === 'disconnected') {
-        // Connection was working but temporarily disconnected
-        // May recover or may fail completely
-        console.warn('[webrtc] ICE disconnected — network may be unstable')
       }
     }
 
     this.pc.onconnectionstatechange = () => {
       const state = this.pc?.connectionState
-      console.log(`[webrtc:${this.opts.peerId.slice(0, 8)}] conn:`, state)
       if (state === 'failed' || state === 'disconnected') {
         this.opts.onChannelStateChange('error')
       }
@@ -105,9 +92,7 @@ export class WebRTCManager {
         payload: offer,
         peerId: this.opts.peerId,
       })
-      console.log(`[webrtc] offer sent to ${this.opts.peerId.slice(0, 8)}`)
     } catch (err) {
-      console.error('[webrtc] createOffer failed:', err)
       this.opts.onChannelStateChange('error')
     }
   }
@@ -115,7 +100,6 @@ export class WebRTCManager {
   private startAsRecipient(): void {
     if (!this.pc) return
     this.pc.ondatachannel = (event) => {
-      console.log('[webrtc] data channel received')
       this.channel = event.channel
       this.setupChannel(this.channel)
     }
@@ -135,14 +119,12 @@ export class WebRTCManager {
           payload: answer,
           peerId: this.opts.peerId,
         })
-        console.log('[webrtc] answer sent')
       }
 
       if (msg.type === 'answer') {
         await this.pc.setRemoteDescription(msg.payload as RTCSessionDescriptionInit)
         this.remoteDescriptionSet = true
         await this.flushPendingCandidates()
-        console.log('[webrtc] remote desc set from answer')
       }
 
       if (msg.type === 'ice') {
@@ -154,7 +136,7 @@ export class WebRTCManager {
         }
       }
     } catch (err) {
-      console.error('[webrtc] handleSignal error:', err)
+      this.opts.onChannelStateChange('error')
     }
   }
 
@@ -162,7 +144,9 @@ export class WebRTCManager {
     if (!this.pc || this.pendingCandidates.length === 0) return
     for (const init of this.pendingCandidates) {
       try { await this.pc.addIceCandidate(new RTCIceCandidate(init)) }
-      catch (err) { console.warn('[webrtc] buffered ICE failed:', err) }
+      catch {
+        this.opts.onChannelStateChange('error')
+      }
     }
     this.pendingCandidates = []
   }
@@ -174,8 +158,6 @@ export class WebRTCManager {
   send(data: string | ArrayBuffer): void {
     if (this.channel?.readyState === 'open') {
       this.channel.send(data as string & ArrayBuffer)
-    } else {
-      console.warn('[webrtc] channel not open:', this.channel?.readyState)
     }
   }
 
@@ -192,15 +174,12 @@ export class WebRTCManager {
   private setupChannel(channel: RTCDataChannel): void {
     this.opts.onChannelStateChange('connecting')
     channel.onopen = () => {
-      console.log('[webrtc] channel open')
       this.opts.onChannelStateChange('open')
     }
     channel.onclose = () => {
-      console.log('[webrtc] channel closed')
       this.opts.onChannelStateChange('closed')
     }
-    channel.onerror = (err) => {
-      console.error('[webrtc] channel error:', err)
+    channel.onerror = () => {
       this.opts.onChannelStateChange('error')
     }
     channel.onmessage = (event: MessageEvent) => {

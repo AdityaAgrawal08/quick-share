@@ -54,7 +54,7 @@ export class SignalingClient {
         const msg = JSON.parse(event.data as string) as SignalMessage
         this.opts.onMessage(msg)
       } catch {
-        console.error('[signaling] failed to parse message:', event.data)
+        // Ignore malformed signaling messages.
       }
     }
 
@@ -73,7 +73,6 @@ export class SignalingClient {
     }
 
     ws.onerror = (err) => {
-      console.error('[signaling] ws error', err)
       this.opts.onError?.(err)
       // onclose fires after onerror — reconnect logic lives there
     }
@@ -81,7 +80,6 @@ export class SignalingClient {
 
   private scheduleReconnect(): void {
     if (this.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
-      console.warn('[signaling] max reconnect attempts reached')
       this.opts.onClose?.()         // Fire onClose only when truly giving up
       this.opts.onReconnectFailed?.()
       return
@@ -93,7 +91,6 @@ export class SignalingClient {
     const delay = Math.round(exp + jitter)
 
     this.reconnectAttempt++
-    console.log(`[signaling] reconnecting in ${delay}ms (attempt ${this.reconnectAttempt}/${RECONNECT_MAX_ATTEMPTS})`)
     this.opts.onReconnecting?.(this.reconnectAttempt, RECONNECT_MAX_ATTEMPTS)
 
     this.reconnectTimer = setTimeout(() => {
@@ -105,8 +102,6 @@ export class SignalingClient {
   send(msg: SignalMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg))
-    } else {
-      console.warn('[signaling] attempted send on non-open socket', msg.type)
     }
   }
 
