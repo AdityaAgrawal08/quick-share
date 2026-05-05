@@ -263,6 +263,14 @@ app.post(
         return
       }
 
+      if (mongoose.connection.db) {
+        const stats = await mongoose.connection.db.stats()
+        if (stats && stats.dataSize > 450 * 1024 * 1024) {
+          res.status(503).json({ error: 'Cloud storage is not available for now. The website is in update.' })
+          return
+        }
+      }
+
       if (!text.trim() && uploadedFiles.length === 0) {
         res.status(400).json({ error: 'Nothing to publish — provide text or at least one file' })
         return
@@ -368,6 +376,14 @@ app.patch(
       if (totalBytes > STORED_MAX_BYTES) {
         res.status(400).json({ error: 'Total payload exceeds 10 MB limit for stored mode' })
         return
+      }
+
+      if (mongoose.connection.db) {
+        const stats = await mongoose.connection.db.stats()
+        if (stats && stats.dataSize > 450 * 1024 * 1024) {
+          res.status(503).json({ error: 'Cloud storage is not available for now. The website is in update.' })
+          return
+        }
       }
 
       if (!text.trim() && uploadedFiles.length === 0) {
@@ -649,6 +665,7 @@ app.post('/session', sessionLimiter, async (req: Request, res: Response) => {
 app.get('/health', async (_req: Request, res: Response) => {
   let mongoPing = -1
   let gridfsStatus = 'unknown'
+  let isStorageFull = false
   
   if (storedModeEnabled) {
     try {
@@ -657,6 +674,10 @@ app.get('/health', async (_req: Request, res: Response) => {
         await mongoose.connection.db.admin().ping()
         mongoPing = Date.now() - start
         gridfsStatus = 'connected'
+        const stats = await mongoose.connection.db.stats()
+        if (stats && stats.dataSize > 450 * 1024 * 1024) {
+          isStorageFull = true
+        }
       }
     } catch (err) {
       mongoPing = -2
@@ -667,7 +688,8 @@ app.get('/health', async (_req: Request, res: Response) => {
   res.json({
     status:             mongoPing === -2 ? 'degraded' : 'ok',
     version:            '1.1.0',
-    storedModeEnabled,
+    storedModeEnabled:  storedModeEnabled && !isStorageFull,
+    isStorageFull,
     mongoLatency:       mongoPing,
     gridfsStatus,
     activeLiveSessions: activeSessions(),
