@@ -106,6 +106,7 @@ export default function App() {
   const [password, setPassword] = useState('')
   const [inputPassword, setInputPassword] = useState('')
   const [burnOnRead, setBurnOnRead] = useState(false)
+  const [isStorageFull, setIsStorageFull] = useState(false)
   const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('qs_theme') as any) || 'dark')
 
   const sigRef = useRef<SignalingClient | null>(null)
@@ -160,6 +161,9 @@ export default function App() {
         const data = await r.json()
         if (typeof data.storedModeEnabled === 'boolean') {
           setStoredEnabled(data.storedModeEnabled)
+        }
+        if (typeof data.isStorageFull === 'boolean') {
+          setIsStorageFull(data.isStorageFull)
         }
       } catch (err) {
         setStoredEnabled(true)
@@ -803,9 +807,14 @@ export default function App() {
                     ? 'Encrypted on our servers. Access anytime until expiry.' 
                     : 'Direct device-to-device. Keep this tab open to transfer.'}
                 </p>
-                {!storedEnabled && !publishedMode && (
+                {!storedEnabled && !publishedMode && !isStorageFull && (
                   <p style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--warning, #eab308)', lineHeight: '1.4' }}>
                     Cloud storage is currently unavailable. Falling back to Live P2P mode.
+                  </p>
+                )}
+                {isStorageFull && !publishedMode && (
+                  <p style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--warning, #eab308)', lineHeight: '1.4' }}>
+                    Cloud storage is not available for now. The website is in update.
                   </p>
                 )}
               </div>
