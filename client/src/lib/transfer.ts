@@ -194,7 +194,6 @@ export class TransferReceiver {
   private onComplete: (result: ReceivedTransfer) => void
   private onAbort: (reason: string) => void
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null
-  private lastChunkTime = 0
   private startTime = 0
 
   constructor(
@@ -223,7 +222,6 @@ export class TransferReceiver {
     if (!this.meta) return // No transfer was in progress — no-op
 
     this.finalized = true
-    console.log('[transfer] aborted:', reason)
     this.onAbort(reason)
     this.reset()
   }
@@ -239,12 +237,9 @@ export class TransferReceiver {
   // Set a 30s timeout when meta is received. Reset on each chunk. Abort if timeout fires.
   private resetInactivityTimer(): void {
     this.clearInactivityTimer()
-    this.lastChunkTime = Date.now()
     
     this.inactivityTimer = setTimeout(() => {
       if (!this.finalized && this.meta && this.totalChunksDone < this.meta.totalChunks) {
-        const elapsed = Date.now() - this.lastChunkTime
-        console.warn(`[transfer] inactivity timeout — no chunks for ${elapsed}ms`)
         this.abort(`No data received for 30 seconds — publisher may have disconnected`)
       }
     }, 30000)
@@ -255,7 +250,6 @@ export class TransferReceiver {
     try {
       msg = JSON.parse(raw)
     } catch {
-      console.error('[transfer] invalid JSON:', raw)
       return
     }
 
@@ -269,7 +263,6 @@ export class TransferReceiver {
       this.finalized = false
       this.startTime = Date.now()
       this.resetInactivityTimer()  // Start timeout when metadata arrives
-      console.log('[transfer] meta received:', msg.files.map((f) => f.name))
     }
 
     if (msg.type === 'done') {
@@ -331,9 +324,7 @@ export class TransferReceiver {
     // but a malicious or buggy sender could declare wrong totalChunks.
     // We warn but still complete — aborting would discard data that did arrive.
     if (this.totalChunksDone !== this.meta.totalChunks) {
-      console.warn(
-        `[transfer] chunk count mismatch: received ${this.totalChunksDone}, expected ${this.meta.totalChunks}`
-      )
+      // Keep going if the declared count was wrong.
     }
 
     const receivedFiles: ReceivedFile[] = this.meta.files.map((fileMeta, i) => ({
@@ -343,7 +334,6 @@ export class TransferReceiver {
     }))
 
     const result: ReceivedTransfer = { text: this.meta.text, files: receivedFiles }
-    console.log('[transfer] complete:', receivedFiles.map((f) => f.name))
     this.onComplete(result)
     this.reset()
   }

@@ -162,7 +162,7 @@ export default function App() {
           setStoredEnabled(data.storedModeEnabled)
         }
       } catch (err) {
-        console.warn('[health] check failed, assuming optimistic support')
+        setStoredEnabled(true)
       }
     }
     checkStatus()
@@ -174,10 +174,10 @@ export default function App() {
   const mode: PublishMode =
     publishedMode === 'stored' ? 'stored' :
       publishedMode === 'live' ? 'live' :
+        (!storedEnabled) ? 'live' :
         (payloadBytes <= STORED_MAX) ? 'stored' : 'live'
 
   const effectiveMode = mode
-  const storedModeBlocked = mode === 'stored' && !storedEnabled
   const hasPayload = text.trim().length > 0 || files.length > 0
 
   function copyCode() {
@@ -284,7 +284,7 @@ export default function App() {
       const url = isUpdate ? `${API_URL}/publish/${code}` : `${API_URL}/publish`
       const method = isUpdate ? 'PATCH' : 'POST'
 
-      const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string; details?: string }>((resolve, reject) => {
+      const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string }>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         xhr.open(method, url)
         if (password) {
@@ -308,7 +308,7 @@ export default function App() {
       })
 
       if (data.error) {
-        setPublishError(data.details ? `${data.error}: ${data.details}` : data.error)
+        setPublishError(data.error.includes('not found') ? 'Session not found.' : 'Could not complete publish.')
         if (data.error.includes('not found') && isUpdate) { setCode(''); setPublishedMode(null) }
         setPublishing(false)
         return
@@ -334,7 +334,7 @@ export default function App() {
       })
       const data = await res.json()
       if (!res.ok) {
-        setPublishError(data?.details ? `${data.error ?? 'Failed to create session'}: ${data.details}` : (data?.error ?? 'Failed to create session'))
+        setPublishError('Could not complete publish.')
         setPublishing(false)
         return
       }
@@ -360,7 +360,7 @@ export default function App() {
       })
       setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, lastSentAt: Date.now(), sendProgress: null } : x))
     } catch (err) {
-      console.error('[p2p] send error:', err)
+      alert('Connection issue. Please try again.')
     }
   }
 
@@ -382,7 +382,7 @@ export default function App() {
           try {
             data.text = await decrypt(base64ToArrayBuffer(data.text), inputPassword, true) as string
           } catch (e) {
-            console.warn('[crypto] text decryption failed', e)
+            setJoinError('Unable to decrypt the message.')
           }
         }
         
@@ -412,25 +412,12 @@ export default function App() {
         setJoining(false)
         return
       }
-      const err = await res.json()
-      setJoinError(err.error ?? 'Unknown error')
+      await res.json()
+      setJoinError('Could not join session.')
     } catch (err: any) {
-      setJoinError(err?.message?.includes('Failed to fetch')
-        ? 'Cannot reach the server. Check your internet connection.'
-        : (err?.message ?? 'An unexpected error occurred.'));
+      setJoinError('Server not connected.')
     }
     setJoining(false)
-  }
-
-  function isSafeToPreview(mimeType: string): boolean {
-    if (!mimeType) return false
-    const safeTypes = [
-      'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml',
-      'video/mp4', 'video/webm', 'video/ogg',
-      'audio/mpeg', 'audio/wav', 'audio/ogg',
-      'application/pdf', 'text/plain', 'text/markdown'
-    ]
-    return safeTypes.includes(mimeType)
   }
 
   function handleStoredDownload(f: StoredFileInfo) {
@@ -438,7 +425,7 @@ export default function App() {
     const headers: any = {}
     if (inputPassword) headers['x-session-password'] = inputPassword
 
-    // For stored files, we always need to check if they are encrypted
+    // Download should always save the file instead of opening a preview.
     fetch(url, { headers })
       .then(res => {
         if (!res.ok) throw new Error()
@@ -452,8 +439,7 @@ export default function App() {
             const decrypted = await decrypt(buffer, inputPassword, false) as ArrayBuffer
             finalBlob = new Blob([decrypted], { type: f.mimeType })
           } catch (e) {
-            console.error('[crypto] decryption failed', e)
-            alert('Decryption failed. The file might be corrupted or the password incorrect.')
+            alert('Unable to open the file.')
             return
           }
         }
@@ -465,11 +451,6 @@ export default function App() {
   }
 
   function handleStoredPreview(f: StoredFileInfo) {
-    if (!isSafeToPreview(f.mimeType)) {
-      handleStoredDownload(f)
-      return
-    }
-
     const headers: any = {}
     if (inputPassword) headers['x-session-password'] = inputPassword
 
@@ -486,14 +467,15 @@ export default function App() {
             const decrypted = await decrypt(buffer, inputPassword, false) as ArrayBuffer
             finalBlob = new Blob([decrypted], { type: f.mimeType })
           } catch (e) {
-            console.error('[crypto] decryption failed', e)
+            alert('Unable to open the file.')
             return
           }
         }
         const u = URL.createObjectURL(finalBlob)
-        window.open(u, '_blank')
+        window.open(u, '_blank', 'noopener')
+        setTimeout(() => URL.revokeObjectURL(u), 60000)
       })
-      .catch(() => alert('Failed to preview file.'))
+      .catch(() => alert('Server not connected.'))
   }
 
   function handleLiveDownload(f: ReceivedFile) {
@@ -671,7 +653,7 @@ export default function App() {
   function channelLabel(state: ChannelState) {
     if (state === 'open') return 'Live'
     if (state === 'connecting') return 'Connecting...'
-    if (state === 'idle') return 'Waiting...'
+    if (state === 'idle') return sigState === 'connected' ? 'Connected, waiting for sender...' : 'Waiting...'
     if (state === 'error') return 'Error'
     return state
   }
@@ -821,9 +803,9 @@ export default function App() {
                     ? 'Encrypted on our servers. Access anytime until expiry.' 
                     : 'Direct device-to-device. Keep this tab open to transfer.'}
                 </p>
-                {storedModeBlocked && (
-                  <p style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--error)', lineHeight: '1.4' }}>
-                    Stored mode is unavailable until MongoDB is configured.
+                {!storedEnabled && !publishedMode && (
+                  <p style={{ marginTop: '0.5rem', fontSize: '0.75rem', color: 'var(--warning, #eab308)', lineHeight: '1.4' }}>
+                    Cloud storage is currently unavailable. Falling back to Live P2P mode.
                   </p>
                 )}
               </div>
@@ -950,8 +932,10 @@ export default function App() {
         <section className="animate-fade">
           <Card style={{ textAlign: 'center' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', justifyContent: 'center', marginBottom: '1.5rem' }}>
-              <Icon name="zap" size={16} style={{ color: channelState === 'open' ? 'var(--success)' : 'var(--error)' }} />
-              <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-dim)' }}>P2P {channelLabel(channelState)}</span>
+              <Icon name={storedPayload ? 'cloud' : 'zap'} size={16} style={{ color: storedPayload ? 'var(--accent)' : (channelState === 'open' ? 'var(--success)' : 'var(--error)') }} />
+              <span style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-dim)' }}>
+                {storedPayload ? 'Stored Session' : `P2P ${channelLabel(channelState)}`}
+              </span>
             </div>
             
             <h2 style={{ fontSize: '1.5rem', fontWeight: 800, marginBottom: '2rem' }}>
