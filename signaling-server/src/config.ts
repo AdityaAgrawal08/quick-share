@@ -28,10 +28,9 @@ export const CONFIG = {
   PORT:             parseInt(process.env.PORT ?? '3001', 10),
   MONGODB_URI:      process.env.MONGODB_URI, // Optional, enables stored mode
   MONGODB_TLS_INSECURE: process.env.MONGODB_TLS_INSECURE === 'true' || process.env.MONGODB_TLS_INSECURE === '1',
-  ALLOWED_ORIGINS:  (process.env.ALLOWED_ORIGINS ?? '*')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
+  ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : []
   SESSION_TTL_MS:   parseInt(process.env.SESSION_TTL_MS ?? '86400000', 10),
   STORED_MAX_BYTES: 10 * 1024 * 1024,
   MAX_FILE_SIZE:    100 * 1024 * 1024,

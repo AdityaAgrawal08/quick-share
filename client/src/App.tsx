@@ -6,8 +6,10 @@ import { TransferReceiver, sendTransfer, type TransferProgress, type ReceivedTra
 import { encrypt, decrypt, arrayBufferToBase64, base64ToArrayBuffer } from './lib/crypto'
 import type { SignalMessage, PeerRole } from './types'
 
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3001'
-const SIGNALING_URL = API_URL.replace(/^http/, 'ws')
+const API_URL = import.meta.env.VITE_API_URL as string
+const SIGNALING_URL = API_URL.startsWith('https')
+  ? API_URL.replace('https', 'wss')
+  : API_URL.replace('http', 'ws')
 const STORED_TTL_MIN = 1 * 60
 const STORED_TTL_MAX = 10 * 60 * 60
 const STORED_MAX = 10 * 1024 * 1024
