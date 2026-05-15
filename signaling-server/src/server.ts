@@ -24,7 +24,7 @@ process.on('unhandledRejection', (reason, promise) => {
   logger.error({ reason, promise }, 'Unhandled Promise Rejection')
 })
 
-const PORT             = CONFIG.PORT
+const PORT             = parseInt(process.env.PORT ?? '') || CONFIG.PORT || 3000
 const TTL_MS           = CONFIG.SESSION_TTL_MS
 const ALLOWED_ORIGINS  = CONFIG.ALLOWED_ORIGINS
 const STORED_MAX_BYTES = CONFIG.STORED_MAX_BYTES
@@ -110,11 +110,11 @@ app.use(express.json({ limit: '2mb' }))
 
 // Security: Global Security Headers & CORS
 app.use((req: Request, res: Response, next: NextFunction) => {
-  const origin = req.headers.origin as string
-  const isAllowed = !CONFIG.ALLOWED_ORIGINS.length || 
-                    CONFIG.ALLOWED_ORIGINS.includes('*') || 
-                    CONFIG.ALLOWED_ORIGINS.includes(origin)
-
+  const origin = req.headers.origin as string | undefined
+  const isAllowed =
+    !CONFIG.ALLOWED_ORIGINS.length ||
+    CONFIG.ALLOWED_ORIGINS.includes('*') ||
+    (origin !== undefined && CONFIG.ALLOWED_ORIGINS.includes(origin))
   // Basic security headers
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('X-Frame-Options', 'DENY')
@@ -626,18 +626,61 @@ app.get('/file/:fileId/:token', fileLimiter, async (req: Request, res: Response)
   }
 })
 
+app.get("/", (_req, res) => {
+  res.send("Quick Share Server Running");
+});
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 // ── GET /ice-servers — fetch ICE servers for WebRTC ──────────────────────────
 // Returns STUN servers always. TURN can be added here with dynamic credential fetching.
 // Phase 8: Integrate with Metered.ca or Cloudflare TURN for NAT traversal.
 
-app.get('/ice-servers', (req: Request, res: Response) => {
-  // Phase 8: Combine default STUN with any configured ICE servers (STUN/TURN) from CONFIG.
-  // This allows production deployments to inject TURN via env variable ICE_SERVERS.
-  const iceServers: IceServer[] = [
-    ...CONFIG.ICE_SERVERS
-  ]
-  res.json({ iceServers })
+app.get('/ice-servers', async (_req: Request, res: Response) => {
+  try {
+    const response = await fetch(
+      `https://global.relay.metered.ca/api/v1/turn/credentials?apiKey=${process.env.METERED_API_KEY}`
+    )
+
+    if (!response.ok) {
+      logger.warn('[ice] Metered TURN unavailable')
+
+      return res.json({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' }
+        ],
+        turnAvailable: false
+      })
+    }
+
+    const turnServers = await response.json()
+
+    const iceServers: IceServer[] = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      ...turnServers
+    ]
+
+    return res.json({
+      iceServers,
+      turnAvailable: true
+    })
+  } catch (err) {
+    logger.error({ err }, '[ice] Failed to fetch TURN credentials')
+
+    return res.json({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ],
+      turnAvailable: false
+    })
+  }
 })
+
 // ── POST /session — live mode ─────────────────────────────────────────────────
 
 app.post('/session', sessionLimiter, async (req: Request, res: Response) => {
