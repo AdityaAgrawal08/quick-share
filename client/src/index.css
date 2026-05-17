@@ -47,6 +47,12 @@ body {
   line-height: 1.5;
   min-height: 100vh;
   transition: background-color 0.2s ease;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  margin: 0;
+  padding: 1.5rem 0;
 }
 
 html {

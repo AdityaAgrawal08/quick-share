@@ -862,12 +862,12 @@ export default function App() {
               </div>
             </div>
             
-            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', marginBottom: '2rem' }}>
-              <Btn onClick={copyCode} style={{ flex: 1 }}>
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', marginBottom: '2rem', flexWrap: 'wrap' }}>
+              <Btn onClick={copyCode} style={{ flex: 1, minWidth: '130px' }}>
                 <Icon name={copiedCode ? 'check' : 'copy'} size={16} />
                 {copiedCode ? 'Copied' : 'Copy Code'}
               </Btn>
-              <Btn onClick={copyLink} style={{ flex: 1 }}>
+              <Btn onClick={copyLink} style={{ flex: 1, minWidth: '130px' }}>
                 <Icon name={copiedLink ? 'check' : 'link'} size={16} />
                 {copiedLink ? 'Link Copied' : 'Copy Link'}
               </Btn>
@@ -1031,7 +1031,7 @@ function DurationPicker({ ttlSeconds, setStoredDuration }: { ttlSeconds: number,
         </div>
         <span style={{ color: 'var(--accent)' }}>{formatTTL(ttlSeconds)}</span>
       </div>
-      <div style={{ display: 'flex', gap: '2rem', alignItems: 'center' }}>
+      <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
         <Stepper
           value={parts.hours} min={0} max={10} label="hr"
           onUpdate={v => setStoredDuration(v, parts.minutes)}
