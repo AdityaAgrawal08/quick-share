@@ -656,7 +656,7 @@ app.get('/ice-servers', async (_req: Request, res: Response) => {
       })
     }
 
-    const turnServers = await response.json()
+    const turnServers = await response.json() as IceServer[]
 
     const iceServers: IceServer[] = [
       { urls: 'stun:stun.l.google.com:19302' },

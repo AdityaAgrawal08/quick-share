@@ -314,7 +314,7 @@ export default function App() {
       })
 
       if (data.error) {
-        setPublishError(data.error.includes('not found') ? 'Session not found.' : 'Could not complete publish.')
+        setPublishError(data.error.includes('not found') ? 'Session not found.' : data.error)
         if (data.error.includes('not found') && isUpdate) { setCode(''); setPublishedMode(null) }
         setPublishing(false)
         return
@@ -340,7 +340,7 @@ export default function App() {
       })
       const data = await res.json()
       if (!res.ok) {
-        setPublishError('Could not complete publish.')
+        setPublishError(data.error || 'Could not complete publish.')
         setPublishing(false)
         return
       }
@@ -418,8 +418,8 @@ export default function App() {
         setJoining(false)
         return
       }
-      await res.json()
-      setJoinError('Could not join session.')
+      const data = await res.json().catch(() => ({}))
+      setJoinError(data.error || 'Could not join session.')
     } catch (err: any) {
       setJoinError('Server not connected.')
     }
