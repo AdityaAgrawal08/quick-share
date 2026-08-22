@@ -160,7 +160,9 @@ export class WebRTCManager {
 
   send(data: string | ArrayBuffer): void {
     if (this.channel?.readyState === 'open') {
-      this.channel.send(data as string & ArrayBuffer)
+      // Narrowed so each call matches a single RTCDataChannel.send overload.
+      if (typeof data === 'string') this.channel.send(data)
+      else this.channel.send(data)
     }
   }
 

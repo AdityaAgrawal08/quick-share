@@ -23,12 +23,16 @@ function concatBytes(...parts: Uint8Array[]): Uint8Array {
 
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer)
+  // Chunked conversion — building the binary string one character at a time
+  // is pathologically slow for multi-megabyte payloads.
+  const CHUNK = 0x8000
   let binary = ''
-
-  for (let index = 0; index < bytes.length; index++) {
-    binary += String.fromCharCode(bytes[index])
+  for (let index = 0; index < bytes.length; index += CHUNK) {
+    binary += String.fromCharCode.apply(
+      null,
+      bytes.subarray(index, index + CHUNK) as unknown as number[]
+    )
   }
-
   return btoa(binary)
 }
 

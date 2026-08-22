@@ -36,10 +36,6 @@ export const CONFIG = {
   STORED_MAX_BYTES: 10 * 1024 * 1024,
   MAX_FILE_SIZE:    100 * 1024 * 1024,
   NODE_ENV:         process.env.NODE_ENV || 'development',
-  ICE_SERVERS:      process.env.ICE_SERVERS ? JSON.parse(process.env.ICE_SERVERS) : [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
 }
 
 // Validation

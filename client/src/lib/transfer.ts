@@ -1,4 +1,5 @@
 import { WebRTCManager } from './webrtc'
+import { guessMime } from './mime'
 
 export const CHUNK_SIZE = 64 * 1024
 export const MAX_FILE_SIZE = 100 * 1024 * 1024
@@ -405,8 +406,8 @@ export class TransferReceiver {
 
     const receivedFiles: ReceivedFile[] = this.meta.files.map((fileMeta, i) => ({
       name: fileMeta.name,
-      mimeType: fileMeta.mimeType,
-      blob: new Blob(this.fileChunks[i], { type: fileMeta.mimeType }),
+      mimeType: guessMime(fileMeta.name, fileMeta.mimeType),
+      blob: new Blob(this.fileChunks[i], { type: guessMime(fileMeta.name, fileMeta.mimeType) }),
     }))
 
     const result: ReceivedTransfer = { text: this.meta.text, files: receivedFiles }

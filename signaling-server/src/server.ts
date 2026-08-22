@@ -188,6 +188,8 @@ app.use(express.json({ limit: '2mb' }))
 // Security: Global Security Headers & CORS
 app.use((req: Request, res: Response, next: NextFunction) => {
   const origin = req.headers.origin as string | undefined
+  // Origin-dependent responses must not be cached across origins.
+  res.setHeader('Vary', 'Origin')
   const isAllowed =
     !CONFIG.ALLOWED_ORIGINS.length ||
     CONFIG.ALLOWED_ORIGINS.includes('*') ||

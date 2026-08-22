@@ -4,6 +4,7 @@ import { SignalingClient } from './lib/signalingClient'
 import { WebRTCManager, type ChannelState } from './lib/webrtc'
 import { TransferReceiver, sendTransfer, type TransferProgress, type ReceivedTransfer, type ReceivedFile } from './lib/transfer'
 import { encrypt, decrypt, arrayBufferToBase64, base64ToArrayBuffer } from './lib/crypto'
+import { guessMime } from './lib/mime'
 import type { SignalMessage, PeerRole } from './types'
 
 const RAW_API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.trim()
@@ -89,16 +90,21 @@ function formatCountdown(ms: number): string {
     document.body.removeChild(a)
   }
 
-  async function fetchStoredFileBlob(f: StoredFileInfo, passwordHeader: string): Promise<Blob> {
-    const res = await fetch(`${API_URL}/file/${f.fileId}/${f.token}`, {
+  async function fetchStoredFileBlob(f: StoredFileInfo, passwordHeader: string): Promise<Blob> {    const res = await fetch(`${API_URL}/file/${f.fileId}/${f.token}`, {
       headers: passwordHeader ? { 'x-session-password': passwordHeader } : {},
     })
     if (!res.ok) throw new Error(String(res.status))
     const raw = await res.blob()
-    if (!passwordHeader) return raw
+    // Legacy sessions may have stored everything as application/octet-stream
+    // (encrypted uploads used to drop the Content-Type). Recover a renderable
+    // type from the filename so "View" can actually preview.
+    const type = guessMime(f.name, f.mimeType || raw.type)
+    if (!passwordHeader) {
+      return raw.type === type ? raw : new Blob([raw], { type })
+    }
     const buffer = await raw.arrayBuffer()
     const decrypted = await decrypt(buffer, passwordHeader, false) as ArrayBuffer
-    return new Blob([decrypted], { type: f.mimeType })
+    return new Blob([decrypted], { type })
   }
 
   async function prefetchStoredFiles(
@@ -114,6 +120,29 @@ function formatCountdown(ms: number): string {
         }
       })
     )
+  }
+
+  // Preview in a new tab. The window must be opened SYNCHRONOUSLY inside the
+  // click handler — awaiting the fetch first loses user activation and popup
+  // blockers silently swallow window.open. We open a blank tab immediately,
+  // then navigate it to the blob URL once ready.
+  async function previewBlobInNewTab(getBlob: () => Promise<Blob>, fallbackName: string) {
+    const win = window.open('about:blank', '_blank')
+    if (win) win.opener = null
+    try {
+      const blob = await getBlob()
+      const url = URL.createObjectURL(blob)
+      if (win && !win.closed) {
+        win.location.href = url
+      } else {
+        // Popup was blocked — degrade to a download rather than nothing.
+        anchorDownload(url, fallbackName)
+      }
+      setTimeout(() => URL.revokeObjectURL(url), 60000)
+    } catch (err) {
+      win?.close()
+      throw err
+    }
   }
 
 type PublishMode = 'stored' | 'live'
@@ -170,6 +199,9 @@ export default function App() {
   // Burn-on-read: blobs prefetched during the grace window so "Get" clicks
   // that land after the server deleted the session still work.
   const prefetchedRef = useRef<Map<string, Blob>>(new Map())
+  // Bumped on reset() — async work started in an old session must not write
+  // state after the user has already moved on.
+  const sessionGenRef = useRef(0)
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const linkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const passwordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -333,7 +365,11 @@ export default function App() {
         if (password) {
           const buffer = await f.arrayBuffer()
           const encrypted = await encrypt(buffer, password)
-          form.append('files', new Blob([encrypted]), f.name)
+          // The Blob's type becomes the multipart part's Content-Type, which
+          // multer records as `mimetype`. Without it every encrypted upload
+          // was stored as application/octet-stream and "View" degraded into
+          // a download prompt.
+          form.append('files', new Blob([encrypted], { type: f.type || 'application/octet-stream' }), f.name)
         } else {
           form.append('files', f)
         }
@@ -345,6 +381,9 @@ export default function App() {
       const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string }>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         xhr.open(method, url)
+        // Generous ceiling so slow-but-healthy uploads finish, while a stalled
+        // connection surfaces as a clear error instead of hanging forever.
+        xhr.timeout = 5 * 60 * 1000
         if (password) {
           xhr.setRequestHeader('x-session-password', password)
         }
@@ -449,7 +488,9 @@ export default function App() {
         // Burn-on-read: the server keeps files alive for a short grace window
         // only. Fetch and decrypt every file NOW so later "Get" clicks work.
         if (data.burnOnRead && data.files.length > 0) {
+          const gen = sessionGenRef.current
           void prefetchStoredFiles(data.files, inputPassword).then(results => {
+            if (sessionGenRef.current !== gen) return // session was reset mid-prefetch
             for (const r of results) {
               if (r.blob) prefetchedRef.current.set(r.fileId, r.blob)
             }
@@ -504,11 +545,10 @@ export default function App() {
 
   async function handleStoredPreview(f: StoredFileInfo) {
     try {
-      let finalBlob = prefetchedRef.current.get(f.fileId)
-      if (!finalBlob) finalBlob = await fetchStoredFileBlob(f, inputPassword)
-      const u = URL.createObjectURL(finalBlob)
-      window.open(u, '_blank', 'noopener')
-      setTimeout(() => URL.revokeObjectURL(u), 60000)
+      await previewBlobInNewTab(async () => {
+        const cached = prefetchedRef.current.get(f.fileId)
+        return cached ?? fetchStoredFileBlob(f, inputPassword)
+      }, f.name)
     } catch {
       alert('Unable to open the file. Check password or connection.')
     }
@@ -521,9 +561,9 @@ export default function App() {
   }
 
   function handleLivePreview(f: ReceivedFile) {
-    const url = URL.createObjectURL(f.blob)
-    window.open(url, '_blank', 'noopener')
-    setTimeout(() => URL.revokeObjectURL(url), 60000)
+    void previewBlobInNewTab(() => Promise.resolve(f.blob), f.name).catch(() => {
+      alert('Unable to open the file.')
+    })
   }
 
   const fetchIceServers = useCallback(async (): Promise<RTCIceServer[]> => {
@@ -655,6 +695,7 @@ export default function App() {
   }
 
   function reset() {
+    sessionGenRef.current++
     rtcMapRef.current.forEach(r => r.close())
     rtcMapRef.current.clear()
     rtcRef.current?.close(); rtcRef.current = null
