@@ -20,4 +20,5 @@ export interface SignalMessage {
 export interface JoinPayload {
   code: string
   role: PeerRole
+  password?: string
 }

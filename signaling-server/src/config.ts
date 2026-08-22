@@ -7,21 +7,22 @@ const envPath = path.resolve(__dirname, '../.env')
 if (fs.existsSync(envPath)) {
   fs.readFileSync(envPath, 'utf8')
     .split('\n')
-    .forEach((line) => {
-      const trimmed = line.trim()
-      if (!trimmed || trimmed.startsWith('#')) return
-      const [key, ...rest] = trimmed.split('=')
-      if (key && !(key in process.env)) process.env[key] = rest.join('=')
+    .forEach((rawLine) => {
+      const line = rawLine.trim().replace(/\r$/, '')
+      if (!line || line.startsWith('#')) return
+      const eq = line.indexOf('=')
+      if (eq <= 0) return
+      const key = line.slice(0, eq).trim()
+      let value = line.slice(eq + 1).trim()
+      // Strip surrounding quotes so PASSWORD="secret" doesn't keep the quotes.
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1)
+      }
+      if (key && !(key in process.env)) process.env[key] = value
     })
-}
-
-function required(key: string): string {
-  const val = process.env[key]
-  if (!val) {
-    logger.error(`FATAL: Missing required environment variable: ${key}`)
-    process.exit(1)
-  }
-  return val
 }
 
 export const CONFIG = {

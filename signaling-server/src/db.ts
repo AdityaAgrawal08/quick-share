@@ -16,6 +16,11 @@ const MONGOOSE_OPTIONS = {
 // In-memory map of active expiry timers: code → NodeJS.Timeout
 const expiryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
+// Number of GridFS uploads currently streaming. Orphan scans must not run
+// while this is > 0: GridFS writes .chunks progressively but only creates the
+// .files document on finish, so an in-flight upload looks "orphaned".
+let activeUploads = 0
+
 // ── Maintenance Locks ─────────────────────────────────────────────────────────
 let isMaintenanceRunning = false
 
@@ -102,7 +107,7 @@ export function scheduleExpiry(code: string, expiresAt: Date): void {
   if (timer.unref) timer.unref()
 
   expiryTimers.set(code, timer)
-  console.log(`[db] expiry timer set for ${code} in ${Math.round(delayMs / 1000)}s`)
+  logger.debug({ code, delaySec: Math.round(delayMs / 1000) }, '[db] expiry timer set')
 }
 
 export function clearExpiryTimer(code: string): void {
@@ -173,7 +178,13 @@ async function recoverExpiryTimers(): Promise<void> {
 
 // Safety net: find any GridFS files not referenced by any session doc and
 // delete them. Also find chunks without parent files.
+// MUST NOT run while uploads are in flight — GridFS only creates the .files
+// document when the upload finishes, so an active upload looks orphaned.
 async function cleanupOrphanedGridFSFiles(): Promise<void> {
+  if (activeUploads > 0) {
+    logger.debug('[db] skipping orphan-file scan — uploads in flight')
+    return
+  }
   try {
     const b = getBucket()
     const allFiles = await b.find({}).project({ _id: 1 }).toArray()
@@ -214,7 +225,12 @@ async function cleanupOrphanedGridFSFiles(): Promise<void> {
 
 // Deep cleanup: find chunks in .chunks that have no corresponding entry in .files.
 // This handles "doubly orphaned" data from crashed uploads or aborted transfers.
+// Same in-flight-upload caveat as cleanupOrphanedGridFSFiles().
 async function cleanupOrphanedChunks(): Promise<void> {
+  if (activeUploads > 0) {
+    logger.debug('[db] skipping orphan-chunk scan — uploads in flight')
+    return
+  }
   try {
     const db = mongoose.connection.db
     if (!db) return
@@ -269,12 +285,24 @@ async function runMaintenance() {
   }
 }
 
-// ── Periodic Maintenance — Phase 7: Reliability ──────────────────────────────
-// Run cleanup every 10 minutes to catch anything the startup scan missed.
-const CLEANUP_INTERVAL = 10 * 60 * 1000
+// ── Periodic Maintenance ─────────────────────────────────────────────────────
+// Two cadences:
+//  • recoverExpiryTimers() every 10 min — cheap cursor scan; deletes expired
+//    sessions and reschedules timers lost to a crash. This is the primary
+//    defence against unbounded document growth (there is deliberately NO
+//    MongoDB TTL index — see schema comment below).
+//  • Deep orphan scans hourly + on startup — expensive full-bucket scans;
+//    skipped while uploads are in flight to avoid corrupting active uploads.
+const RECOVERY_INTERVAL_MS = 10 * 60 * 1000
+const DEEP_CLEANUP_INTERVAL_MS = 60 * 60 * 1000
+
+setInterval(() => {
+  recoverExpiryTimers().catch(err => logger.error({ err }, '[db] periodic recovery failed'))
+}, RECOVERY_INTERVAL_MS).unref()
+
 setInterval(() => {
   runMaintenance().catch(err => logger.error({ err }, '[db] periodic maintenance failed'))
-}, CLEANUP_INTERVAL)
+}, DEEP_CLEANUP_INTERVAL_MS).unref()
 
 // ── Stored session schema ─────────────────────────────────────────────────────
 
@@ -294,6 +322,7 @@ export interface IStoredSession {
   createdAt: Date
   password?: string // Optional hashed password
   burnOnRead?: boolean
+  burnedAt?: Date | null // Set on first read of a burn-on-read session; blocks further reads until deletion
 }
 
 const storedSessionSchema = new mongoose.Schema<IStoredSession>({
@@ -307,14 +336,15 @@ const storedSessionSchema = new mongoose.Schema<IStoredSession>({
     token:    { type: String, required: true },
   }],
   burnOnRead: { type: Boolean, default: false },
-  // NO expires: 0 here — MongoDB TTL is intentionally removed.
-  // If MongoDB TTL deletes the session doc before our Node timer fires,
-  // we lose the gridfsIds and GridFS files leak permanently.
-  // The Node timer in scheduleExpiry() handles all deletion.
-  // Secondary safety net: MongoDB native TTL.
-  // We set it significantly longer (e.g. +2 hours) than our Node timer to ensure 
-  // Node always gets the chance to clean GridFS first, even if processing is delayed.
-  expiresAt: { type: Date, required: true, index: { expires: '2h' } },
+  burnedAt:   { type: Date,   default: null },
+  // Deletion design (do NOT add a MongoDB TTL index here):
+  //   1. scheduleExpiry() Node timer deletes GridFS files, then the doc.
+  //   2. recoverExpiryTimers() (startup + every 10 min) deletes anything a
+  //      crash left behind and reschedules live timers.
+  //   3. cleanupOrphanedGridFSFiles() is the last-resort sweep.
+  // A Mongo TTL would delete ONLY the tiny doc — never the GridFS blobs — and
+  // by destroying the gridfsIds it turns reclaimable files into leaks.
+  expiresAt: { type: Date, required: true, index: true },
   createdAt: { type: Date, default: Date.now },
   password:  { type: String, select: false }, // Don't include by default in queries
 })
@@ -329,14 +359,35 @@ export async function uploadFile(
   mimeType: string
 ): Promise<ObjectId> {
   const b = getBucket()
+  activeUploads++
+  let settled = false
+  const release = () => {
+    if (!settled) {
+      settled = true
+      activeUploads--
+    }
+  }
   return new Promise((resolve, reject) => {
     const uploadStream = b.openUploadStream(filename, {
       metadata: { mimeType },
     })
     const readable = Readable.from(buffer)
     readable.pipe(uploadStream)
-    uploadStream.on('finish', () => resolve(uploadStream.id as ObjectId))
-    uploadStream.on('error', reject)
+    uploadStream.on('finish', () => {
+      release()
+      resolve(uploadStream.id as ObjectId)
+    })
+    uploadStream.on('error', (err) => {
+      release()
+      reject(err)
+    })
+    // pipe() does not forward source errors to the destination — handle them
+    // explicitly or a failed read would leave the promise pending forever.
+    readable.on('error', (err) => {
+      release()
+      try { uploadStream.destroy(err) } catch { /* already destroyed */ }
+      reject(err)
+    })
   })
 }
 

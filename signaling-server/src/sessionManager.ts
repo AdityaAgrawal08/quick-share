@@ -38,7 +38,7 @@ export function createSession(ttlMs: number, passwordHash?: string): string {
   const idleTimer = setTimeout(() => {
     const s = sessions.get(code)
     if (s && !s.publisher) {
-      console.log(`[session] idle timeout — no publisher joined ${code}`)
+      logger.warn({ code }, '[session] idle timeout — no publisher joined')
       // Clear ttlTimer too — session is being destroyed here
       clearTimeout(s.ttlTimer)
       // Notify any waiting recipients
@@ -60,7 +60,7 @@ export function createSession(ttlMs: number, passwordHash?: string): string {
   }
 
   sessions.set(code, session)
-  console.log(`[session] created ${code} (ttl ${ttlMs / 1000}s)`)
+  logger.info({ code, ttlSec: ttlMs / 1000 }, '[session] created')
   return code
 }
 
@@ -95,7 +95,7 @@ export function addPeer(code: string, role: PeerRole, ws: WebSocket): { session:
     const id = randomUUID()
     const peer: Peer = { ws, role, id, connectedAt: Date.now() }
     session.recipients.set(id, peer)
-    console.log(`[session] recipient ${id.slice(0, 8)} joined ${code} (total: ${session.recipients.size}/${MAX_RECIPIENTS_PER_SESSION})`)
+    logger.debug({ code, peerId: id, total: session.recipients.size, limit: MAX_RECIPIENTS_PER_SESSION }, '[session] recipient joined')
     return { session, peer }
   }
 }
@@ -105,7 +105,7 @@ export function removePeer(code: string, peerId: string, role: PeerRole): void {
   if (!session) return
 
   if (role === 'publisher') {
-    console.log(`[session] publisher left ${code} — destroying session`)
+    logger.info({ code }, '[session] publisher left — destroying session')
     // Publisher leaving means the session is dead — files only exist in their
     // browser RAM. Destroy the session immediately so new recipients cannot
     // join a session that can never transfer anything.
@@ -118,7 +118,7 @@ export function removePeer(code: string, peerId: string, role: PeerRole): void {
     return
   } else {
     session.recipients.delete(peerId)
-    console.log(`[session] recipient ${peerId.slice(0, 8)} left ${code} (remaining: ${session.recipients.size})`)
+    logger.debug({ code, peerId, remaining: session.recipients.size }, '[session] recipient left')
     if (session.publisher) {
       sendTo(session.publisher.ws, { type: 'peer_left', peerId })
     }
@@ -139,7 +139,7 @@ function expireSession(code: string): void {
   const session = sessions.get(code)
   if (!session) return
 
-  console.log(`[session] expired ${code}`)
+  logger.info({ code }, '[session] expired')
 
   if (session.publisher) {
     sendTo(session.publisher.ws, { type: 'expired' })
@@ -159,7 +159,7 @@ function destroySession(code: string): void {
   clearTimeout(session.ttlTimer)
   if (session.idleTimer) clearTimeout(session.idleTimer)
   sessions.delete(code)
-  console.log(`[session] destroyed ${code}`)
+  logger.info({ code }, '[session] destroyed')
 }
 
 export function activeSessions(): number {

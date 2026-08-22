@@ -34,6 +34,21 @@ export interface TransferProgress {
 export type SendProgressCallback = (progress: TransferProgress) => void
 export type ReceiveProgressCallback = (progress: TransferProgress) => void
 
+// Progress callbacks used to fire once per 64KB chunk (~1600 React
+// re-renders/sec on a fast link). Throttle to ~10 updates/sec; the final
+// update is always forced through.
+const PROGRESS_INTERVAL_MS = 100
+
+function makeProgressThrottle(onProgress: (p: TransferProgress) => void) {
+  let lastEmit = 0
+  return (p: TransferProgress, force = false) => {
+    const now = Date.now()
+    if (!force && now - lastEmit < PROGRESS_INTERVAL_MS) return
+    lastEmit = now
+    onProgress(p)
+  }
+}
+
 // ── Send side ────────────────────────────────────────────────────────────────
 
 export async function sendTransfer(
@@ -74,6 +89,24 @@ export async function sendTransfer(
   let chunksDone = 0
   let bytesDone = 0
   const startTime = Date.now()
+  const emitProgress = makeProgressThrottle(onProgress)
+
+  const buildProgress = (currentFile: string | null): TransferProgress => {
+    const elapsedSec = (Date.now() - startTime) / 1000
+    const speed = elapsedSec > 0 ? bytesDone / elapsedSec : 0
+    const remainingBytes = totalBytes - bytesDone
+    const timeRemaining = speed > 0 ? remainingBytes / speed : 0
+    return {
+      chunksTotal: totalChunks,
+      chunksDone,
+      bytesTotal: totalBytes,
+      bytesDone,
+      percent: totalBytes > 0 ? Math.round((bytesDone / totalBytes) * 100) : 100,
+      currentFile,
+      speed,
+      timeRemaining,
+    }
+  }
 
   try {
     for (const file of files) {
@@ -104,25 +137,13 @@ export async function sendTransfer(
         bytesDone += buffer.byteLength
         offset += buffer.byteLength
 
-        const elapsedSec = (Date.now() - startTime) / 1000
-        const speed = elapsedSec > 0 ? bytesDone / elapsedSec : 0
-        const remainingBytes = totalBytes - bytesDone
-        const timeRemaining = speed > 0 ? remainingBytes / speed : 0
-
-        onProgress({
-          chunksTotal: totalChunks,
-          chunksDone,
-          bytesTotal: totalBytes,
-          bytesDone,
-          percent: Math.round((bytesDone / totalBytes) * 100),
-          currentFile: file.name,
-          speed,
-          timeRemaining,
-        })
+        emitProgress(buildProgress(file.name))
       }
     }
 
     rtc.send(JSON.stringify({ type: 'done' } satisfies TransferDone))
+    // Force the final progress state through so the UI lands at 100%.
+    emitProgress(buildProgress(files[files.length - 1]?.name ?? null), true)
 
   } catch (err) {
     // FIX 6: Send abort message to recipient so they don't wait forever.
@@ -190,20 +211,20 @@ export class TransferReceiver {
   private totalBytesDone = 0
   private totalChunksDone = 0
   private finalized = false  // Prevent double-complete
-  private onProgress: ReceiveProgressCallback
   private onComplete: (result: ReceivedTransfer) => void
   private onAbort: (reason: string) => void
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null
   private startTime = 0
+  private emitProgress: (p: TransferProgress, force?: boolean) => void
 
   constructor(
     onProgress: ReceiveProgressCallback,
     onComplete: (result: ReceivedTransfer) => void,
     onAbort: (reason: string) => void   // FIX 4+6: called on abort or channel close
   ) {
-    this.onProgress = onProgress
     this.onComplete = onComplete
     this.onAbort = onAbort
+    this.emitProgress = makeProgressThrottle(onProgress)
   }
 
   receive(data: string | ArrayBuffer): void {
@@ -262,6 +283,15 @@ export class TransferReceiver {
       this.totalChunksDone = 0
       this.finalized = false
       this.startTime = Date.now()
+      // Zero-byte files never receive chunks — skip over them up front
+      // (and after each boundary advance below), otherwise every subsequent
+      // chunk would be mis-attributed to the empty file.
+      while (
+        this.currentFileIndex < msg.files.length &&
+        msg.files[this.currentFileIndex].size === 0
+      ) {
+        this.currentFileIndex++
+      }
       this.resetInactivityTimer()  // Start timeout when metadata arrives
     }
 
@@ -284,13 +314,52 @@ export class TransferReceiver {
     // Reset inactivity timer on each chunk received
     this.resetInactivityTimer()
 
-    this.fileChunks[this.currentFileIndex].push(buffer)
-    this.fileBytesDone[this.currentFileIndex] += buffer.byteLength
-    this.totalBytesDone += buffer.byteLength
-    this.totalChunksDone++
+    const idx = this.currentFileIndex
+    const remaining = files[idx].size - this.fileBytesDone[idx]
+    if (remaining <= 0 && files[idx].size > 0) return
 
-    if (this.fileBytesDone[this.currentFileIndex] >= files[this.currentFileIndex].size) {
+    // A chunk can span a file boundary (sender streams contiguously).
+    // Split it so bytes always land in the file they belong to.
+    const take = Math.min(remaining, buffer.byteLength)
+    if (take > 0) {
+      this.fileChunks[idx].push(buffer.slice(0, take))
+      this.fileBytesDone[idx] += take
+      this.totalBytesDone += take
+      this.totalChunksDone++
+    }
+    let rest: ArrayBuffer | null = take < buffer.byteLength ? buffer.slice(take) : null
+
+    while (this.currentFileIndex < files.length &&
+           this.fileBytesDone[this.currentFileIndex] >= files[this.currentFileIndex].size &&
+           files[this.currentFileIndex].size > 0) {
       this.currentFileIndex++
+    }
+    // Skip any zero-byte files at the new boundary
+    while (this.currentFileIndex < files.length && files[this.currentFileIndex].size === 0) {
+      this.currentFileIndex++
+    }
+
+    // Spill leftover bytes into the following file(s)
+    while (rest && rest.byteLength > 0 && this.currentFileIndex < files.length) {
+      const nextIdx = this.currentFileIndex
+      const nextRemaining = files[nextIdx].size - this.fileBytesDone[nextIdx]
+      if (nextRemaining <= 0 && files[nextIdx].size > 0) { this.currentFileIndex++; continue }
+      const nextTake = Math.min(Math.max(nextRemaining, 0), rest.byteLength)
+      if (nextTake > 0) {
+        this.fileChunks[nextIdx].push(rest.slice(0, nextTake))
+        this.fileBytesDone[nextIdx] += nextTake
+        this.totalBytesDone += nextTake
+        this.totalChunksDone++
+      }
+      rest = nextTake < rest.byteLength ? rest.slice(nextTake) : null
+      while (this.currentFileIndex < files.length &&
+             this.fileBytesDone[this.currentFileIndex] >= files[this.currentFileIndex].size &&
+             files[this.currentFileIndex].size > 0) {
+        this.currentFileIndex++
+      }
+      while (this.currentFileIndex < files.length && files[this.currentFileIndex].size === 0) {
+        this.currentFileIndex++
+      }
     }
 
     const totalBytes = files.reduce((s, f) => s + f.size, 0)
@@ -302,7 +371,7 @@ export class TransferReceiver {
     const remainingBytes = totalBytes - this.totalBytesDone
     const timeRemaining = speed > 0 ? remainingBytes / speed : 0
 
-    this.onProgress({
+    this.emitProgress({
       chunksTotal: this.meta.totalChunks,
       chunksDone: this.totalChunksDone,
       bytesTotal: totalBytes,
@@ -319,12 +388,19 @@ export class TransferReceiver {
     if (!this.meta || this.finalized) return
     this.finalized = true
 
-    // FIX 8: Verify chunk count matches what sender declared in meta.
-    // RTCDataChannel ordered:true makes mismatch practically impossible,
-    // but a malicious or buggy sender could declare wrong totalChunks.
-    // We warn but still complete — aborting would discard data that did arrive.
-    if (this.totalChunksDone !== this.meta.totalChunks) {
-      // Keep going if the declared count was wrong.
+    // Verify every file received exactly the byte count the sender declared.
+    // RTCDataChannel ordered:true makes drift practically impossible, but a
+    // buggy sender (or a mid-transfer abort we missed) must not surface as a
+    // silently corrupted download — fail loudly instead of completing.
+    const mismatches = this.meta.files
+      .map((fileMeta, i) => ({ name: fileMeta.name, expected: fileMeta.size, got: this.fileBytesDone[i] }))
+      .filter(m => m.expected !== m.got)
+
+    if (mismatches.length > 0) {
+      const first = mismatches[0]
+      this.onAbort(`Corrupted transfer: "${first.name}" received ${first.got} of ${first.expected} bytes`)
+      this.reset()
+      return
     }
 
     const receivedFiles: ReceivedFile[] = this.meta.files.map((fileMeta, i) => ({

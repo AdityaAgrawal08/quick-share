@@ -113,7 +113,7 @@ export async function decrypt(combined: ArrayBuffer, password: string, isText: b
       return new TextDecoder().decode(decrypted);
     }
     return decrypted;
-  } catch (err) {
+  } catch {
     throw new Error('Decryption failed. Check your password.');
   }
 }

@@ -68,7 +68,10 @@ export class WebRTCManager {
 
     this.pc.onconnectionstatechange = () => {
       const state = this.pc?.connectionState
-      if (state === 'failed' || state === 'disconnected') {
+      // Only 'failed' is terminal. 'disconnected' can recover on its own
+      // (transient network blip) — flagging it as an error immediately used
+      // to abort healthy mid-transfers.
+      if (state === 'failed') {
         this.opts.onChannelStateChange('error')
       }
     }
@@ -92,7 +95,7 @@ export class WebRTCManager {
         payload: offer,
         peerId: this.opts.peerId,
       })
-    } catch (err) {
+    } catch {
       this.opts.onChannelStateChange('error')
     }
   }
@@ -135,7 +138,7 @@ export class WebRTCManager {
           this.pendingCandidates.push(init)
         }
       }
-    } catch (err) {
+    } catch {
       this.opts.onChannelStateChange('error')
     }
   }

@@ -40,4 +40,5 @@ export interface SignalMessage {
 export interface JoinPayload {
   code: string
   role: PeerRole
+  password?: string // Required for BOTH roles — live sessions are password-protected at creation
 }

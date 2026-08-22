@@ -30,6 +30,15 @@ const ALLOWED_ORIGINS  = CONFIG.ALLOWED_ORIGINS
 const STORED_MAX_BYTES = CONFIG.STORED_MAX_BYTES
 const STORED_TTL_MIN_MS = 1 * 60 * 1000
 const STORED_TTL_MAX_MS = 60 * 60 * 1000
+// Free-tier Atlas ceiling: refuse new uploads well before the hard quota so
+// maintenance/deletion traffic still has headroom.
+const MAX_DATA_SIZE_BYTES = 450 * 1024 * 1024
+
+// Burn-on-read: after the first successful retrieve the content is gone for
+// new readers, but the recipient still needs a window to download the files
+// listed in that response. 3s was far too short — any human-paced click on
+// "Download" landed after deletion and got a 404.
+const BURN_GRACE_MS = 60 * 1000
 
 type IceServer = {
   urls: string | string[]
@@ -92,12 +101,80 @@ function getTextBytes(text: string): number {
 
 // ── Multer ────────────────────────────────────────────────────────────────────
 
+// Multer's limits are PER FILE — with memoryStorage, 20 × 10MB files buffer
+// ~200MB per request before our totalBytes check ever runs. Two mitigations:
+//   1. Cap file count (10) so worst-case buffering per request is bounded.
+//   2. A concurrency gate limiting simultaneous heavy uploads.
+const MAX_UPLOAD_FILES = 10
+const HEAVY_CONCURRENCY = 3
+const HEAVY_QUEUE_TIMEOUT_MS = 10_000
+
+class Gate {
+  private slots: number
+  private waiters: (() => void)[] = []
+  constructor(n: number) { this.slots = n }
+  // Resolves with a releaser once a slot is held. The caller MUST eventually
+  // invoke it exactly once — this keeps accounting correct even if the caller
+  // gave up waiting (timeout) before the slot was granted.
+  async acquire(): Promise<() => void> {
+    if (this.slots > 0) {
+      this.slots--
+      return () => this.release()
+    }
+    return new Promise<() => void>(resolve => {
+      this.waiters.push(() => {
+        this.slots--
+        resolve(() => this.release())
+      })
+    })
+  }
+  release(): void {
+    this.slots++
+    const next = this.waiters.shift()
+    if (next) next()
+  }
+}
+const heavyGate = new Gate(HEAVY_CONCURRENCY)
+
+function gate(_req: Request, res: Response, next: NextFunction): void {
+  let releaser: (() => void) | null = null
+  let released = false
+  const releaseOnce = () => {
+    if (releaser && !released) {
+      released = true
+      releaser()
+    }
+  }
+
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    releaseOnce()          // no-op if the slot wasn't granted yet
+    res.status(503).json({ error: 'Server busy — try again shortly' })
+  }, HEAVY_QUEUE_TIMEOUT_MS)
+  timer.unref?.()
+
+  heavyGate.acquire().then(rel => {
+    clearTimeout(timer)
+    if (timedOut || res.writableFinished || res.writableEnded) {
+      // Request already answered via timeout or aborted — give the slot back
+      // untouched so concurrency accounting stays balanced.
+      rel()
+      return
+    }
+    releaser = rel
+    res.once('finish', releaseOnce)
+    res.once('close', releaseOnce)
+    next()
+  })
+}
+
 const storage = multer.memoryStorage()
-const upload  = multer({ 
-  storage, 
-  limits: { 
+const upload  = multer({
+  storage,
+  limits: {
     fileSize: STORED_MAX_BYTES,
-    files: 20,
+    files: MAX_UPLOAD_FILES,
     fieldSize: 1024 * 1024,
   },
 })
@@ -152,7 +229,7 @@ const WINDOW_MS = 15 * 60 * 1000 // 15 minutes
 // Stricter limits on creation endpoints (publish, session)
 const publishLimiter = rateLimit({
   windowMs: WINDOW_MS,
-  max: 10,
+  limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many publish requests — try again in 15 minutes' },
@@ -160,7 +237,7 @@ const publishLimiter = rateLimit({
 
 const patchLimiter = rateLimit({
   windowMs: WINDOW_MS,
-  max: 20,
+  limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many update requests — try again in 15 minutes' },
@@ -168,7 +245,7 @@ const patchLimiter = rateLimit({
 
 const sessionLimiter = rateLimit({
   windowMs: WINDOW_MS,
-  max: 20,
+  limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many session requests — try again in 15 minutes' },
@@ -177,17 +254,18 @@ const sessionLimiter = rateLimit({
 // Stricter limits for password attempts
 const passwordLimiter = rateLimit({
   windowMs: WINDOW_MS,
-  max: 10, // 10 attempts per 15 minutes
+  limit: 10, // 10 attempts per 15 minutes
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many failed password attempts — try again later' },
   skipSuccessfulRequests: true, // Only count 4xx/5xx
 })
 
-// Retrieve is the enumeration attack surface — rate limited tightly
+// Retrieve is the enumeration attack surface — rate limited tightly.
+// Generous enough for several recipients behind one shared NAT (QR-code flow).
 const retrieveLimiter = rateLimit({
   windowMs: WINDOW_MS,
-  max: 15, // Max 15 lookups per 15 mins
+  limit: 40,
   standardHeaders: true,
   legacyHeaders: false,
 })
@@ -195,10 +273,18 @@ const retrieveLimiter = rateLimit({
 // File downloads — users may download multiple files per session
 const fileLimiter = rateLimit({
   windowMs: WINDOW_MS,
-  max: 60,
+  limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many file download requests — try again in 15 minutes' },
+})
+
+// ICE endpoint proxies an external Metered API call — protect the key/budget
+const iceLimiter = rateLimit({
+  windowMs: WINDOW_MS,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
 })
 
 // ── Code generation ───────────────────────────────────────────────────────────
@@ -238,6 +324,7 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
 app.post(
   '/publish',
   publishLimiter,
+  gate,
   requireStoredMode,
   upload.array('files'),
   async (req: Request, res: Response) => {
@@ -265,7 +352,7 @@ app.post(
 
       if (mongoose.connection.db) {
         const stats = await mongoose.connection.db.stats()
-        if (stats && stats.dataSize > 450 * 1024 * 1024) {
+        if (stats && stats.dataSize > MAX_DATA_SIZE_BYTES) {
           res.status(503).json({ error: 'Cloud storage is not available for now. The website is in update.' })
           return
         }
@@ -340,9 +427,9 @@ app.post(
       throw lastErr ?? new Error('Server error during publish')
     } catch (err: any) {
       logger.error({ err }, '[publish] error')
-      
-      const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE'
-      res.status(isLimit ? 400 : 500).json({ 
+
+      const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE' || err?.code === 'LIMIT_FILE_COUNT'
+      res.status(isLimit ? 400 : 500).json({
         error: isLimit ? 'Upload limit exceeded' : 'Server error during publish',
         details: err?.message
       })
@@ -355,10 +442,10 @@ app.post(
 app.patch(
   '/publish/:code',
   patchLimiter,
+  gate,
   requireStoredMode,
   upload.array('files'),
   async (req: Request, res: Response) => {
-    let newlyUploadedIds: ObjectId[] = []
     try {
       const code = req.params['code'] as string
       if (!/^\d{6}$/.test(code)) {
@@ -380,7 +467,7 @@ app.patch(
 
       if (mongoose.connection.db) {
         const stats = await mongoose.connection.db.stats()
-        if (stats && stats.dataSize > 450 * 1024 * 1024) {
+        if (stats && stats.dataSize > MAX_DATA_SIZE_BYTES) {
           res.status(503).json({ error: 'Cloud storage is not available for now. The website is in update.' })
           return
         }
@@ -391,13 +478,14 @@ app.patch(
         return
       }
 
+      // Security: verify ownership ONCE before the retry loop — re-verifying
+      // inside each attempt was redundant (same request, same credentials).
       const existing = await StoredSession.findOne({ code, expiresAt: { $gt: new Date() } }).select('+password').lean()
       if (!existing) {
         res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
         return
       }
 
-      // Security: verify existing password before allowing update
       if (existing.password) {
         const clientPass = req.headers['x-session-password'] as string
         if (!clientPass || !(await verifyPassword(clientPass, existing.password))) {
@@ -418,21 +506,14 @@ app.patch(
       for (let retryAttempt = 0; retryAttempt < 2; retryAttempt++) {
         let newlyUploadedIds: ObjectId[] = []
         try {
-          const existing = await StoredSession.findOne({ code, expiresAt: { $gt: new Date() } }).select('+password').lean()
-          if (!existing) {
+          // Fresh read per attempt: oldIds must reflect the doc state right
+          // before this update so we never delete files a previous attempt
+          // already swapped in. Password is NOT re-checked — credentials were
+          // validated above and cannot change mid-request.
+          const current = await StoredSession.findOne({ code }).lean()
+          if (!current || (current.expiresAt && current.expiresAt <= new Date())) {
             res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
             return
-          }
-
-          // Security: verify existing password before allowing update
-          if (existing.password) {
-            const clientPass = req.headers['x-session-password'] as string
-            if (!clientPass || !(await verifyPassword(clientPass, existing.password))) {
-              // Artificial delay to slow down automated brute force
-              await new Promise(r => setTimeout(r, 500 + Math.random() * 1000))
-              res.status(401).json({ error: 'password_required', message: 'Correct password required to update this session' })
-              return
-            }
           }
 
           const storedFiles = await Promise.all(
@@ -447,19 +528,22 @@ app.patch(
           const expiresAt = new Date(Date.now() + ttlMs)
           const password = typeof req.body.password === 'string' && req.body.password.trim() ? req.body.password : null
           const updateSet: any = { text, files: storedFiles, expiresAt }
+          // New content = readable again. Without this, a burn-on-read
+          // session that was updated after its first read stayed 410 forever.
+          updateSet.burnedAt = null
           if (password) updateSet.password = await hashPassword(password)
           if (burnOnRead !== undefined) updateSet.burnOnRead = burnOnRead === 'true' || burnOnRead === true
 
           await StoredSession.updateOne({ code }, { $set: updateSet })
 
           // Delete old GridFS files only after session doc points to new ones
-          const oldIds = existing.files.map((f) => f.gridfsId)
+          const oldIds = current.files.map((f) => f.gridfsId)
           if (oldIds.length > 0) await deleteFiles(oldIds)
 
           clearExpiryTimer(code)
           scheduleExpiry(code, expiresAt)
 
-          console.log(`[publish] updated ${code} — expires ${expiresAt.toISOString()} — ${sanitisedFiles.length} file(s)`)
+          logger.info({ code, files: sanitisedFiles.length, expiresAt: expiresAt.toISOString() }, '[publish] updated stored session')
           res.json({ code, mode: 'stored', expiresAt: expiresAt.getTime(), ttlMs })
           return
         } catch (err: any) {
@@ -481,7 +565,11 @@ app.patch(
       throw lastErr ?? new Error('Server error during update')
     } catch (err: any) {
       logger.error({ err }, '[publish] update error')
-      res.status(500).json({ error: 'Server error during update', details: err?.message })
+      const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE' || err?.code === 'LIMIT_FILE_COUNT'
+      res.status(isLimit ? 400 : 500).json({
+        error: isLimit ? 'Upload limit exceeded' : 'Server error during update',
+        details: err?.message
+      })
     }
   }
 )
@@ -506,12 +594,18 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
 
     // Single DB query — check session existence
     const session = await StoredSession.findOne({ code }).select('+password').lean()
-    
+
     if (!session) {
       // Not a stored session — check if it's an active live session
       const liveSession = getSession(code)
       if (!liveSession) await new Promise(r => setTimeout(r, 800))
       res.status(404).json({ error: liveSession ? 'live_session' : 'not_found' })
+      return
+    }
+
+    // Burn-on-read session that was already read — content is gone.
+    if (session.burnedAt) {
+      res.status(410).json({ error: 'burned' })
       return
     }
 
@@ -531,19 +625,35 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
       return
     }
 
+    // Burn-on-read: mark atomically so exactly ONE retrieve ever sees the
+    // content, then keep files alive for BURN_GRACE_MS so the recipient can
+    // actually download what was just announced to them.
+    let burnGraceMs: number | null = null
     if (session.burnOnRead) {
-      logger.info({ code }, '[retrieve] burn-on-read triggered, deleting session')
-      // Small delay to ensure the client receives the response first
-      setTimeout(() => {
-        clearExpiryTimer(code)
-        deleteSessionAndFiles(code).catch(() => {})
-      }, 3000).unref()
+      const marked = await StoredSession.updateOne(
+        { code, burnedAt: null },
+        { $set: { burnedAt: new Date() } }
+      )
+      if (marked.modifiedCount === 1) {
+        burnGraceMs = BURN_GRACE_MS
+        logger.info({ code, graceMs: BURN_GRACE_MS }, '[retrieve] burn-on-read triggered')
+        setTimeout(() => {
+          clearExpiryTimer(code)
+          deleteSessionAndFiles(code).catch(() => {})
+        }, BURN_GRACE_MS).unref()
+      } else {
+        // Lost a concurrent race — another reader burned it first.
+        res.status(410).json({ error: 'burned' })
+        return
+      }
     }
 
     res.json({
       mode:      'stored',
       text:      session.text,
       expiresAt: session.expiresAt.getTime(),
+      burnOnRead: !!session.burnOnRead,
+      ...(burnGraceMs ? { burnGraceMs } : {}),
       files:     session.files.map((f) => ({
         name:     f.name,
         mimeType: f.mimeType,
@@ -615,13 +725,13 @@ app.get('/file/:fileId/:token', fileLimiter, async (req: Request, res: Response)
     res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
 
     stream.on('error', (err) => {
-      console.error('[file] stream error:', err)
+      logger.error({ err }, '[file] stream error')
       if (!res.headersSent) res.status(500).end()
     })
 
     stream.pipe(res)
   } catch (err) {
-    console.error('[file] error:', err)
+    logger.error({ err }, '[file] error')
     if (!res.headersSent) res.status(500).json({ error: 'Failed to stream file' })
   }
 })
@@ -630,54 +740,66 @@ app.get("/", (_req, res) => {
   res.send("Quick Share Server Running");
 });
 
-app.get("/health", (_req, res) => {
-  res.status(200).json({ status: "ok" });
-});
+// NOTE: the detailed /health handler lives further down this file. A second,
+// bare "/health" used to be registered here and silently shadowed it — which
+// broke the client's stored-mode feature detection. Keep exactly one.
 
 // ── GET /ice-servers — fetch ICE servers for WebRTC ──────────────────────────
-// Returns STUN servers always. TURN can be added here with dynamic credential fetching.
-// Phase 8: Integrate with Metered.ca or Cloudflare TURN for NAT traversal.
+// Returns STUN servers always; TURN credentials from Metered when configured.
+// The Metered response is cached server-side (credentials are short-lived but
+// outlive a 30 min cache) so this endpoint can never be used to amplify calls
+// to — and billing on — the upstream API.
+const ICE_CACHE_TTL_MS = 30 * 60 * 1000
+const ICE_NEGATIVE_TTL_MS = 5 * 60 * 1000
+const STUN_ONLY = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ],
+  turnAvailable: false,
+}
+let iceCache: { body: unknown; expiresAt: number } | null = null
 
-app.get('/ice-servers', async (_req: Request, res: Response) => {
+app.get('/ice-servers', iceLimiter, async (_req: Request, res: Response) => {
+  if (iceCache && Date.now() < iceCache.expiresAt) {
+    return res.json(iceCache.body)
+  }
+
+  const apiKey = process.env.METERED_API_KEY
+  if (!apiKey) {
+    logger.warn('[ice] METERED_API_KEY not set — serving STUN only')
+    iceCache = { body: STUN_ONLY, expiresAt: Date.now() + ICE_CACHE_TTL_MS }
+    return res.json(STUN_ONLY)
+  }
+
   try {
     const response = await fetch(
-      `https://global.relay.metered.ca/api/v1/turn/credentials?apiKey=${process.env.METERED_API_KEY}`
+      `https://global.relay.metered.ca/api/v1/turn/credentials?apiKey=${encodeURIComponent(apiKey)}`,
+      { signal: AbortSignal.timeout(5000) }
     )
 
     if (!response.ok) {
-      logger.warn('[ice] Metered TURN unavailable')
-
-      return res.json({
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' }
-        ],
-        turnAvailable: false
-      })
+      logger.warn({ status: response.status }, '[ice] Metered TURN unavailable')
+      iceCache = { body: STUN_ONLY, expiresAt: Date.now() + ICE_NEGATIVE_TTL_MS }
+      return res.json(STUN_ONLY)
     }
 
     const turnServers = await response.json() as IceServer[]
-
-    const iceServers: IceServer[] = [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-      ...turnServers
-    ]
-
-    return res.json({
-      iceServers,
-      turnAvailable: true
-    })
-  } catch (err) {
-    logger.error({ err }, '[ice] Failed to fetch TURN credentials')
-
-    return res.json({
+    const body = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
+        { urls: 'stun:stun1.l.google.com:19302' },
+        ...turnServers,
       ],
-      turnAvailable: false
-    })
+      turnAvailable: true,
+    }
+    iceCache = { body, expiresAt: Date.now() + ICE_CACHE_TTL_MS }
+    return res.json(body)
+  } catch (err) {
+    logger.error({ err }, '[ice] Failed to fetch TURN credentials')
+    // Short negative cache so an outage doesn't turn into a retry storm.
+    iceCache = { body: STUN_ONLY, expiresAt: Date.now() + ICE_NEGATIVE_TTL_MS }
+    return res.json(STUN_ONLY)
   }
 })
 
@@ -698,7 +820,7 @@ app.post('/session', sessionLimiter, async (req: Request, res: Response) => {
     const code = createSession(effectiveTtl, hashedPassword)
     res.status(201).json({ code, mode: 'live', expiresAt: Date.now() + effectiveTtl, ttlMs: effectiveTtl })
   } catch (err) {
-    console.error('[session] creation failed:', err)
+    logger.error({ err }, '[session] creation failed')
     res.status(503).json({ error: 'Failed to create session' })
   }
 })
@@ -718,7 +840,7 @@ app.get('/health', async (_req: Request, res: Response) => {
         mongoPing = Date.now() - start
         gridfsStatus = 'connected'
         const stats = await mongoose.connection.db.stats()
-        if (stats && stats.dataSize > 450 * 1024 * 1024) {
+        if (stats && stats.dataSize > MAX_DATA_SIZE_BYTES) {
           isStorageFull = true
         }
       }
@@ -742,9 +864,21 @@ app.get('/health', async (_req: Request, res: Response) => {
 
 // ── GET /stats — Phase 10: Monitoring ──────────────────────────────────────────
 // Requires STATS_KEY environment variable. Provides insight into server load.
+function timingSafeStrEqual(a: unknown, b: unknown): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  const bufA = Buffer.from(a)
+  const bufB = Buffer.from(b)
+  if (bufA.length !== bufB.length) {
+    // Burn comparable time to avoid a length oracle.
+    crypto.timingSafeEqual(bufA, bufA)
+    return false
+  }
+  return crypto.timingSafeEqual(bufA, bufB)
+}
+
 app.get('/stats', (req: Request, res: Response) => {
   const key = req.headers['x-stats-key']
-  if (!process.env.STATS_KEY || key !== process.env.STATS_KEY) {
+  if (!timingSafeStrEqual(key, process.env.STATS_KEY) || !process.env.STATS_KEY) {
     res.status(403).json({ error: 'forbidden' })
     return
   }
@@ -764,20 +898,26 @@ app.get('/stats', (req: Request, res: Response) => {
 
 const server = http.createServer(app)
 
-const wss = new WebSocketServer({
-  server,
-  verifyClient: ({ origin }, cb) => {
-    const allowed =
-      ALLOWED_ORIGINS.length === 0 ||
-      ALLOWED_ORIGINS.includes('*') ||
-      ALLOWED_ORIGINS.includes(origin ?? '')
-    if (!allowed) cb(false, 403, 'Forbidden')
-    else cb(true)
-  },
+// Origin check happens in an explicit upgrade handler — `verifyClient` is a
+// deprecated ws API and is scheduled for removal.
+const wss = new WebSocketServer({ noServer: true })
+
+server.on('upgrade', (req, socket, head) => {
+  const origin = req.headers.origin ?? ''
+  const allowed =
+    ALLOWED_ORIGINS.length === 0 ||
+    ALLOWED_ORIGINS.includes('*') ||
+    ALLOWED_ORIGINS.includes(origin)
+  if (!allowed) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
+    socket.destroy()
+    return
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
 })
 
 wss.on('connection', handleConnection)
-wss.on('error', (err) => console.error('[wss] error:', err))
+wss.on('error', (err) => logger.error({ err }, '[wss] error'))
 
 // ── WebSocket Heartbeat ───────────────────────────────────────────────────────
 // Send ping every 30s to detect dead connections. Clients should respond with pong.
@@ -862,11 +1002,11 @@ start()
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 function shutdown(signal: string) {
-  console.log(`[server] ${signal} — shutting down`)
+  logger.warn({ signal }, '[server] shutting down')
   wss.clients.forEach((ws) => ws.close(1001, 'Server shutting down'))
   server.close(async () => {
     await mongoose.connection.close()
-    console.log('[server] closed')
+    logger.info('[server] closed')
     process.exit(0)
   })
 }

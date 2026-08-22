@@ -8,12 +8,39 @@ import { promisify } from 'util'
 
 const scrypt = promisify(crypto.scrypt)
 
-async function verifyPassword(password: string, stored: string): Promise<boolean> {
-  const [salt, key] = stored.split(':')
-  const derivedKey = (await scrypt(password, salt, 64)) as Buffer
-  const derivedKeyHex = derivedKey.toString('hex')
-  if (derivedKeyHex.length !== key.length) return false
-  return crypto.timingSafeEqual(Buffer.from(derivedKeyHex), Buffer.from(key))
+// Null-safe password verification. A malformed/empty stored hash must return
+// false, never throw — a throw inside the async message handler would leave
+// the socket hanging with no response.
+async function verifyPassword(password: string, stored: string | undefined | null): Promise<boolean> {
+  if (!stored || typeof stored !== 'string') return false
+  const parts = stored.split(':')
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return false
+  const [salt, key] = parts as [string, string]
+  try {
+    const derivedKey = (await scrypt(password, salt, 64)) as Buffer
+    const derivedKeyHex = derivedKey.toString('hex')
+    if (derivedKeyHex.length !== key.length) return false
+    return crypto.timingSafeEqual(Buffer.from(derivedKeyHex), Buffer.from(key))
+  } catch {
+    return false
+  }
+}
+
+// Resolve the client IP for rate limiting. Trust X-Forwarded-For ONLY when the
+// TCP peer is a private/loopback address (i.e. our own reverse proxy).
+// A direct public client cannot spoof its IP this way.
+const PRIVATE_PEER_RE = /^(::1|::ffff:127\.|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::ffff:10\.|::ffff:192\.168\.|::ffff:172\.(1[6-9]|2\d|3[01])\.)/
+
+function clientIpFromReq(req: IncomingMessage): string {
+  const sock = req.socket.remoteAddress ?? 'unknown'
+  if (PRIVATE_PEER_RE.test(sock)) {
+    const xff = req.headers['x-forwarded-for']
+    if (typeof xff === 'string' && xff.length > 0) {
+      const first = xff.split(',')[0]?.trim()
+      if (first) return first
+    }
+  }
+  return sock
 }
 
 const RELAY_TYPES = new Set(['offer', 'answer', 'ice'])
@@ -67,13 +94,15 @@ interface PeerContext {
 }
 
 export function handleConnection(ws: WebSocket, _req: IncomingMessage): void {
-  const ctx: PeerContext = { code: null, role: null, peerId: null };
-  (ws as any)._ip = _req.socket.remoteAddress;
+  const ctx: PeerContext = { code: null, role: null, peerId: null }
+  const clientIp = clientIpFromReq(_req)
+  const ext = ws as WebSocket & { _ip?: string, isAlive?: boolean }
+  ext._ip = clientIp
 
   // Heartbeat: mark as alive on pong
-  (ws as any).isAlive = true
+  ext.isAlive = true
   ws.on('pong', () => {
-    (ws as any).isAlive = true
+    ext.isAlive = true
   })
 
   // Rate limiting: track message count per window
@@ -90,14 +119,14 @@ export function handleConnection(ws: WebSocket, _req: IncomingMessage): void {
     messageCount++
     
     if (messageCount > RATE_LIMIT_MAX_MSGS) {
-      logger.warn({ ip: _req.socket.remoteAddress }, 'WebSocket: rate limit exceeded')
+      logger.warn({ ip: ext._ip }, 'WebSocket: rate limit exceeded')
       ws.close(1008, 'Rate limit exceeded')
       return
     }
     // FIX 1: Reject oversized messages before JSON.parse
     const msgLength = Buffer.isBuffer(raw) ? raw.length : Buffer.byteLength(raw.toString())
-    if (msgLength > 65536) {
-      logger.warn({ ip: _req.socket.remoteAddress }, 'WebSocket: oversized message rejected')
+    if (msgLength > MAX_WS_MSG_BYTES) {
+      logger.warn({ ip: ext._ip }, 'WebSocket: oversized message rejected')
       ws.close(1009, 'Message too large')
       return
     }
@@ -112,7 +141,14 @@ export function handleConnection(ws: WebSocket, _req: IncomingMessage): void {
     }
 
     if (msg.type === 'join') {
-      await handleJoin(ws, ctx, msg.payload as any)
+      try {
+        await handleJoin(ws, ctx, msg.payload as JoinPayload)
+      } catch (err) {
+        // A rejected promise here would otherwise become an unhandled
+        // rejection and leave the socket open with no reply.
+        logger.error({ err }, 'WebSocket: join handler failed')
+        sendTo(ws, { type: 'error', payload: 'join_failed' })
+      }
       return
     }
 
@@ -163,16 +199,19 @@ async function handleJoin(ws: WebSocket, ctx: PeerContext, payload: JoinPayload)
     return
   }
 
-  // Mandatory password check for recipients
-  if (role === 'recipient') {
-    const ip = (ws as any)._ip || 'unknown'
+  // Mandatory password check for BOTH roles.
+  // Live sessions are password-protected at creation; verifying the publisher
+  // too prevents an attacker who knows the 6-digit code from claiming the
+  // single publisher slot and hijacking (or permanently blocking) the session.
+  {
+    const ip = (ws as WebSocket & { _ip?: string })._ip || 'unknown'
     if (isBruteForcing(ip)) {
       sendTo(ws, { type: 'error', payload: 'Too many failed attempts. Try again in 15 minutes.' })
       return
     }
 
-    const providedPass = (payload as any).password
-    if (!providedPass || !(await verifyPassword(providedPass, session.passwordHash || ''))) {
+    const providedPass = payload.password
+    if (!providedPass || !(await verifyPassword(providedPass, session.passwordHash))) {
       recordFailure(ip)
       // Artificial delay to slow down automated brute force
       await new Promise(r => setTimeout(r, 500 + Math.random() * 1000))

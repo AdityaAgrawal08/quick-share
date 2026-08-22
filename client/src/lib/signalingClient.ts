@@ -1,4 +1,4 @@
-import type { SignalMessage, PeerRole } from '../types'
+import type { SignalMessage, PeerRole, JoinPayload } from '../types'
 
 type MessageHandler = (msg: SignalMessage) => void
 
@@ -43,7 +43,7 @@ export class SignalingClient {
     ws.onopen = () => {
       this.reconnectAttempt = 0  // Reset on successful connect
       // Re-send join on every (re)connect — server needs it to rebuild ctx
-      const joinPayload: any = { code: this.opts.code, role: this.opts.role }
+      const joinPayload: JoinPayload = { code: this.opts.code, role: this.opts.role }
       if (this.opts.password) joinPayload.password = this.opts.password
       this.send({ type: 'join', payload: joinPayload })
       this.opts.onOpen?.()
@@ -58,7 +58,7 @@ export class SignalingClient {
       }
     }
 
-    ws.onclose = (_event) => {
+    ws.onclose = () => {
       this.ws = null
 
       if (this.intentionalClose) {

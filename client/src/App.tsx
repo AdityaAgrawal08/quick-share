@@ -6,13 +6,30 @@ import { TransferReceiver, sendTransfer, type TransferProgress, type ReceivedTra
 import { encrypt, decrypt, arrayBufferToBase64, base64ToArrayBuffer } from './lib/crypto'
 import type { SignalMessage, PeerRole } from './types'
 
-const API_URL = import.meta.env.VITE_API_URL as string
+const RAW_API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.trim()
+// Fall back to same-origin so a missing env var crashes nothing at module load.
+const API_URL = (RAW_API_URL || window.location.origin).replace(/\/$/, '')
 const SIGNALING_URL = API_URL.startsWith('https')
   ? API_URL.replace('https', 'wss')
   : API_URL.replace('http', 'ws')
 const STORED_TTL_MIN = 1 * 60
 const STORED_TTL_MAX = 10 * 60 * 60
 const STORED_MAX = 10 * 1024 * 1024
+// ICE servers / TURN credentials are short-lived — refresh before they expire.
+const ICE_CACHE_TTL_MS = 25 * 60 * 1000
+// Live sessions run for a full day (server clamps to its own SESSION_TTL_MS).
+const LIVE_TTL_MS = 24 * 60 * 60 * 1000
+
+// E2EE payload layout: [salt(16) | iv(12) | ciphertext], then base64 for text.
+const E2EE_OVERHEAD_BYTES = 16 + 12
+
+// The server stores encrypted text as base64, which is ~4/3 the raw byte
+// length, plus salt+iv overhead. Mirror that when deciding if the payload
+// fits stored mode, otherwise near-limit payloads pass client-side checks
+// and then fail server-side with a confusing error.
+function encryptedTextBytes(rawBytes: number): number {
+  return Math.ceil((rawBytes + E2EE_OVERHEAD_BYTES) / 3) * 4
+}
 
 function formatTTL(s: number): string {
   if (s < 3600) return `${Math.round(s / 60)} min`
@@ -42,6 +59,10 @@ function getTextBytes(text: string): number {
   return new TextEncoder().encode(text).length
 }
 
+function passwordHeaders(password: string): Record<string, string> {
+  return password ? { 'x-session-password': password } : {}
+}
+
 function splitStoredTtl(seconds: number): { hours: number; minutes: number } {
   const clamped = Math.min(Math.max(seconds, STORED_TTL_MIN), STORED_TTL_MAX)
   const h = Math.floor(clamped / 3600)
@@ -58,20 +79,47 @@ function formatCountdown(ms: number): string {
   return `${Math.floor(m / 60)}h ${m % 60}m`
 }
 
-function anchorDownload(url: string, filename: string) {
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.style.display = 'none'
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-}
+  function anchorDownload(url: string, filename: string) {
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.style.display = 'none'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  }
+
+  async function fetchStoredFileBlob(f: StoredFileInfo, passwordHeader: string): Promise<Blob> {
+    const res = await fetch(`${API_URL}/file/${f.fileId}/${f.token}`, {
+      headers: passwordHeader ? { 'x-session-password': passwordHeader } : {},
+    })
+    if (!res.ok) throw new Error(String(res.status))
+    const raw = await res.blob()
+    if (!passwordHeader) return raw
+    const buffer = await raw.arrayBuffer()
+    const decrypted = await decrypt(buffer, passwordHeader, false) as ArrayBuffer
+    return new Blob([decrypted], { type: f.mimeType })
+  }
+
+  async function prefetchStoredFiles(
+    fileList: StoredFileInfo[],
+    pass: string
+  ): Promise<{ fileId: string; blob: Blob | null }[]> {
+    return Promise.all(
+      fileList.map(async f => {
+        try {
+          return { fileId: f.fileId, blob: await fetchStoredFileBlob(f, pass) }
+        } catch {
+          return { fileId: f.fileId, blob: null }
+        }
+      })
+    )
+  }
 
 type PublishMode = 'stored' | 'live'
 
 interface StoredFileInfo { name: string; mimeType: string; size: number; fileId: string; token: string }
-interface RetrievedPayload { mode: 'stored'; text: string; expiresAt: number; files: StoredFileInfo[] }
+interface RetrievedPayload { mode: 'stored'; text: string; expiresAt: number; burnOnRead?: boolean; burnGraceMs?: number; files: StoredFileInfo[] }
 interface RecipientConn {
   peerId: string; rtc: WebRTCManager
   channelState: ChannelState; sendProgress: TransferProgress | null; lastSentAt: number | null
@@ -109,7 +157,7 @@ export default function App() {
   const [inputPassword, setInputPassword] = useState('')
   const [burnOnRead, setBurnOnRead] = useState(false)
   const [isStorageFull, setIsStorageFull] = useState(false)
-  const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('qs_theme') as any) || 'dark')
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => localStorage.getItem('qs_theme') === 'light' ? 'light' : 'dark')
 
   const sigRef = useRef<SignalingClient | null>(null)
   const rtcMapRef = useRef<Map<string, WebRTCManager>>(new Map())
@@ -118,6 +166,10 @@ export default function App() {
   const recipientCountRef = useRef(0)
   const p2pEverLiveRef = useRef(false)
   const iceServersRef = useRef<RTCIceServer[]>([])
+  const iceFetchedAtRef = useRef(0)
+  // Burn-on-read: blobs prefetched during the grace window so "Get" clicks
+  // that land after the server deleted the session still work.
+  const prefetchedRef = useRef<Map<string, Blob>>(new Map())
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const linkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const passwordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -167,7 +219,7 @@ export default function App() {
         if (typeof data.isStorageFull === 'boolean') {
           setIsStorageFull(data.isStorageFull)
         }
-      } catch (err) {
+      } catch {
         setStoredEnabled(true)
       }
     }
@@ -175,7 +227,7 @@ export default function App() {
   }, [])
 
   const totalBytes = files.reduce((s, f) => s + f.size, 0)
-  const textBytes = getTextBytes(text)
+  const textBytes = password ? encryptedTextBytes(getTextBytes(text)) : getTextBytes(text)
   const payloadBytes = totalBytes + textBytes
   const mode: PublishMode =
     publishedMode === 'stored' ? 'stored' :
@@ -296,15 +348,12 @@ export default function App() {
         if (password) {
           xhr.setRequestHeader('x-session-password', password)
         }
-        if (files.length > 0) {
-          xhr.upload.onprogress = () => {}
-        }
         xhr.onload = () => {
           try {
             const resp = JSON.parse(xhr.responseText)
             if (xhr.status >= 400) resolve({ error: resp.error || 'Request failed', ...resp })
             else resolve(resp)
-          } catch (e) {
+          } catch {
             reject(new Error('Invalid response from server'))
           }
         }
@@ -322,8 +371,8 @@ export default function App() {
       setCode(data.code)
       setExpiresAt(data.expiresAt)
       setPublishedMode('stored')
-    } catch (err: any) {
-      setPublishError(err?.message ?? 'An unexpected error occurred.')
+    } catch (err: unknown) {
+      setPublishError(err instanceof Error ? err.message : 'An unexpected error occurred.')
     }
     setPublishing(false)
   }
@@ -336,7 +385,7 @@ export default function App() {
       const res = await fetch(`${API_URL}/session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ttlMs: 24 * 60 * 60 * 1000, password })
+        body: JSON.stringify({ ttlMs: LIVE_TTL_MS, password })
       })
       const data = await res.json()
       if (!res.ok) {
@@ -348,7 +397,7 @@ export default function App() {
       setPublishedMode('live')
       setExpiresAt(data.expiresAt)
       startSignaling(data.code, 'publisher')
-    } catch (err: any) {
+    } catch {
       setPublishError('Could not connect to server. Please try again.')
     }
     setPublishing(false)
@@ -365,7 +414,7 @@ export default function App() {
         setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, sendProgress: p } : x))
       })
       setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, lastSentAt: Date.now(), sendProgress: null } : x))
-    } catch (err) {
+    } catch {
       alert('Connection issue. Please try again.')
     }
   }
@@ -376,26 +425,40 @@ export default function App() {
     setJoining(true)
     setJoinError('')
     try {
-      const headers: any = {}
-      if (inputPassword) headers['x-session-password'] = inputPassword
-
-      const res = await fetch(`${API_URL}/retrieve/${inputCode}`, { headers })
+      const res = await fetch(`${API_URL}/retrieve/${inputCode}`, { headers: passwordHeaders(inputPassword) })
       if (res.ok) {
         const data: RetrievedPayload = await res.json()
-        
+
         // E2EE: Decrypt text if password was used
         if (inputPassword && data.text) {
           try {
             data.text = await decrypt(base64ToArrayBuffer(data.text), inputPassword, true) as string
-          } catch (e) {
-            setJoinError('Unable to decrypt the message.')
+          } catch {
+            // Wrong password / corrupted payload — do NOT show ciphertext.
+            setJoinError('Unable to decrypt the message. Check the password.')
+            setJoining(false)
+            return
           }
         }
-        
+
         setStoredPayload(data)
         setCode(inputCode)
         setExpiresAt(data.expiresAt)
         setView('join')
+
+        // Burn-on-read: the server keeps files alive for a short grace window
+        // only. Fetch and decrypt every file NOW so later "Get" clicks work.
+        if (data.burnOnRead && data.files.length > 0) {
+          void prefetchStoredFiles(data.files, inputPassword).then(results => {
+            for (const r of results) {
+              if (r.blob) prefetchedRef.current.set(r.fileId, r.blob)
+            }
+            if (results.some(r => !r.blob)) {
+              setJoinError('Some files could not be preloaded before the session self-destructed.')
+            }
+          })
+        }
+
         setJoining(false)
         return
       }
@@ -420,68 +483,35 @@ export default function App() {
       }
       const data = await res.json().catch(() => ({}))
       setJoinError(data.error || 'Could not join session.')
-    } catch (err: any) {
+    } catch {
       setJoinError('Server not connected.')
     }
     setJoining(false)
   }
 
-  function handleStoredDownload(f: StoredFileInfo) {
-    const url = `${API_URL}/file/${f.fileId}/${f.token}`
-    const headers: any = {}
-    if (inputPassword) headers['x-session-password'] = inputPassword
-
-    // Download should always save the file instead of opening a preview.
-    fetch(url, { headers })
-      .then(res => {
-        if (!res.ok) throw new Error()
-        return res.blob()
-      })
-      .then(async blob => {
-        let finalBlob = blob
-        if (inputPassword) {
-          try {
-            const buffer = await blob.arrayBuffer()
-            const decrypted = await decrypt(buffer, inputPassword, false) as ArrayBuffer
-            finalBlob = new Blob([decrypted], { type: f.mimeType })
-          } catch (e) {
-            alert('Unable to open the file.')
-            return
-          }
-        }
-        const u = URL.createObjectURL(finalBlob)
-        anchorDownload(u, f.name)
-        setTimeout(() => URL.revokeObjectURL(u), 1000)
-      })
-      .catch(() => alert('Failed to download file. Check password or connection.'))
+  async function handleStoredDownload(f: StoredFileInfo) {
+    try {
+      // Prefer a blob prefetched during the burn-on-read grace window.
+      let finalBlob = prefetchedRef.current.get(f.fileId)
+      if (!finalBlob) finalBlob = await fetchStoredFileBlob(f, inputPassword)
+      const u = URL.createObjectURL(finalBlob)
+      anchorDownload(u, f.name)
+      setTimeout(() => URL.revokeObjectURL(u), 1000)
+    } catch {
+      alert('Failed to download file. Check password or connection.')
+    }
   }
 
-  function handleStoredPreview(f: StoredFileInfo) {
-    const headers: any = {}
-    if (inputPassword) headers['x-session-password'] = inputPassword
-
-    fetch(`${API_URL}/file/${f.fileId}/${f.token}`, { headers })
-      .then(res => {
-        if (!res.ok) throw new Error()
-        return res.blob()
-      })
-      .then(async blob => {
-        let finalBlob = blob
-        if (inputPassword) {
-          try {
-            const buffer = await blob.arrayBuffer()
-            const decrypted = await decrypt(buffer, inputPassword, false) as ArrayBuffer
-            finalBlob = new Blob([decrypted], { type: f.mimeType })
-          } catch (e) {
-            alert('Unable to open the file.')
-            return
-          }
-        }
-        const u = URL.createObjectURL(finalBlob)
-        window.open(u, '_blank', 'noopener')
-        setTimeout(() => URL.revokeObjectURL(u), 60000)
-      })
-      .catch(() => alert('Server not connected.'))
+  async function handleStoredPreview(f: StoredFileInfo) {
+    try {
+      let finalBlob = prefetchedRef.current.get(f.fileId)
+      if (!finalBlob) finalBlob = await fetchStoredFileBlob(f, inputPassword)
+      const u = URL.createObjectURL(finalBlob)
+      window.open(u, '_blank', 'noopener')
+      setTimeout(() => URL.revokeObjectURL(u), 60000)
+    } catch {
+      alert('Unable to open the file. Check password or connection.')
+    }
   }
 
   function handleLiveDownload(f: ReceivedFile) {
@@ -497,15 +527,21 @@ export default function App() {
   }
 
   const fetchIceServers = useCallback(async (): Promise<RTCIceServer[]> => {
-    if (iceServersRef.current.length > 0) return iceServersRef.current
+    const fresh = Date.now() - iceFetchedAtRef.current < ICE_CACHE_TTL_MS
+    if (iceServersRef.current.length > 0 && fresh) return iceServersRef.current
     try {
       const res = await fetch(`${API_URL}/ice-servers`)
       if (!res.ok) throw new Error()
       const data = await res.json() as { iceServers: RTCIceServer[] }
       iceServersRef.current = data.iceServers
+      iceFetchedAtRef.current = Date.now()
       return data.iceServers
     } catch {
-      return [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }]
+      // Network failure — fall back to whatever we have (or bare STUN), but
+      // don't stamp a fresh timestamp so the next call retries.
+      return iceServersRef.current.length > 0
+        ? iceServersRef.current
+        : [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }]
     }
   }, [])
 
@@ -627,6 +663,8 @@ export default function App() {
     recipientCountRef.current = 0
     p2pEverLiveRef.current = false
     iceServersRef.current = []
+    iceFetchedAtRef.current = 0
+    prefetchedRef.current.clear()
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
     setView('home'); setCode(''); setInputCode('')
     setText(''); setFiles([]); setTtlSeconds(3600)
@@ -637,6 +675,10 @@ export default function App() {
     setReceived(null); setStoredPayload(null)
     setJoining(false); setJoinError('')
     setCountdown(''); setPassword(''); setInputPassword('')
+    // These leaked across sessions before — burn-on-read silently applied to
+    // the next share, and the password stayed revealed.
+    setBurnOnRead(false)
+    setShowPassword(false)
   }
 
   function sigColor() {
@@ -983,6 +1025,11 @@ export default function App() {
                 {(storedPayload?.files?.length || received?.files?.length) && (
                   <div>
                     <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '0.75rem' }}>Files</label>
+                    {storedPayload?.burnOnRead && (
+                      <p style={{ fontSize: '0.75rem', color: 'var(--warning, #eab308)', margin: '0 0 0.75rem', fontWeight: 600 }}>
+                        One-time session — files are preloaded below; the server copy self-destructs shortly.
+                      </p>
+                    )}
                     <div style={{ display: 'grid', gap: '12px' }}>
                       {(storedPayload?.files || received?.files || []).map((f, i) => (
                         <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px', background: 'var(--surface-hi)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
@@ -1021,6 +1068,21 @@ export default function App() {
 
 function DurationPicker({ ttlSeconds, setStoredDuration }: { ttlSeconds: number, setStoredDuration: (h: number, m: number) => void }) {
   const parts = splitStoredTtl(ttlSeconds)
+  // Mirror the latest split in a ref so held-button repeats always step from
+  // the freshest values, even if a tick fires between renders.
+  const partsRef = useRef(parts)
+  useEffect(() => {
+    partsRef.current = parts
+  })
+
+  const stepHours = (delta: number) => {
+    const cur = partsRef.current
+    setStoredDuration(cur.hours + delta, cur.minutes)
+  }
+  const stepMinutes = (delta: number) => {
+    const cur = partsRef.current
+    setStoredDuration(cur.hours, cur.minutes + delta)
+  }
 
   return (
     <div style={{ marginTop: '1rem', padding: '1rem', background: 'var(--surface-hi)', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
@@ -1033,29 +1095,32 @@ function DurationPicker({ ttlSeconds, setStoredDuration }: { ttlSeconds: number,
       </div>
       <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
         <Stepper
-          value={parts.hours} min={0} max={10} label="hr"
-          onUpdate={v => setStoredDuration(v, parts.minutes)}
+          value={parts.hours} label="hr"
+          onStep={stepHours}
         />
         <Stepper
-          value={parts.minutes} min={0} max={59} label="min"
-          onUpdate={v => setStoredDuration(parts.hours, v)}
+          value={parts.minutes} label="min"
+          onStep={stepMinutes}
         />
       </div>
     </div>
   )
 }
 
-function Stepper({ value, min, max, label, onUpdate }: {
-  value: number, min: number, max: number, label: string, onUpdate: (v: number) => void
+function Stepper({ value, label, onStep }: {
+  value: number, label: string, onStep: (delta: number) => void
 }) {
-  const timerRef = useRef<any>(null)
-  const intervalRef = useRef<any>(null)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const startChange = (delta: number) => {
-    onUpdate(Math.min(max, Math.max(min, value + delta)))
+    // The parent reads its latest state via ref — passing a delta (instead of
+    // a pre-computed value captured from this render) makes hold-to-repeat
+    // accumulate correctly instead of re-applying one stale increment.
+    onStep(delta)
     timerRef.current = setTimeout(() => {
       intervalRef.current = setInterval(() => {
-        onUpdate(Math.min(max, Math.max(min, value + delta)))
+        onStep(delta)
       }, 80)
     }, 400)
   }
@@ -1063,7 +1128,12 @@ function Stepper({ value, min, max, label, onUpdate }: {
   const stopChange = () => {
     if (timerRef.current) clearTimeout(timerRef.current)
     if (intervalRef.current) clearInterval(intervalRef.current)
+    timerRef.current = null
+    intervalRef.current = null
   }
+
+  // Clear timers if unmounted mid-press.
+  useEffect(() => stopChange, [])
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
