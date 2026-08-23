@@ -24,3 +24,5 @@ Thumbs.db
 *.swp
 *.swo
 
+signaling-server/.evalbuild/
+signaling-server/.hf-cache/
