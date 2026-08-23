@@ -53,8 +53,11 @@ Ensure you have **Node.js v20+** installed on your machine.
     MONGODB_URI=your_mongodb_atlas_uri
     ALLOWED_ORIGINS=http://localhost:3000
     METERED_API_KEY=your_metered_ca_api_key
+    GROQ_API_KEY=gsk_your_groq_api_key
+    GROQ_MODEL=openai/gpt-oss-120b
     NODE_ENV=development
     ```
+    Get a free Groq key at [console.groq.com/keys](https://console.groq.com/keys) — no credit card needed. Without it, file indexing and retrieval still work; only AI *answers* are disabled.
 4.  Start the development server:
     ```bash
     npm run dev

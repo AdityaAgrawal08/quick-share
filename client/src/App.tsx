@@ -6,6 +6,8 @@ import { TransferReceiver, sendTransfer, type TransferProgress, type ReceivedTra
 import { encrypt, decrypt, arrayBufferToBase64, base64ToArrayBuffer } from './lib/crypto'
 import { guessMime } from './lib/mime'
 import type { SignalMessage, PeerRole } from './types'
+import { AiChat } from './components/AiChat'
+import type { AiSource } from './components/AiChat'
 
 const RAW_API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.trim()
 // Fall back to same-origin so a missing env var crashes nothing at module load.
@@ -183,9 +185,11 @@ export default function App() {
   const [storedEnabled, setStoredEnabled] = useState(true)
   const [publishError, setPublishError] = useState('')
   const [password, setPassword] = useState('')
+  const [isPrivate, setIsPrivate] = useState(false)
   const [inputPassword, setInputPassword] = useState('')
   const [burnOnRead, setBurnOnRead] = useState(false)
   const [isStorageFull, setIsStorageFull] = useState(false)
+  const [aiStatus, setAiStatus] = useState<'none'|'pending'|'ready'|'failed'>('none')
   const [theme, setTheme] = useState<'dark' | 'light'>(() => localStorage.getItem('qs_theme') === 'light' ? 'light' : 'dark')
 
   const sigRef = useRef<SignalingClient | null>(null)
@@ -259,7 +263,10 @@ export default function App() {
   }, [])
 
   const totalBytes = files.reduce((s, f) => s + f.size, 0)
-  const textBytes = password ? encryptedTextBytes(getTextBytes(text)) : getTextBytes(text)
+  // Mirror server-side size math: base64 inflation applies ONLY when this
+  // stored session will actually be encrypted (Private + password typed).
+  const willEncryptStored = (publishedMode === 'stored' || !publishedMode) && isPrivate && password.length > 0
+  const textBytes = willEncryptStored ? encryptedTextBytes(getTextBytes(text)) : getTextBytes(text)
   const payloadBytes = totalBytes + textBytes
   const mode: PublishMode =
     publishedMode === 'stored' ? 'stored' :
@@ -346,25 +353,30 @@ export default function App() {
     setPublishing(true)
     setPublishError('')
     const isUpdate = publishedMode === 'stored' && code !== ''
+    // SINGLE SOURCE OF TRUTH: stored sessions are encrypted ONLY when the
+    // user explicitly chose Private. A leftover password typed elsewhere
+    // (e.g. a live-mode attempt) must never silently E2EE an open session.
+    const privatePassword = isPrivate && publishedMode !== 'live' ? password.trim() : ''
+    if (isPrivate && !privatePassword) return // guarded by UI; belt-and-braces
     try {
       const form = new FormData()
-      
-      // E2EE: Encrypt text if password is set
+
+      // E2EE: Encrypt text ONLY for private sessions
       let finalText = text
-      if (password) {
-        const encryptedText = await encrypt(text, password)
+      if (privatePassword) {
+        const encryptedText = await encrypt(text, privatePassword)
         finalText = arrayBufferToBase64(encryptedText)
       }
       form.append('text', finalText)
       form.append('ttlMs', String(clampStoredTtl(ttlSeconds) * 1000))
-      if (password) form.append('password', password)
+      if (privatePassword) form.append('password', privatePassword)
       form.append('burnOnRead', String(burnOnRead))
-      
-      // E2EE: Encrypt each file if password is set
+
+      // E2EE: Encrypt each file ONLY for private sessions
       for (const f of files) {
-        if (password) {
+        if (privatePassword) {
           const buffer = await f.arrayBuffer()
-          const encrypted = await encrypt(buffer, password)
+          const encrypted = await encrypt(buffer, privatePassword)
           // The Blob's type becomes the multipart part's Content-Type, which
           // multer records as `mimetype`. Without it every encrypted upload
           // was stored as application/octet-stream and "View" degraded into
@@ -384,8 +396,8 @@ export default function App() {
         // Generous ceiling so slow-but-healthy uploads finish, while a stalled
         // connection surfaces as a clear error instead of hanging forever.
         xhr.timeout = 5 * 60 * 1000
-        if (password) {
-          xhr.setRequestHeader('x-session-password', password)
+        if (privatePassword) {
+          xhr.setRequestHeader('x-session-password', privatePassword)
         }
         xhr.onload = () => {
           try {
@@ -460,7 +472,7 @@ export default function App() {
 
 
   async function handleJoin() {
-    if (inputCode.length !== 6 || !inputPassword) return
+    if (inputCode.length !== 6) return
     setJoining(true)
     setJoinError('')
     try {
@@ -484,6 +496,10 @@ export default function App() {
         setCode(inputCode)
         setExpiresAt(data.expiresAt)
         setView('join')
+        // AI availability for this session
+        void fetch(`${API_URL}/ai/status/${inputCode}`).then(r => r.json()).then(st => {
+          if (typeof st.aiStatus === 'string') setAiStatus(st.aiStatus as 'none'|'pending'|'ready'|'failed')
+        }).catch(() => {})
 
         // Burn-on-read: the server keeps files alive for a short grace window
         // only. Fetch and decrypt every file NOW so later "Get" clicks work.
@@ -694,6 +710,21 @@ export default function App() {
     }
   }
 
+  async function askAi(question: string): Promise<{ answer: string; refused?: boolean; sources?: AiSource[]; error?: string }> {
+    try {
+      const res = await fetch(`${API_URL}/ai/query/${code}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...passwordHeaders(inputPassword) },
+        body: JSON.stringify({ question }),
+      })
+      const data = await res.json()
+      if (!res.ok) return { answer: '', error: String(data.error ?? 'ai_error') }
+      return { answer: data.answer, refused: data.refused, sources: data.sources }
+    } catch {
+      return { answer: '', error: 'network' }
+    }
+  }
+
   function reset() {
     sessionGenRef.current++
     rtcMapRef.current.forEach(r => r.close())
@@ -715,7 +746,8 @@ export default function App() {
     setChannelState('idle'); setRecvProgress(null)
     setReceived(null); setStoredPayload(null)
     setJoining(false); setJoinError('')
-    setCountdown(''); setPassword(''); setInputPassword('')
+    setCountdown(''); setPassword(''); setInputPassword(''); setIsPrivate(false)
+    setAiStatus('none')
     // These leaked across sessions before — burn-on-read silently applied to
     // the next share, and the password stayed revealed.
     setBurnOnRead(false)
@@ -790,7 +822,7 @@ export default function App() {
                   onKeyDown={e => e.key === 'Enter' && handleJoin()}
                   style={{ textAlign: 'center', fontSize: '1.25rem', fontWeight: 700, letterSpacing: '0.2em', fontFamily: 'var(--font-mono)' }}
                 />
-                <Btn primary disabled={inputCode.length !== 6 || !inputPassword || joining} onClick={handleJoin} style={{ width: '80px' }}>
+                <Btn primary disabled={inputCode.length !== 6 || joining} onClick={handleJoin} style={{ width: '80px' }}>
                   {joining ? <Spinner /> : 'Join'}
                 </Btn>
               </div>
@@ -802,7 +834,7 @@ export default function App() {
                 <input
                   className="input"
                   type="password"
-                  placeholder="Required for security"
+                  placeholder="Only for private sessions (optional)"
                   value={inputPassword}
                   onChange={e => setInputPassword(e.target.value)}
                   onKeyDown={e => e.key === 'Enter' && handleJoin()}
@@ -854,27 +886,78 @@ export default function App() {
           <Card>
             <div style={{ marginBottom: '1.5rem' }}>
               <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.1em', color: 'var(--text-dim)', marginBottom: '0.75rem' }}>Security</label>
-              <div style={{ position: 'relative' }}>
-                <input
-                  className="input"
-                  type="password"
-                  placeholder="Set session password"
-                  value={password}
-                  onChange={e => setPassword(e.target.value)}
-                  style={{ paddingLeft: '2.5rem' }}
-                />
-                <Icon name="lock" size={16} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-dim)' }} />
-              </div>
-              
+
+              {effectiveMode === 'stored' ? (
+                <>
+                  {/* Visibility toggle — Open sessions are AI-indexable; Private are E2EE + invisible to AI */}
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: isPrivate ? '1rem' : '0.25rem' }}>
+                    <Btn
+                      secondary={!isPrivate}
+                      primary={isPrivate}
+                      small
+                      onClick={() => { setIsPrivate(false); setPassword('') }}
+                      style={{ flex: 1, opacity: isPrivate ? 0.6 : 1 }}
+                    >
+                      🌐 Open · AI-enabled
+                    </Btn>
+                    <Btn
+                      secondary={!isPrivate}
+                      primary={isPrivate}
+                      small
+                      onClick={() => setIsPrivate(true)}
+                      style={{ flex: 1, opacity: !isPrivate ? 0.6 : 1 }}
+                    >
+                      🔒 Private · E2EE
+                    </Btn>
+                  </div>
+                  {!isPrivate && (
+                    <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)', margin: '0 0 0.5rem', lineHeight: 1.4 }}>
+                      Anyone with the code can read this session. Content is indexed so you can ask questions about it.
+                    </p>
+                  )}
+                  {isPrivate && (
+                    <>
+                      <p style={{ fontSize: '0.75rem', color: 'var(--text-dim)', margin: '0 0 0.75rem', lineHeight: 1.4 }}>
+                        End-to-end encrypted in your browser. The server cannot read it — AI features stay off.
+                      </p>
+                      <div style={{ position: 'relative' }}>
+                        <input
+                          className="input"
+                          type="password"
+                          placeholder="Set a strong private password"
+                          value={password}
+                          onChange={e => setPassword(e.target.value)}
+                          style={{ paddingLeft: '2.5rem' }}
+                        />
+                        <Icon name="lock" size={16} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-dim)' }} />
+                      </div>
+                    </>
+                  )}
+                </>
+              ) : (
+                /* Live P2P keeps the mandatory password (protects signaling) */
+                <div style={{ position: 'relative' }}>
+                  <input
+                    className="input"
+                    type="password"
+                    placeholder="Set session password (required)"
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    style={{ paddingLeft: '2.5rem' }}
+                  />
+                  <Icon name="lock" size={16} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-dim)' }} />
+                </div>
+              )}
+
               {effectiveMode === 'stored' && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', marginTop: '1rem' }} onClick={() => setBurnOnRead(!burnOnRead)}>
-                  <div style={{ 
-                    width: '32px', height: '18px', background: burnOnRead ? 'var(--accent)' : 'var(--border)', 
-                    borderRadius: '100px', position: 'relative', transition: 'var(--transition)' 
+                  <div style={{
+                    width: '32px', height: '18px', background: burnOnRead ? 'var(--accent)' : 'var(--border)',
+                    borderRadius: '100px', position: 'relative', transition: 'var(--transition)'
                   }}>
-                    <div style={{ 
-                      width: '12px', height: '12px', background: '#fff', borderRadius: '50%', 
-                      position: 'absolute', top: '3px', left: burnOnRead ? '17px' : '3px', transition: 'var(--transition)' 
+                    <div style={{
+                      width: '12px', height: '12px', background: '#fff', borderRadius: '50%',
+                      position: 'absolute', top: '3px', left: burnOnRead ? '17px' : '3px', transition: 'var(--transition)'
                     }} />
                   </div>
                   <span style={{ fontSize: '0.8125rem', fontWeight: 600 }}>Burn after first retrieval</span>
@@ -914,7 +997,7 @@ export default function App() {
           <Btn
             primary
             onClick={() => effectiveMode === 'stored' ? handleStoredPublish() : handleLivePublish()}
-            disabled={!hasPayload || publishing || !password}
+            disabled={!hasPayload || publishing || (effectiveMode === 'live' && !password) || (effectiveMode === 'stored' && isPrivate && !password)}
             style={{ width: '100%', height: '52px' }}
           >
             {publishing ? <Spinner /> : 'Launch Session'}
@@ -1096,6 +1179,10 @@ export default function App() {
             )}
           </Card>
           
+          {storedPayload && (
+            <AiChat code={code} apiBase={API_URL} aiStatus={aiStatus} onStatusChange={setAiStatus} onAsk={askAi} />
+          )}
+
           <div style={{ textAlign: 'center', marginTop: '2rem' }}>
             <Btn onClick={reset} style={{ opacity: 0.7 }}>Exit Session</Btn>
           </div>

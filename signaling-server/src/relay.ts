@@ -199,11 +199,10 @@ async function handleJoin(ws: WebSocket, ctx: PeerContext, payload: JoinPayload)
     return
   }
 
-  // Mandatory password check for BOTH roles.
-  // Live sessions are password-protected at creation; verifying the publisher
-  // too prevents an attacker who knows the 6-digit code from claiming the
-  // single publisher slot and hijacking (or permanently blocking) the session.
-  {
+  // Password gate. Live sessions are always created WITH a password, so this
+  // verifies BOTH roles there (publisher verification prevents 6-digit-code
+  // hijacking). Open stored sessions have no hash and skip the gate entirely.
+  if (session.passwordHash) {
     const ip = (ws as WebSocket & { _ip?: string })._ip || 'unknown'
     if (isBruteForcing(ip)) {
       sendTo(ws, { type: 'error', payload: 'Too many failed attempts. Try again in 15 minutes.' })

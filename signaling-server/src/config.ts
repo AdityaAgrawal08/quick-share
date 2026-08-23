@@ -36,6 +36,15 @@ export const CONFIG = {
   STORED_MAX_BYTES: 10 * 1024 * 1024,
   MAX_FILE_SIZE:    100 * 1024 * 1024,
   NODE_ENV:         process.env.NODE_ENV || 'development',
+  // ── RAG agent ──────────────────────────────────────────────────────────
+  GROQ_API_KEY:     process.env.GROQ_API_KEY,
+  GROQ_MODEL:       process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+  RAG_ENABLED:      process.env.RAG_ENABLED !== 'false',
+  EMBED_MODEL:      process.env.RAG_EMBED_MODEL || 'Xenova/bge-small-en-v1.5',
+  RERANK_MODEL:     process.env.RAG_RERANK_MODEL || 'Xenova/bge-reranker-base',
+  CHUNK_SIZE_CHARS: parseInt(process.env.RAG_CHUNK_SIZE ?? '600', 10),
+  CHUNK_OVERLAP_CHARS: parseInt(process.env.RAG_CHUNK_OVERLAP ?? '90', 10),
+  MAX_CHUNKS_PER_SESSION: parseInt(process.env.RAG_MAX_CHUNKS ?? '4000', 10),
 }
 
 // Validation
