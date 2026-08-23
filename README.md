@@ -103,6 +103,10 @@ QuickShare is optimized for modern, zero-cost cloud hosting:
     *   `MONGODB_URI`: Your MongoDB Atlas URI.
     *   `ALLOWED_ORIGINS`: Your custom Cloudflare Pages domain (e.g. `https://quick-share.shooterdelta.tech`).
     *   `NODE_ENV`: `production`
+    *   `GROQ_API_KEY`: Free key from [console.groq.com/keys](https://console.groq.com/keys) — enables AI answers (retrieval works without it).
+    *   `GROQ_MODEL`: Defaults to `openai/gpt-oss-120b`.
+    *   `RAG_RERANK_ENABLED`: Leave unset (`false`) on 512MB free tiers — the cross-encoder reranker needs ~400MB extra RAM and is disabled by default for exactly that reason.
+    *   `NODE_OPTIONS` *(recommended on Render free)*: `--max-old-space-size=384` — makes V8 garbage-collect before the container OOM-kills the service.
 
 ---
 
