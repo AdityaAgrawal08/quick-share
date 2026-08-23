@@ -15,13 +15,22 @@ interface ChatMessage {
   error?: boolean
 }
 
+export interface AskResult {
+  answer: string
+  refused?: boolean
+  sources?: AiSource[]
+  error?: string
+  /** HTTP status when the server rejected the request (drives better copy). */
+  status?: number
+}
+
 interface AiChatProps {
   code: string
   apiBase: string
   aiStatus: 'none' | 'pending' | 'ready' | 'failed'
   /** Called when background polling observes a terminal index status. */
   onStatusChange?: (status: 'ready' | 'failed') => void
-  onAsk: (question: string) => Promise<{ answer: string; refused?: boolean; sources?: AiSource[]; error?: string }>
+  onAsk: (question: string) => Promise<AskResult>
 }
 
 export function AiChat({ code, apiBase, aiStatus, onStatusChange, onAsk }: AiChatProps) {
@@ -66,8 +75,13 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onAsk }: AiCha
         const friendly =
           r.error === 'ai_busy' ? 'AI is rate-limited right now — try again in a few minutes.' :
           r.error === 'indexing' ? 'Still indexing this session — one moment.' :
-          r.error === 'expired' ? 'This session has expired.' :
+          r.error === 'expired' || r.error === 'not_found' ? 'This session has expired and was cleaned up.' :
+          r.error === 'burned' ? 'One-time session already consumed.' :
           r.error === 'ai_not_configured' ? 'AI answering needs the operator to configure GROQ_API_KEY. Retrieval worked though.' :
+          r.error === 'ai_config' ? 'AI model/key misconfigured on the server — contact the operator.' :
+          r.error === 'private' ? 'Private session — AI features are off.' :
+          r.error === 'network' ? 'Could not reach the server (it may be waking from sleep). Retrying usually works.' :
+          r.status === 500 ? 'Server hit an unexpected error answering this question. Try again.' :
           'AI request failed. Try again.'
         setMessages(prev => [...prev, { role: 'assistant', text: friendly, error: true }])
       } else {

@@ -7,7 +7,7 @@ import { encrypt, decrypt, arrayBufferToBase64, base64ToArrayBuffer } from './li
 import { guessMime } from './lib/mime'
 import type { SignalMessage, PeerRole } from './types'
 import { AiChat } from './components/AiChat'
-import type { AiSource } from './components/AiChat'
+import type { AskResult } from './components/AiChat'
 
 const RAW_API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.trim()
 // Fall back to same-origin so a missing env var crashes nothing at module load.
@@ -710,19 +710,33 @@ export default function App() {
     }
   }
 
-  async function askAi(question: string): Promise<{ answer: string; refused?: boolean; sources?: AiSource[]; error?: string }> {
+  async function askAiOnce(question: string): Promise<AskResult> {
     try {
       const res = await fetch(`${API_URL}/ai/query/${code}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...passwordHeaders(inputPassword) },
         body: JSON.stringify({ question }),
+        signal: AbortSignal.timeout(45_000), // covers free-host cold starts
       })
       const data = await res.json()
-      if (!res.ok) return { answer: '', error: String(data.error ?? 'ai_error') }
+      if (!res.ok) return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status }
       return { answer: data.answer, refused: data.refused, sources: data.sources }
     } catch {
       return { answer: '', error: 'network' }
     }
+  }
+
+  async function askAi(question: string): Promise<AskResult> {
+    let r = await askAiOnce(question)
+    // One silent retry for transient failures (host waking from sleep,
+    // blips to the LLM API). Never retry definitive answers.
+    if (r.error === 'network' || (r.status !== undefined && r.status >= 500)) {
+      await new Promise(res => setTimeout(res, 900))
+      const second = await askAiOnce(question)
+      if (!second.error || second.error !== 'network') r = second
+    }
+    const { status: _s, ...rest } = r
+    return rest
   }
 
   function reset() {

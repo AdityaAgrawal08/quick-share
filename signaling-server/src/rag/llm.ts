@@ -40,7 +40,7 @@ export async function generateAnswer(
     max_tokens: 1024,
   }
 
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+  const callGroq = () => fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -49,6 +49,14 @@ export async function generateAnswer(
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(30_000),
   })
+
+  // One retry for transient failures (network blip, 5xx). Config errors
+  // (4xx) are never retried — they will fail identically.
+  let res = await callGroq()
+  if ((!res.ok && res.status >= 500)) {
+    await new Promise(r => setTimeout(r, 700))
+    res = await callGroq()
+  }
 
   if (!res.ok) {
     const detail = await res.text().catch(() => '')
