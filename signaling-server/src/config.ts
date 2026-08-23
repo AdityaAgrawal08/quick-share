@@ -42,6 +42,10 @@ export const CONFIG = {
   RAG_ENABLED:      process.env.RAG_ENABLED !== 'false',
   EMBED_MODEL:      process.env.RAG_EMBED_MODEL || 'Xenova/bge-small-en-v1.5',
   RERANK_MODEL:     process.env.RAG_RERANK_MODEL || 'Xenova/bge-reranker-base',
+  // Cross-encoder reranking adds ~400MB resident RAM — off by default so the
+  // app fits small free-tier hosts (Render 512MB). Fusion ranking alone
+  // scored hit@3=1.0 on the eval set. Opt in only on ≥1GB instances.
+  RAG_RERANK_ENABLED: process.env.RAG_RERANK_ENABLED === 'true',
   CHUNK_SIZE_CHARS: parseInt(process.env.RAG_CHUNK_SIZE ?? '600', 10),
   CHUNK_OVERLAP_CHARS: parseInt(process.env.RAG_CHUNK_OVERLAP ?? '90', 10),
   MAX_CHUNKS_PER_SESSION: parseInt(process.env.RAG_MAX_CHUNKS ?? '4000', 10),

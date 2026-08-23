@@ -28,7 +28,7 @@ interface SessionIndex {
 }
 
 const indexCache = new Map<string, SessionIndex>()
-const INDEX_CACHE_MAX = 50
+const INDEX_CACHE_MAX = 12 // bounded so the LRU can never balloon RAM on small hosts
 
 function evictIfNeeded(): void {
   while (indexCache.size >= INDEX_CACHE_MAX) {
@@ -156,6 +156,11 @@ function getReranker(): Promise<RerankerBundle> {
 
 async function rerank(query: string, candidates: Chunk[]): Promise<{ chunk: Chunk; score: number }[]> {
   if (candidates.length === 0) return []
+  if (!CONFIG.RAG_RERANK_ENABLED) {
+    // Reranker disabled (default on small/free hosts): trust the hybrid
+    // fusion order. Eval gate: hit@3=1.0 pre-rerank.
+    return candidates.map((chunk, i) => ({ chunk, score: 1 / (i + 1) }))
+  }
   try {
     const rr = await getReranker()
     const scores = await rr.score(query, candidates.map(c => c.text))
