@@ -5,6 +5,9 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 3000
-  }
+    // Pinned + strict so the dev origin is always one the backend's
+    // ALLOWED_ORIGINS trusts — silent port-drift breaks CORS.
+    port: 4000,
+    strictPort: true,
+  },
 })
