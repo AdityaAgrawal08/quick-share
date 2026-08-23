@@ -7,7 +7,7 @@ import { encrypt, decrypt, arrayBufferToBase64, base64ToArrayBuffer } from './li
 import { guessMime } from './lib/mime'
 import type { SignalMessage, PeerRole } from './types'
 import { AiChat } from './components/AiChat'
-import type { AskResult } from './components/AiChat'
+import type { AiSource, AskResult } from './components/AiChat'
 import { ToastHost, toast } from './components/Toast'
 
 const RAW_API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.trim()
@@ -715,14 +715,58 @@ export default function App() {
     }
   }
 
-  async function askAiOnce(question: string): Promise<AskResult> {
+  async function askAiOnce(
+    question: string,
+    cbs?: { onDelta?: (t: string) => void; onSources?: (s: AiSource[]) => void; onDone?: (fullText: string, refused: boolean, cached: boolean) => void }
+  ): Promise<AskResult> {
     try {
       const res = await fetch(`${API_URL}/ai/query/${code}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...passwordHeaders(inputPassword) },
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...passwordHeaders(inputPassword) },
         body: JSON.stringify({ question }),
-        signal: AbortSignal.timeout(45_000), // covers free-host cold starts
+        signal: AbortSignal.timeout(90_000),
       })
+
+      const ct = res.headers.get('content-type') ?? ''
+      if (!res.ok) {
+        const data = await res.json()
+        return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status }
+      }
+
+      if (ct.includes('text/event-stream')) {
+        // Parse our SSE protocol: sources → delta* → done | error
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+        let buf = ''
+        let full = ''
+        let refused = false
+        let cached = false
+        let err: string | null = null
+        let sources: AiSource[] | undefined
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          let nl: number
+          while ((nl = buf.indexOf('\n\n')) !== -1) {
+            const frame = buf.slice(0, nl)
+            buf = buf.slice(nl + 2)
+            const evLine = frame.split('\n').find(l => l.startsWith('event:'))
+            const dataLine = frame.split('\n').find(l => l.startsWith('data:'))
+            if (!dataLine) continue
+            const ev = evLine?.slice(6).trim() ?? 'message'
+            const payload = JSON.parse(dataLine.slice(5).trim())
+            if (ev === 'sources') { sources = payload.sources; cbs?.onSources?.(sources ?? []) }
+            else if (ev === 'delta') { full += payload.t; cbs?.onDelta?.(payload.t) }
+            else if (ev === 'done') { refused = !!payload.refused; cached = !!payload.cached; full = payload.fullText ?? full; cbs?.onDone?.(full, refused, cached) }
+            else if (ev === 'error') { err = String(payload.error) }
+          }
+        }
+        if (err) return { answer: '', error: err }
+        return { answer: full, refused, sources, status: res.status }
+      }
+
       const data = await res.json()
       if (!res.ok) return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status }
       return { answer: data.answer, refused: data.refused, sources: data.sources }
@@ -731,14 +775,16 @@ export default function App() {
     }
   }
 
-  async function askAi(question: string): Promise<AskResult> {
-    let r = await askAiOnce(question)
-    // One silent retry for transient failures (host waking from sleep,
-    // blips to the LLM API). Never retry definitive answers.
-    if (r.error === 'network' || (r.status !== undefined && r.status >= 500)) {
+  async function askAi(
+    question: string,
+    cbs?: { onDelta?: (t: string) => void; onSources?: (s: AiSource[]) => void; onDone?: (fullText: string, refused: boolean, cached: boolean) => void }
+  ): Promise<AskResult> {
+    let r = await askAiOnce(question, cbs)
+    // One silent retry for transient failures — but never re-stream deltas
+    // into an already-populated bubble (only retry when nothing streamed).
+    if ((r.error === 'network' || (r.status !== undefined && r.status >= 500)) && !cbs?.onDelta) {
       await new Promise(res => setTimeout(res, 900))
-      const second = await askAiOnce(question)
-      if (!second.error || second.error !== 'network') r = second
+      r = await askAiOnce(question, cbs)
     }
     const { status: _s, ...rest } = r
     return rest
