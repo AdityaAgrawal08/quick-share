@@ -21,6 +21,7 @@ import { CONFIG } from './config'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
 import { preloadEmbedder } from './rag/embedder'
 import { retrieve } from './rag/retriever'
+import { getAnswer, putAnswer } from './rag/answerCache'
 import { generateAnswer, llmConfigured } from './rag/llm'
 
 // Security: Global rejection handler
@@ -860,6 +861,15 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
       return
     }
 
+    // Identical-question cache: saves Groq quota on repeat asks within a
+    // session's lifetime. Cleared automatically on re-index/delete.
+    const cached = getAnswer(code, question)
+    if (cached) {
+      logger.info({ code }, '[ai] answer served from cache')
+      res.json({ ...cached, cached: true })
+      return
+    }
+
     const { sources, context } = await retrieve(code, question)
 
     let answer: { text: string; refused: boolean }
@@ -878,10 +888,12 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
       throw llmErr
     }
 
+    putAnswer(code, question, { answer: answer.text, refused: answer.refused, sources })
     res.json({
       answer: answer.text,
       refused: answer.refused,
       sources,
+      cached: false,
     })
   } catch (err) {
     logger.error({ err, code }, '[ai] query error')

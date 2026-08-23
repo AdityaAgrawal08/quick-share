@@ -10,6 +10,7 @@ import { extractFileText, isSupportedForExtraction } from './extractor'
 import { chunkPages } from './chunker'
 import { embedTexts } from './embedder'
 import type { Chunk } from './types'
+import { dropSessionIndex } from './retriever'
 
 // ── Index pipeline ───────────────────────────────────────────────────────────
 // publish ──► indexSession(code)   (async, fire-and-forget, never blocks)
@@ -163,6 +164,9 @@ async function runIndex(code: string): Promise<void> {
         aiStats: { chunks: workChunks.length, files: session.files.length - failedFiles.length, failedFiles },
       },
     })
+    // Fresh corpus → any cached in-memory search structures/answers are stale.
+    dropSessionIndex(code)
+
     logger.info({
       code,
       chunks: workChunks.length,
