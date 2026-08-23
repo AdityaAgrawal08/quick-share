@@ -1112,6 +1112,9 @@ async function start() {
           void recoverPendingIndexes()
           // Re-kick jobs whose process died mid-index.
           setInterval(() => { void recoverPendingIndexes() }, 5 * 60 * 1000).unref()
+          if (!CONFIG.GROQ_API_KEY) {
+            logger.warn('[server] GROQ_API_KEY not set — AI answers disabled, retrieval-only mode. Set it in the hosting dashboard environment.')
+          }
         }
       } catch (dbErr) {
         logger.error({ err: dbErr }, '[server] MongoDB connection failed — entering live-only mode')
