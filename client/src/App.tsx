@@ -8,6 +8,7 @@ import { guessMime } from './lib/mime'
 import type { SignalMessage, PeerRole } from './types'
 import { AiChat } from './components/AiChat'
 import type { AskResult } from './components/AiChat'
+import { ToastHost, toast } from './components/Toast'
 
 const RAW_API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.trim()
 // Fall back to same-origin so a missing env var crashes nothing at module load.
@@ -466,7 +467,7 @@ export default function App() {
       })
       setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, lastSentAt: Date.now(), sendProgress: null } : x))
     } catch {
-      alert('Connection issue. Please try again.')
+      toast('Connection issue. Please try again.', 'error')
     }
   }
 
@@ -555,7 +556,7 @@ export default function App() {
       anchorDownload(u, f.name)
       setTimeout(() => URL.revokeObjectURL(u), 1000)
     } catch {
-      alert('Failed to download file. Check password or connection.')
+      toast('Failed to download file. Check password or connection.', 'error')
     }
   }
 
@@ -566,7 +567,7 @@ export default function App() {
         return cached ?? fetchStoredFileBlob(f, inputPassword)
       }, f.name)
     } catch {
-      alert('Unable to open the file. Check password or connection.')
+      toast('Unable to open the file. Check password or connection.', 'error')
     }
   }
 
@@ -578,7 +579,7 @@ export default function App() {
 
   function handleLivePreview(f: ReceivedFile) {
     void previewBlobInNewTab(() => Promise.resolve(f.blob), f.name).catch(() => {
-      alert('Unable to open the file.')
+      toast('Unable to open the file.', 'error')
     })
   }
 
@@ -797,6 +798,7 @@ export default function App() {
 
   return (
     <div className="container animate-fade">
+      <ToastHost />
       <header>
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '1rem' }}>
           <button
