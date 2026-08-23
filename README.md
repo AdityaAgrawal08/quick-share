@@ -1,5 +1,7 @@
 # ⚡ QuickShare
 
+[![CI](https://github.com/AdityaAgrawal08/quick-share/actions/workflows/ci.yml/badge.svg)](https://github.com/AdityaAgrawal08/quick-share/actions/workflows/ci.yml)
+
 A fast, modern file & text sharing app: **WebRTC peer-to-peer transfers** for large files, **MongoDB GridFS** persistence (≤10MB) with an end-to-end encrypted **Private** mode, and a built-in **RAG AI agent** — ask questions about any shared session and get grounded, cited answers.
 
 ---

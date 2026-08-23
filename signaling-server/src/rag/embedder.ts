@@ -11,6 +11,8 @@ import logger from '../logger'
 // into session aiStatus='failed'.
 
 env.allowLocalModels = false
+// Optional explicit cache dir (used by CI to cache model weights between runs).
+if (process.env.HF_CACHE_DIR) env.cacheDir = process.env.HF_CACHE_DIR
 
 // The concrete pipeline type from transformers.js is unwieldy; feature-
 // extraction call signature: (texts, opts) → Tensor with .tolist().
