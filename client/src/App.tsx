@@ -7,7 +7,8 @@ import { encrypt, decrypt, arrayBufferToBase64, base64ToArrayBuffer } from './li
 import { guessMime } from './lib/mime'
 import type { SignalMessage, PeerRole } from './types'
 import { AiChat } from './components/AiChat'
-import type { AskResult } from './components/AiChat'
+import type { AiSource, AskResult } from './components/AiChat'
+import { ToastHost, toast } from './components/Toast'
 
 const RAW_API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.trim()
 // Fall back to same-origin so a missing env var crashes nothing at module load.
@@ -128,14 +129,15 @@ function formatCountdown(ms: number): string {
   // click handler — awaiting the fetch first loses user activation and popup
   // blockers silently swallow window.open. We open a blank tab immediately,
   // then navigate it to the blob URL once ready.
-  async function previewBlobInNewTab(getBlob: () => Promise<Blob>, fallbackName: string) {
+  // `urlSuffix` supports viewer fragments like "#page=3" for PDFs.
+  async function previewBlobInNewTab(getBlob: () => Promise<Blob>, fallbackName: string, urlSuffix = '') {
     const win = window.open('about:blank', '_blank')
     if (win) win.opener = null
     try {
       const blob = await getBlob()
       const url = URL.createObjectURL(blob)
       if (win && !win.closed) {
-        win.location.href = url
+        win.location.href = url + urlSuffix
       } else {
         // Popup was blocked — degrade to a download rather than nothing.
         anchorDownload(url, fallbackName)
@@ -466,7 +468,7 @@ export default function App() {
       })
       setRecipients(prev => prev.map(x => x.peerId === peerId ? { ...x, lastSentAt: Date.now(), sendProgress: null } : x))
     } catch {
-      alert('Connection issue. Please try again.')
+      toast('Connection issue. Please try again.', 'error')
     }
   }
 
@@ -555,18 +557,21 @@ export default function App() {
       anchorDownload(u, f.name)
       setTimeout(() => URL.revokeObjectURL(u), 1000)
     } catch {
-      alert('Failed to download file. Check password or connection.')
+      toast('Failed to download file. Check password or connection.', 'error')
     }
   }
 
-  async function handleStoredPreview(f: StoredFileInfo) {
+  async function handleStoredPreview(f: StoredFileInfo, page?: number | null) {
     try {
+      // Native PDF viewers honor #page=N — clicking a chat citation jumps
+      // straight to the referenced page.
+      const suffix = page != null && /pdf/i.test(f.mimeType) ? `#page=${page}` : ''
       await previewBlobInNewTab(async () => {
         const cached = prefetchedRef.current.get(f.fileId)
         return cached ?? fetchStoredFileBlob(f, inputPassword)
-      }, f.name)
+      }, f.name, suffix)
     } catch {
-      alert('Unable to open the file. Check password or connection.')
+      toast('Unable to open the file. Check password or connection.', 'error')
     }
   }
 
@@ -578,7 +583,7 @@ export default function App() {
 
   function handleLivePreview(f: ReceivedFile) {
     void previewBlobInNewTab(() => Promise.resolve(f.blob), f.name).catch(() => {
-      alert('Unable to open the file.')
+      toast('Unable to open the file.', 'error')
     })
   }
 
@@ -710,14 +715,58 @@ export default function App() {
     }
   }
 
-  async function askAiOnce(question: string): Promise<AskResult> {
+  async function askAiOnce(
+    question: string,
+    cbs?: { onDelta?: (t: string) => void; onSources?: (s: AiSource[]) => void; onDone?: (fullText: string, refused: boolean, cached: boolean) => void }
+  ): Promise<AskResult> {
     try {
       const res = await fetch(`${API_URL}/ai/query/${code}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...passwordHeaders(inputPassword) },
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...passwordHeaders(inputPassword) },
         body: JSON.stringify({ question }),
-        signal: AbortSignal.timeout(45_000), // covers free-host cold starts
+        signal: AbortSignal.timeout(90_000),
       })
+
+      const ct = res.headers.get('content-type') ?? ''
+      if (!res.ok) {
+        const data = await res.json()
+        return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status }
+      }
+
+      if (ct.includes('text/event-stream')) {
+        // Parse our SSE protocol: sources → delta* → done | error
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+        let buf = ''
+        let full = ''
+        let refused = false
+        let cached = false
+        let err: string | null = null
+        let sources: AiSource[] | undefined
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          let nl: number
+          while ((nl = buf.indexOf('\n\n')) !== -1) {
+            const frame = buf.slice(0, nl)
+            buf = buf.slice(nl + 2)
+            const evLine = frame.split('\n').find(l => l.startsWith('event:'))
+            const dataLine = frame.split('\n').find(l => l.startsWith('data:'))
+            if (!dataLine) continue
+            const ev = evLine?.slice(6).trim() ?? 'message'
+            const payload = JSON.parse(dataLine.slice(5).trim())
+            if (ev === 'sources') { sources = payload.sources; cbs?.onSources?.(sources ?? []) }
+            else if (ev === 'delta') { full += payload.t; cbs?.onDelta?.(payload.t) }
+            else if (ev === 'done') { refused = !!payload.refused; cached = !!payload.cached; full = payload.fullText ?? full; cbs?.onDone?.(full, refused, cached) }
+            else if (ev === 'error') { err = String(payload.error) }
+          }
+        }
+        if (err) return { answer: '', error: err }
+        return { answer: full, refused, sources, status: res.status }
+      }
+
       const data = await res.json()
       if (!res.ok) return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status }
       return { answer: data.answer, refused: data.refused, sources: data.sources }
@@ -726,14 +775,16 @@ export default function App() {
     }
   }
 
-  async function askAi(question: string): Promise<AskResult> {
-    let r = await askAiOnce(question)
-    // One silent retry for transient failures (host waking from sleep,
-    // blips to the LLM API). Never retry definitive answers.
-    if (r.error === 'network' || (r.status !== undefined && r.status >= 500)) {
+  async function askAi(
+    question: string,
+    cbs?: { onDelta?: (t: string) => void; onSources?: (s: AiSource[]) => void; onDone?: (fullText: string, refused: boolean, cached: boolean) => void }
+  ): Promise<AskResult> {
+    let r = await askAiOnce(question, cbs)
+    // One silent retry for transient failures — but never re-stream deltas
+    // into an already-populated bubble (only retry when nothing streamed).
+    if ((r.error === 'network' || (r.status !== undefined && r.status >= 500)) && !cbs?.onDelta) {
       await new Promise(res => setTimeout(res, 900))
-      const second = await askAiOnce(question)
-      if (!second.error || second.error !== 'network') r = second
+      r = await askAiOnce(question, cbs)
     }
     const { status: _s, ...rest } = r
     return rest
@@ -797,6 +848,7 @@ export default function App() {
 
   return (
     <div className="container animate-fade">
+      <ToastHost />
       <header>
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '1rem' }}>
           <button
@@ -1194,7 +1246,21 @@ export default function App() {
           </Card>
           
           {storedPayload && (
-            <AiChat code={code} apiBase={API_URL} aiStatus={aiStatus} onStatusChange={setAiStatus} onAsk={askAi} />
+            <AiChat
+              code={code}
+              apiBase={API_URL}
+              aiStatus={aiStatus}
+              onStatusChange={setAiStatus}
+              onAsk={askAi}
+              onOpenSource={(src) => {
+                const stored = storedPayload?.files.find(f => f.fileId === src.fileId)
+                if (stored) { void handleStoredPreview(stored, src.page); return }
+                // Live P2P transfer: match by name and open from memory
+                const live = received?.files.find(f => f.name === src.name)
+                if (live) handleLivePreview(live)
+                else toast('Source file is no longer available in this view.', 'error')
+              }}
+            />
           )}
 
           <div style={{ textAlign: 'center', marginTop: '2rem' }}>

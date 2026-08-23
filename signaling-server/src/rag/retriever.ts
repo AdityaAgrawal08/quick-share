@@ -4,6 +4,7 @@ import logger from '../logger'
 import { CONFIG } from '../config'
 import type { Chunk, Source } from './types'
 import { embedQuery } from './embedder'
+import { clearAnswerCache } from './answerCache'
 import { RagChunk } from '../db'
 
 // ── Hybrid retrieval ─────────────────────────────────────────────────────────
@@ -41,6 +42,8 @@ function evictIfNeeded(): void {
 
 export function dropSessionIndex(code: string): void {
   indexCache.delete(code)
+  // Keep answer cache consistent with the (possibly re-indexed) corpus.
+  clearAnswerCache(code)
 }
 
 export function getSessionIndex(code: string): SessionIndex | undefined {

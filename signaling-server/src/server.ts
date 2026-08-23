@@ -21,7 +21,8 @@ import { CONFIG } from './config'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
 import { preloadEmbedder } from './rag/embedder'
 import { retrieve } from './rag/retriever'
-import { generateAnswer, llmConfigured } from './rag/llm'
+import { getAnswer, putAnswer } from './rag/answerCache'
+import { generateAnswer, llmConfigured, streamAnswer } from './rag/llm'
 
 // Security: Global rejection handler
 process.on('unhandledRejection', (reason, promise) => {
@@ -860,8 +861,65 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
       return
     }
 
+    // Identical-question cache: saves Groq quota on repeat asks within a
+    // session's lifetime. Cleared automatically on re-index/delete.
+    const wantsStream = (req.headers.accept ?? '').includes('text/event-stream')
+    const sseHeaders = () => {
+      res.status(200)
+      res.setHeader('Content-Type', 'text/event-stream')
+      res.setHeader('Cache-Control', 'no-cache')
+      res.setHeader('Connection', 'keep-alive')
+      res.flushHeaders()
+    }
+    const sseSend = (event: string, data: unknown) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    }
+
+    const cached = getAnswer(code, question)
+    if (cached) {
+      logger.info({ code }, '[ai] answer served from cache')
+      if (wantsStream) {
+        sseHeaders()
+        sseSend('sources', { sources: cached.sources })
+        sseSend('delta', { t: cached.answer })
+        sseSend('done', { refused: cached.refused, cached: true, fullText: cached.answer })
+        res.end()
+        return
+      }
+      res.json({ ...cached, cached: true })
+      return
+    }
+
     const { sources, context } = await retrieve(code, question)
 
+    // ---- Streaming mode ----
+    if (wantsStream) {
+      sseHeaders()
+      sseSend('sources', { sources })
+      try {
+        let full = ''
+        for await (const t of streamAnswer(question, context)) {
+          if (t.startsWith('__FULL__')) {
+            const fin = JSON.parse(t.slice(8)) as { text: string; refused: boolean }
+            putAnswer(code, question, { answer: fin.text, refused: fin.refused, sources })
+            sseSend('done', { refused: fin.refused, cached: false, fullText: fin.text })
+          } else {
+            full += t
+            sseSend('delta', { t })
+          }
+        }
+      } catch (llmErr) {
+        const msg = llmErr instanceof Error ? llmErr.message : 'ai_error'
+        const code2 = msg === 'ai_busy' ? 'ai_busy' : msg === 'ai_config' ? 'ai_config' : 'ai_error'
+        sseSend('error', { error: code2 })
+        res.end()
+        return
+      }
+      res.end()
+      return
+    }
+
+    // ---- Legacy JSON mode ----
     let answer: { text: string; refused: boolean }
     try {
       answer = await generateAnswer(question, context)
@@ -878,10 +936,12 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
       throw llmErr
     }
 
+    putAnswer(code, question, { answer: answer.text, refused: answer.refused, sources })
     res.json({
       answer: answer.text,
       refused: answer.refused,
       sources,
+      cached: false,
     })
   } catch (err) {
     logger.error({ err, code }, '[ai] query error')

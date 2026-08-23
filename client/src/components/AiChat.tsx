@@ -13,6 +13,7 @@ interface ChatMessage {
   text: string
   sources?: AiSource[]
   error?: boolean
+  streaming?: boolean
 }
 
 export interface AskResult {
@@ -30,10 +31,15 @@ interface AiChatProps {
   aiStatus: 'none' | 'pending' | 'ready' | 'failed'
   /** Called when background polling observes a terminal index status. */
   onStatusChange?: (status: 'ready' | 'failed') => void
-  onAsk: (question: string) => Promise<AskResult>
+  /** Clicking a citation chip — opens the referenced file at its page. */
+  onOpenSource?: (source: AiSource) => void
+  onAsk: (
+    question: string,
+    cbs?: { onDelta?: (t: string) => void; onSources?: (s: AiSource[]) => void; onDone?: (fullText: string, refused: boolean, cached: boolean) => void }
+  ) => Promise<AskResult>
 }
 
-export function AiChat({ code, apiBase, aiStatus, onStatusChange, onAsk }: AiChatProps) {
+export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, onAsk }: AiChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -67,10 +73,27 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onAsk }: AiCha
     const q = input.trim()
     if (!q || busy) return
     setInput('')
-    setMessages(prev => [...prev, { role: 'user', text: q }])
+    setMessages(prev => [
+      ...prev,
+      { role: 'user', text: q },
+      { role: 'assistant', text: '', streaming: true },
+    ])
+    // Live-update the streaming assistant bubble.
+    const patchLast = (map: (prev: ChatMessage) => Partial<ChatMessage>) =>
+      setMessages(prev => {
+        const next = [...prev]
+        const last = next[next.length - 1]
+        if (last?.role === 'assistant') next[next.length - 1] = { ...last, ...map(last) }
+        return next
+      })
     setBusy(true)
     try {
-      const r = await onAsk(q)
+      const r = await onAsk(q, {
+        onSources: (srcs: AiSource[]) => patchLast(() => ({ sources: srcs })),
+        onDelta: (t: string) => patchLast(prev => ({ text: prev.text + t })),
+        onDone: (fullText: string, _refused: boolean, _cached: boolean) =>
+          patchLast(() => ({ text: fullText, streaming: false })),
+      })
       if (r.error) {
         const friendly =
           r.error === 'ai_busy' ? 'AI is rate-limited right now — try again in a few minutes.' :
@@ -83,7 +106,15 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onAsk }: AiCha
           r.error === 'network' ? 'Could not reach the server (it may be waking from sleep). Retrying usually works.' :
           r.status === 500 ? 'Server hit an unexpected error answering this question. Try again.' :
           'AI request failed. Try again.'
-        setMessages(prev => [...prev, { role: 'assistant', text: friendly, error: true }])
+        setMessages(prev => {
+          const next = [...prev]
+          const last = next[next.length - 1]
+          if (last?.role === 'assistant' && last.streaming && last.text === '') {
+            next[next.length - 1] = { ...last, text: friendly, error: true, streaming: false }
+            return next
+          }
+          return [...next, { role: 'assistant', text: friendly, error: true }]
+        })
       } else {
         setMessages(prev => [...prev, { role: 'assistant', text: r.answer, sources: r.sources }])
       }
@@ -150,21 +181,28 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onAsk }: AiCha
             lineHeight: 1.45,
           }}>
             {m.text}
-            {m.sources && m.sources.length > 0 && (
+                {m.sources && m.sources.length > 0 && (
               <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                 {m.sources.map((s, j) => (
-                  <span key={j} title={s.snippet} style={{
-                    fontSize: '0.6875rem', padding: '2px 8px', borderRadius: 999,
-                    background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--text-dim)',
-                  }}>
-                    {s.name}{s.page != null ? ` p.${s.page}` : ''}
-                  </span>
+                  <button key={j}
+                    title={s.snippet}
+                    onClick={() => onOpenSource?.(s)}
+                    style={{
+                      fontSize: '0.6875rem', padding: '2px 8px', borderRadius: 999,
+                      background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--text-dim)',
+                      cursor: onOpenSource ? 'pointer' : 'default',
+                    }}
+                  >
+                    📄 {s.name}{s.page != null ? ` p.${s.page}` : ''}
+                  </button>
                 ))}
               </div>
             )}
           </div>
         ))}
-        {busy && <div style={{ alignSelf: 'flex-start', color: 'var(--text-dim)', fontSize: '0.8125rem' }}>Thinking…</div>}
+        {busy && !messages.some(x => x.streaming) && (
+          <div style={{ alignSelf: 'flex-start', color: 'var(--text-dim)', fontSize: '0.8125rem' }}>Thinking…</div>
+        )}
       </div>
 
       <div style={{ display: 'flex', gap: 8 }}>
