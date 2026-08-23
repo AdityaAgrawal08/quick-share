@@ -129,14 +129,15 @@ function formatCountdown(ms: number): string {
   // click handler — awaiting the fetch first loses user activation and popup
   // blockers silently swallow window.open. We open a blank tab immediately,
   // then navigate it to the blob URL once ready.
-  async function previewBlobInNewTab(getBlob: () => Promise<Blob>, fallbackName: string) {
+  // `urlSuffix` supports viewer fragments like "#page=3" for PDFs.
+  async function previewBlobInNewTab(getBlob: () => Promise<Blob>, fallbackName: string, urlSuffix = '') {
     const win = window.open('about:blank', '_blank')
     if (win) win.opener = null
     try {
       const blob = await getBlob()
       const url = URL.createObjectURL(blob)
       if (win && !win.closed) {
-        win.location.href = url
+        win.location.href = url + urlSuffix
       } else {
         // Popup was blocked — degrade to a download rather than nothing.
         anchorDownload(url, fallbackName)
@@ -560,12 +561,15 @@ export default function App() {
     }
   }
 
-  async function handleStoredPreview(f: StoredFileInfo) {
+  async function handleStoredPreview(f: StoredFileInfo, page?: number | null) {
     try {
+      // Native PDF viewers honor #page=N — clicking a chat citation jumps
+      // straight to the referenced page.
+      const suffix = page != null && /pdf/i.test(f.mimeType) ? `#page=${page}` : ''
       await previewBlobInNewTab(async () => {
         const cached = prefetchedRef.current.get(f.fileId)
         return cached ?? fetchStoredFileBlob(f, inputPassword)
-      }, f.name)
+      }, f.name, suffix)
     } catch {
       toast('Unable to open the file. Check password or connection.', 'error')
     }
@@ -1196,7 +1200,21 @@ export default function App() {
           </Card>
           
           {storedPayload && (
-            <AiChat code={code} apiBase={API_URL} aiStatus={aiStatus} onStatusChange={setAiStatus} onAsk={askAi} />
+            <AiChat
+              code={code}
+              apiBase={API_URL}
+              aiStatus={aiStatus}
+              onStatusChange={setAiStatus}
+              onAsk={askAi}
+              onOpenSource={(src) => {
+                const stored = storedPayload?.files.find(f => f.fileId === src.fileId)
+                if (stored) { void handleStoredPreview(stored, src.page); return }
+                // Live P2P transfer: match by name and open from memory
+                const live = received?.files.find(f => f.name === src.name)
+                if (live) handleLivePreview(live)
+                else toast('Source file is no longer available in this view.', 'error')
+              }}
+            />
           )}
 
           <div style={{ textAlign: 'center', marginTop: '2rem' }}>

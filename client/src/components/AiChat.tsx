@@ -30,10 +30,12 @@ interface AiChatProps {
   aiStatus: 'none' | 'pending' | 'ready' | 'failed'
   /** Called when background polling observes a terminal index status. */
   onStatusChange?: (status: 'ready' | 'failed') => void
+  /** Clicking a citation chip — opens the referenced file at its page. */
+  onOpenSource?: (source: AiSource) => void
   onAsk: (question: string) => Promise<AskResult>
 }
 
-export function AiChat({ code, apiBase, aiStatus, onStatusChange, onAsk }: AiChatProps) {
+export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, onAsk }: AiChatProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -153,12 +155,17 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onAsk }: AiCha
             {m.sources && m.sources.length > 0 && (
               <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                 {m.sources.map((s, j) => (
-                  <span key={j} title={s.snippet} style={{
-                    fontSize: '0.6875rem', padding: '2px 8px', borderRadius: 999,
-                    background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--text-dim)',
-                  }}>
-                    {s.name}{s.page != null ? ` p.${s.page}` : ''}
-                  </span>
+                  <button key={j}
+                    title={s.snippet}
+                    onClick={() => onOpenSource?.(s)}
+                    style={{
+                      fontSize: '0.6875rem', padding: '2px 8px', borderRadius: 999,
+                      background: 'var(--surface)', border: '1px solid var(--border)', color: 'var(--text-dim)',
+                      cursor: onOpenSource ? 'pointer' : 'default',
+                    }}
+                  >
+                    📄 {s.name}{s.page != null ? ` p.${s.page}` : ''}
+                  </button>
                 ))}
               </div>
             )}
