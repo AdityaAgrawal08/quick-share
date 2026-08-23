@@ -18,6 +18,10 @@ import { connectDB, reconnectDB, isRetryableMongoError, StoredSession, uploadFil
 
 import logger from './logger'
 import { CONFIG } from './config'
+import { indexSession, recoverPendingIndexes } from './rag/pipeline'
+import { preloadEmbedder } from './rag/embedder'
+import { retrieve } from './rag/retriever'
+import { generateAnswer, llmConfigured } from './rag/llm'
 
 // Security: Global rejection handler
 process.on('unhandledRejection', (reason, promise) => {
@@ -51,6 +55,17 @@ function isRetryablePublishError(err: unknown): boolean {
 }
 
 let storedModeEnabled = false
+
+// RAG runs only for stored sessions on an open (non-E2EE) corpus.
+function ragEnabled(): boolean {
+  return CONFIG.RAG_ENABLED && storedModeEnabled
+}
+
+/** Fire-and-forget indexing — never blocks the HTTP response. */
+function kickIndex(code: string): void {
+  if (!ragEnabled()) return
+  void indexSession(code)
+}
 
 function requireStoredMode(_req: Request, res: Response, next: NextFunction) {
   if (!storedModeEnabled) {
@@ -289,6 +304,15 @@ const iceLimiter = rateLimit({
   legacyHeaders: false,
 })
 
+// RAG queries hit a free-tier LLM — tightest budget of all AI endpoints
+const aiQueryLimiter = rateLimit({
+  windowMs: WINDOW_MS,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'ai_busy', message: 'Too many AI questions from this address — try again in 15 minutes' },
+})
+
 // ── Code generation ───────────────────────────────────────────────────────────
 
 function generateCode(): string {
@@ -337,11 +361,11 @@ app.post(
       
       const password = typeof req.body.password === 'string' ? req.body.password.trim() : ''
       const burnOnRead = req.body.burnOnRead === 'true' || req.body.burnOnRead === true
-      if (!password) {
-        res.status(400).json({ error: 'Password is required' })
-        return
-      }
-      
+      // Privacy model: sessions are OPEN by default (AI-indexable). Setting a
+      // password makes the session PRIVATE — E2EE client-side, and invisible
+      // to the RAG pipeline by design.
+      const isPrivate = password.length > 0
+
       const parsedTtl    = parseInt(req.body.ttlMs ?? '3600000', 10)
       const ttlMs        = clampStoredTtlMs(Number.isNaN(parsedTtl) ? STORED_TTL_MAX_MS : parsedTtl)
       const uploadedFiles = (req.files as Express.Multer.File[] | undefined) ?? []
@@ -385,7 +409,7 @@ app.post(
             })
           )
 
-          const hashedPassword = await hashPassword(password)
+          const hashedPassword = isPrivate ? await hashPassword(password) : undefined
 
           // Retry loop handles E11000 duplicate key (non-atomic check-then-insert race)
           for (let attempt = 0; attempt < 5; attempt++) {
@@ -395,11 +419,16 @@ app.post(
 
               // Create the session doc with the uploaded files already attached.
               // This ensures that we never have a session with empty files if an upload fails.
-              await StoredSession.create({ code, text, files: storedFiles, expiresAt, password: hashedPassword, burnOnRead })
+              await StoredSession.create({
+                code, text, files: storedFiles, expiresAt, burnOnRead,
+                ...(hashedPassword ? { password: hashedPassword } : {}),
+                aiStatus: isPrivate ? 'none' : 'pending',
+              })
 
               scheduleExpiry(code, expiresAt)
-              logger.info(`[publish] stored ${code} — expires ${expiresAt.toISOString()} — ${sanitisedFiles.length} file(s)`)
-              res.status(201).json({ code, mode: 'stored', expiresAt: expiresAt.getTime(), ttlMs })
+              kickIndex(code)
+              logger.info(`[publish] stored ${code} — expires ${expiresAt.toISOString()} — ${sanitisedFiles.length} file(s) — ${isPrivate ? 'PRIVATE' : 'open'}`)
+              res.status(201).json({ code, mode: 'stored', private: isPrivate, expiresAt: expiresAt.getTime(), ttlMs })
               return
             } catch (err) {
               if (isE11000(err) && attempt < 4) {
@@ -544,6 +573,7 @@ app.patch(
 
           clearExpiryTimer(code)
           scheduleExpiry(code, expiresAt)
+          kickIndex(code)
 
           logger.info({ code, files: sanitisedFiles.length, expiresAt: expiresAt.toISOString() }, '[publish] updated stored session')
           res.json({ code, mode: 'stored', expiresAt: expiresAt.getTime(), ttlMs })
@@ -740,6 +770,123 @@ app.get('/file/:fileId/:token', fileLimiter, async (req: Request, res: Response)
 
 app.get("/", (_req, res) => {
   res.send("Quick Share Server Running");
+});
+
+// ── AI (RAG) endpoints ───────────────────────────────────────────────────────
+
+function aiDisabledReason(res: Response): string | null {
+  if (!CONFIG.RAG_ENABLED || !storedModeEnabled) {
+    res.status(503).json({ error: 'ai_disabled', message: 'AI is not enabled on this server' })
+    return 'ai_disabled'
+  }
+  return null
+}
+
+app.get('/ai/status/:code', async (req: Request, res: Response) => {
+  const disabled = aiDisabledReason(res)
+  if (disabled) return
+  try {
+    const code = req.params['code'] as string
+    if (!/^\d{6}$/.test(code)) {
+      res.status(400).json({ error: 'Invalid code format' })
+      return
+    }
+    const session = await StoredSession.findOne({ code })
+      .select('aiStatus aiStats expiresAt burnedAt')
+      .lean()
+    if (!session) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    if (session.burnedAt || session.expiresAt <= new Date()) {
+      res.status(410).json({ error: 'expired' })
+      return
+    }
+    res.json({
+      aiStatus: session.aiStatus ?? 'none',
+      aiStats: session.aiStats ?? null,
+      llmConfigured: llmConfigured(),
+    })
+  } catch (err) {
+    logger.error({ err }, '[ai] status error')
+    res.status(500).json({ error: 'ai_error' })
+  }
+})
+
+app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) => {
+  const disabled = aiDisabledReason(res)
+  if (disabled) return
+
+  const code = req.params['code'] as string
+  const question = typeof req.body?.question === 'string' ? req.body.question.trim() : ''
+  if (!/^\d{6}$/.test(code)) {
+    res.status(400).json({ error: 'Invalid code format' })
+    return
+  }
+  if (!question || question.length > 2000) {
+    res.status(400).json({ error: 'question must be 1..2000 chars' })
+    return
+  }
+
+  try {
+    const session = await StoredSession.findOne({ code })
+      .select('aiStatus expiresAt burnedAt +password')
+      .lean()
+    if (!session) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    // Private (E2EE) sessions are invisible to the pipeline by design.
+    if (session.password) {
+      res.status(403).json({ error: 'ai_disabled', message: 'Private sessions do not support AI queries' })
+      return
+    }
+    if (session.burnedAt || session.expiresAt <= new Date()) {
+      res.status(410).json({ error: 'expired' })
+      return
+    }
+    if ((session.aiStatus ?? 'none') !== 'ready') {
+      res.status(202).json({ error: 'indexing', aiStatus: session.aiStatus ?? 'none' })
+      return
+    }
+    if (!llmConfigured()) {
+      // Retrieval works; generation needs the operator's free-tier key.
+      const { sources } = await retrieve(code, question)
+      res.status(503).json({
+        error: 'ai_not_configured',
+        message: 'Server has no GROQ_API_KEY — retrieval results only',
+        sources,
+      })
+      return
+    }
+
+    const { sources, context } = await retrieve(code, question)
+
+    let answer: { text: string; refused: boolean }
+    try {
+      answer = await generateAnswer(question, context)
+    } catch (llmErr) {
+      const msg = llmErr instanceof Error ? llmErr.message : 'ai_error'
+      if (msg === 'ai_busy') {
+        res.status(429).json({ error: 'ai_busy', message: 'AI quota reached — try again shortly' })
+        return
+      }
+      if (msg === 'ai_config') {
+        res.status(503).json({ error: 'ai_config', message: 'LLM key invalid — contact the operator' })
+        return
+      }
+      throw llmErr
+    }
+
+    res.json({
+      answer: answer.text,
+      refused: answer.refused,
+      sources,
+    })
+  } catch (err) {
+    logger.error({ err, code }, '[ai] query error')
+    res.status(500).json({ error: 'ai_error' })
+  }
 });
 
 // NOTE: the detailed /health handler lives further down this file. A second,
@@ -960,6 +1107,12 @@ async function start() {
         await connectDB()
         storedModeEnabled = true
         logger.info('[server] Connected to MongoDB — Stored Mode enabled')
+        if (CONFIG.RAG_ENABLED) {
+          void preloadEmbedder()
+          void recoverPendingIndexes()
+          // Re-kick jobs whose process died mid-index.
+          setInterval(() => { void recoverPendingIndexes() }, 5 * 60 * 1000).unref()
+        }
       } catch (dbErr) {
         logger.error({ err: dbErr }, '[server] MongoDB connection failed — entering live-only mode')
         storedModeEnabled = false

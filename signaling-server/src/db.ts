@@ -137,6 +137,11 @@ export async function deleteSessionAndFiles(code: string): Promise<void> {
       logger.info({ code, count: ids.length, fileNames: session.files.map(f => f.name) }, '[db] deleted GridFS file(s)')
     }
 
+    // Step 1b: delete any RAG index chunks for this session
+    await RagChunk.deleteMany({ code }).catch(err =>
+      logger.error({ err, code }, '[db] failed to delete rag chunks')
+    )
+
     // Step 2: delete session document only after GridFS is clean
     await StoredSession.deleteOne({ code })
     logger.info({ code }, '[db] session deleted')
@@ -268,15 +273,42 @@ async function cleanupOrphanedChunks(): Promise<void> {
   }
 }
 
+// Safety net: find RAG chunk docs whose parent session no longer exists and
+// delete them. Runs with the other deep-clean sweeps.
+async function cleanupOrphanedRagChunks(): Promise<void> {
+  try {
+    const codes = await RagChunk.distinct('code')
+    if (codes.length === 0) return
+    const BATCH = 100
+    let removed = 0
+    for (let i = 0; i < codes.length; i += BATCH) {
+      const batch = codes.slice(i, i + BATCH)
+      const existing = await StoredSession.find({ code: { $in: batch } })
+        .select('code').lean()
+      const alive = new Set(existing.map(s => s.code))
+      const dead = batch.filter(c => !alive.has(c))
+      logger.warn({ batch, aliveCount: alive.size, dead }, '[rag][debug] orphan sweep pass')
+      if (dead.length > 0) {
+        const r = await RagChunk.deleteMany({ code: { $in: dead } })
+        removed += r.deletedCount ?? 0
+      }
+    }
+    if (removed > 0) logger.info({ removed }, '[db] maintenance: cleaned orphaned rag chunk(s)')
+  } catch (err) {
+    logger.error({ err }, '[db] orphan rag chunk cleanup error')
+  }
+}
+
 async function runMaintenance() {
   if (isMaintenanceRunning) return
   isMaintenanceRunning = true
   try {
     logger.info('[db] starting maintenance scan...')
     const start = Date.now()
-    
+
     await cleanupOrphanedGridFSFiles()
     await cleanupOrphanedChunks()
+    await cleanupOrphanedRagChunks()
     await recoverExpiryTimers()
     
     logger.info({ durationMs: Date.now() - start }, '[db] maintenance complete')
@@ -323,6 +355,8 @@ export interface IStoredSession {
   password?: string // Optional hashed password
   burnOnRead?: boolean
   burnedAt?: Date | null // Set on first read of a burn-on-read session; blocks further reads until deletion
+  aiStatus?: 'none' | 'pending' | 'ready' | 'failed'
+  aiStats?: { chunks: number; files: number; failedFiles: string[] }
 }
 
 const storedSessionSchema = new mongoose.Schema<IStoredSession>({
@@ -337,6 +371,12 @@ const storedSessionSchema = new mongoose.Schema<IStoredSession>({
   }],
   burnOnRead: { type: Boolean, default: false },
   burnedAt:   { type: Date,   default: null },
+  aiStatus: { type: String, enum: ['none', 'pending', 'ready', 'failed'], default: 'none' },
+  aiStats:  {
+    chunks:      { type: Number, default: 0 },
+    files:       { type: Number, default: 0 },
+    failedFiles: { type: [String], default: [] },
+  },
   // Deletion design (do NOT add a MongoDB TTL index here):
   //   1. scheduleExpiry() Node timer deletes GridFS files, then the doc.
   //   2. recoverExpiryTimers() (startup + every 10 min) deletes anything a
@@ -350,6 +390,37 @@ const storedSessionSchema = new mongoose.Schema<IStoredSession>({
 })
 
 export const StoredSession = mongoose.model<IStoredSession>('StoredSession', storedSessionSchema)
+
+// ── RAG index chunks ──────────────────────────────────────────────────────────
+// One doc per chunk. Kept OUT of StoredSession so a 4k-chunk index can never
+// push a session doc near the 16MB BSON limit.
+
+export interface IRagChunk {
+  code: string
+  fileId: ObjectId
+  name: string
+  page: number | null
+  idx: number
+  text: string
+  embedding: number[]
+}
+
+const ragChunkSchema = new mongoose.Schema<IRagChunk>({
+  code:      { type: String, required: true, index: true },
+  fileId:    { type: mongoose.Schema.Types.ObjectId, required: true },
+  name:      { type: String, required: true },
+  page:      { type: Number, default: null },
+  idx:       { type: Number, required: true },
+  text:      { type: String, required: true },
+  embedding: { type: [Number], required: true },
+}, { collection: 'ragchunks' })
+
+export const RagChunk = mongoose.model<IRagChunk>('RagChunk', ragChunkSchema)
+
+/** Delete every indexed chunk for a session (idempotent). */
+export async function deleteRagChunks(code: string): Promise<void> {
+  await RagChunk.deleteMany({ code })
+}
 
 // ── GridFS helpers ────────────────────────────────────────────────────────────
 
@@ -414,4 +485,19 @@ export async function getFileStream(id: ObjectId): Promise<{
   const mimeType = (meta.metadata?.mimeType as string | undefined) ?? 'application/octet-stream'
   const stream = b.openDownloadStream(id)
   return { stream, filename: meta.filename, mimeType }
+}
+
+/** Read a whole GridFS file into memory. Safe here: stored payloads are capped at 10MB. */
+export async function readGridFile(id: ObjectId): Promise<Buffer> {
+  const { stream } = await (async () => {
+    const b = getBucket()
+    return { stream: b.openDownloadStream(id) }
+  })()
+  const chunks: Buffer[] = []
+  await new Promise<void>((resolve, reject) => {
+    stream.on('data', (c: Buffer) => chunks.push(c))
+    stream.on('end', () => resolve())
+    stream.on('error', reject)
+  })
+  return Buffer.concat(chunks)
 }
