@@ -56,6 +56,23 @@ async function runIndex(code: string): Promise<void> {
     const failedFiles: string[] = []
     const allChunks: Chunk[] = []
 
+    // The message body itself is indexable content — without this, text-only
+    // sessions reported "ready" with an empty index and every query 500'd.
+    if (session.text?.trim()) {
+      for (const c of chunkPages('(session-message)', [{ page: null, text: session.text }], {
+        targetChars: CONFIG.CHUNK_SIZE_CHARS,
+        overlapChars: CONFIG.CHUNK_OVERLAP_CHARS,
+      })) {
+        allChunks.push({
+          fileId: 'session-text',
+          name: '(session-message)',
+          page: c.page,
+          idx: c.idx,
+          text: c.text,
+        })
+      }
+    }
+
     for (const f of session.files ?? []) {
       if (!isSupportedForExtraction(f.name, f.mimeType)) {
         failedFiles.push(f.name)
@@ -117,6 +134,8 @@ async function runIndex(code: string): Promise<void> {
     // 4. Persist in batches
     for (let i = 0; i < workChunks.length; i += MONGO_INSERT_BATCH) {
       const slice = workChunks.slice(i, i + MONGO_INSERT_BATCH)
+      // Native-collection bulkWrite: the mongoose-model insertMany path
+      // silently dropped documents when running under ts-node-dev.
       const docs = slice.map((c, j) => ({
         code,
         fileId: c.fileId,
@@ -126,7 +145,16 @@ async function runIndex(code: string): Promise<void> {
         text: c.text,
         embedding: embeddings[i + j],
       }))
-      await RagChunk.insertMany(docs, { ordered: false })
+      await RagChunk.collection.bulkWrite(
+        docs.map(d => ({
+          replaceOne: {
+            filter: { code: d.code, idx: d.idx },
+            replacement: d,
+            upsert: true,
+          },
+        })),
+        { ordered: false }
+      )
     }
 
     await StoredSession.updateOne({ code }, {

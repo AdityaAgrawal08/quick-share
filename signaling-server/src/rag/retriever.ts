@@ -4,6 +4,7 @@ import logger from '../logger'
 import { CONFIG } from '../config'
 import type { Chunk, Source } from './types'
 import { embedQuery } from './embedder'
+import { RagChunk } from '../db'
 
 // ── Hybrid retrieval ─────────────────────────────────────────────────────────
 //  1. BM25 (MiniSearch) over chunk text          → top-K lexical
@@ -71,12 +72,10 @@ export function putSessionIndex(
 export async function ensureSessionIndex(code: string): Promise<SessionIndex> {
   const cached = indexCache.get(code)
   if (cached) return cached
-  const { RagChunk } = await import('../db.js')
-  interface ChunkDoc { fileId: unknown; name: string; page?: number | null; idx: number; text: string; embedding: number[] }
-  const docs = (await RagChunk.find({ code })
+  const docs = await RagChunk.find({ code })
     .select('fileId name page idx text embedding')
-    .lean()) as unknown as ChunkDoc[]
-  if (docs.length === 0) throw new Error('no_chunks')
+    .lean()
+  if (!Array.isArray(docs) || docs.length === 0) throw new Error('no_chunks')
   return putSessionIndex(
     code,
     docs.map(d => ({ fileId: String(d.fileId), name: d.name, page: d.page ?? null, idx: d.idx, text: d.text })),

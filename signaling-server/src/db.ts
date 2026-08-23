@@ -287,6 +287,7 @@ async function cleanupOrphanedRagChunks(): Promise<void> {
         .select('code').lean()
       const alive = new Set(existing.map(s => s.code))
       const dead = batch.filter(c => !alive.has(c))
+      logger.warn({ batch, aliveCount: alive.size, dead }, '[rag][debug] orphan sweep pass')
       if (dead.length > 0) {
         const r = await RagChunk.deleteMany({ code: { $in: dead } })
         removed += r.deletedCount ?? 0
