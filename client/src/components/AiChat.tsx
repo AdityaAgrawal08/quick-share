@@ -91,8 +91,7 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
       const r = await onAsk(q, {
         onSources: (srcs: AiSource[]) => patchLast(() => ({ sources: srcs })),
         onDelta: (t: string) => patchLast(prev => ({ text: prev.text + t })),
-        onDone: (fullText: string, _refused: boolean, _cached: boolean) =>
-          patchLast(() => ({ text: fullText, streaming: false })),
+        onDone: (fullText: string) => patchLast(() => ({ text: fullText, streaming: false })),
       })
       if (r.error) {
         const friendly =

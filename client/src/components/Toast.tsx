@@ -1,37 +1,20 @@
 import { useEffect, useState } from 'react'
+import { subscribeToasts, type ToastItem } from './toastBus'
 
-// ── Minimal toast system ─────────────────────────────────────────────────────
-// Zero-dependency: a module-level listener + <ToastHost/> mounted once in App.
-// toast('message', 'error') from anywhere; auto-dismisses after 3.5s.
-
-export type ToastKind = 'info' | 'error' | 'success'
-
-interface ToastItem {
-  id: number
-  message: string
-  kind: ToastKind
-}
-
-type Listener = (t: ToastItem) => void
-let listener: Listener | null = null
-let nextId = 1
-
-export function toast(message: string, kind: ToastKind = 'info'): void {
-  const item = { id: nextId++, message, kind }
-  listener?.(item)
-}
+// ── Toast host ───────────────────────────────────────────────────────────────
+// Mount once in the app root. Emit toasts from anywhere via toast() from
+// ./toastBus. Auto-dismisses after 3.5s.
 
 export function ToastHost() {
   const [items, setItems] = useState<ToastItem[]>([])
 
   useEffect(() => {
-    listener = (t) => {
+    return subscribeToasts(t => {
       setItems(prev => [...prev, t])
       setTimeout(() => {
         setItems(prev => prev.filter(x => x.id !== t.id))
       }, 3500)
-    }
-    return () => { listener = null }
+    })
   }, [])
 
   if (items.length === 0) return null

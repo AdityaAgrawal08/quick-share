@@ -8,7 +8,8 @@ import { guessMime } from './lib/mime'
 import type { SignalMessage, PeerRole } from './types'
 import { AiChat } from './components/AiChat'
 import type { AiSource, AskResult } from './components/AiChat'
-import { ToastHost, toast } from './components/Toast'
+import { ToastHost } from './components/Toast'
+import { toast } from './components/toastBus'
 
 const RAW_API_URL = (import.meta.env.VITE_API_URL as string | undefined)?.trim()
 // Fall back to same-origin so a missing env var crashes nothing at module load.
@@ -786,8 +787,8 @@ export default function App() {
       await new Promise(res => setTimeout(res, 900))
       r = await askAiOnce(question, cbs)
     }
-    const { status: _s, ...rest } = r
-    return rest
+    // Explicit rebuild — drops `status` without tripping no-unused-vars.
+    return { answer: r.answer, refused: r.refused, sources: r.sources, error: r.error }
   }
 
   function reset() {
