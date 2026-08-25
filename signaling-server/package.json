@@ -7,7 +7,9 @@
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "prebuild": "npm install",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "test": "node --test tests/unit/",
+    "test:integration": "node --test tests/integration/"
   },
   "keywords": [],
   "author": "",

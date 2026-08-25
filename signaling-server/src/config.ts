@@ -41,6 +41,8 @@ export const CONFIG = {
   GROQ_MODEL:       process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
   RAG_ENABLED:      process.env.RAG_ENABLED !== 'false',
   EMBED_MODEL:      process.env.RAG_EMBED_MODEL || 'Xenova/bge-small-en-v1.5',
+  // ONNX quantization for the local embedder — q8 keeps RAM ~4x lower than fp32.
+  EMBED_DTYPE:      process.env.RAG_EMBED_DTYPE || 'q8',
   RERANK_MODEL:     process.env.RAG_RERANK_MODEL || 'Xenova/bge-reranker-base',
   // Cross-encoder reranking adds ~400MB resident RAM — off by default so the
   // app fits small free-tier hosts (Render 512MB). Fusion ranking alone
@@ -49,6 +51,18 @@ export const CONFIG = {
   CHUNK_SIZE_CHARS: parseInt(process.env.RAG_CHUNK_SIZE ?? '600', 10),
   CHUNK_OVERLAP_CHARS: parseInt(process.env.RAG_CHUNK_OVERLAP ?? '90', 10),
   MAX_CHUNKS_PER_SESSION: parseInt(process.env.RAG_MAX_CHUNKS ?? '4000', 10),
+  // Direct-stuffing threshold (adaptive workload selection): corpora with up
+  // to this many extracted chars skip embeddings entirely — the full content
+  // goes into the Groq prompt at query time (~48k chars ≈ 12k tokens).
+  DIRECT_STUFF_MAX_CHARS: parseInt(process.env.RAG_DIRECT_STUFF_CHARS ?? '48000', 10),
+  // Resume-without-re-extraction of durable chunk work units after a
+  // provider failure or process death.
+  RAG_RESUME_ENABLED: process.env.RAG_RESUME_ENABLED !== 'false',
+  // Embedding provider circuit breaker.
+  BREAKER_THRESHOLD: parseInt(process.env.RAG_BREAKER_THRESHOLD ?? '3', 10),
+  BREAKER_COOLDOWN_MS: parseInt(process.env.RAG_BREAKER_COOLDOWN_MS ?? '30000', 10),
+  // LRU cap on in-memory retrieval indexes (each holds chunks + Float32 vectors).
+  RAG_INDEX_CACHE_MAX: parseInt(process.env.RAG_INDEX_CACHE_MAX ?? '12', 10),
 }
 
 // Validation

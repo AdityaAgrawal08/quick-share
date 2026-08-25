@@ -3,9 +3,13 @@ import { AutoTokenizer, AutoModelForSequenceClassification } from '@huggingface/
 import logger from '../logger'
 import { CONFIG } from '../config'
 import type { Chunk, Source } from './types'
-import { embedQuery } from './embedder'
+import {
+  embedQuery,
+  GenerationMismatchError,
+  ACTIVE_GENERATION_ID,
+} from './embedding/orchestrator'
 import { clearAnswerCache } from './answerCache'
-import { RagChunk } from '../db'
+import { RagChunk, StoredSession } from '../db'
 
 // ── Hybrid retrieval ─────────────────────────────────────────────────────────
 //  1. BM25 (MiniSearch) over chunk text          → top-K lexical
@@ -21,6 +25,9 @@ const RRF_K = 60
 const CANDIDATES_PER_LEG = 25
 const FUSION_KEEP = 12
 const FINAL_TOP_K = 5
+// Safety margin over DIRECT_STUFF_MAX_CHARS so a planner-approved corpus is
+// never truncated here even after per-chunk prefix overhead.
+const DIRECT_BUDGET_MARGIN_CHARS = 4096
 
 interface SessionIndex {
   minisearch: MiniSearch<Chunk>
@@ -29,7 +36,7 @@ interface SessionIndex {
 }
 
 const indexCache = new Map<string, SessionIndex>()
-const INDEX_CACHE_MAX = 12 // bounded so the LRU can never balloon RAM on small hosts
+const INDEX_CACHE_MAX = CONFIG.RAG_INDEX_CACHE_MAX // bounded so the LRU can never balloon RAM on small hosts
 
 function evictIfNeeded(): void {
   while (indexCache.size >= INDEX_CACHE_MAX) {
@@ -75,24 +82,70 @@ export function putSessionIndex(
 export async function ensureSessionIndex(code: string): Promise<SessionIndex> {
   const cached = indexCache.get(code)
   if (cached) return cached
-  const docs = await RagChunk.find({ code })
-    .select('fileId name page idx text embedding')
+  // Legacy chunks (pre durable-units deploy) carry no `st` field — they must
+  // still load so the generation check below can trigger their transparent
+  // rebuild instead of failing the query outright.
+  const docs = await RagChunk.find({
+    code,
+    $or: [{ st: 'completed' }, { st: { $exists: false } }],
+    embedding: { $exists: true, $ne: [] },
+  })
+    .select('fileId name page idx text embedding gen')
     .lean()
   if (!Array.isArray(docs) || docs.length === 0) throw new Error('no_chunks')
+  // Vector-space consistency (doc §35/Invariant 4): refuse to query across
+  // embedding generations. A mismatch triggers one transparent reindex via
+  // the /ai/query handler instead of silently comparing incommensurable
+  // vectors.
+  const mismatched = docs.find(d => (d.gen ?? null) !== ACTIVE_GENERATION_ID)
+  if (mismatched) throw new GenerationMismatchError(mismatched.gen ?? 'legacy', ACTIVE_GENERATION_ID)
   return putSessionIndex(
     code,
     docs.map(d => ({ fileId: String(d.fileId), name: d.name, page: d.page ?? null, idx: d.idx, text: d.text })),
-    docs.map(d => d.embedding),
+    docs.map(d => d.embedding ?? []),
   )
 }
 
-function cosine(a: Float32Array, b: Float32Array): number {
+// ── Direct-mode retrieval ────────────────────────────────────────────────────
+// Small corpora skip BM25/vectors entirely: the WHOLE canonical content
+// becomes the context. Nothing is lost between chunks — near-perfect by
+// construction — and the embedding model never loads for these sessions.
+
+async function retrieveDirect(code: string): Promise<RetrievalResult> {
+  const docs = await RagChunk.find({ code })
+    .select('fileId name page idx text')
+    .sort({ idx: 1 })
+    .lean()
+  if (!Array.isArray(docs) || docs.length === 0) throw new Error('no_chunks')
+
+  let budget = CONFIG.DIRECT_STUFF_MAX_CHARS + DIRECT_BUDGET_MARGIN_CHARS
+  const sources: Source[] = []
+  const parts: string[] = []
+  for (const d of docs) {
+    if (budget <= 0) break
+    const take = d.text.slice(0, budget)
+    budget -= take.length
+    parts.push(`[[${sources.length + 1}]] ${take}`)
+    sources.push({
+      name: d.name,
+      fileId: String(d.fileId),
+      page: d.page ?? null,
+      score: 1,
+      snippet: d.text.slice(0, 240),
+    })
+  }
+  return { sources, context: parts.join('\n\n---\n\n') }
+}
+
+// Exported for unit tests — pure ranking math.
+export function cosine(a: Float32Array, b: Float32Array): number {
   let dot = 0
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i]
   return dot // both normalized
 }
 
-function reciprocalFusion(
+// Exported for unit tests — pure ranking math.
+export function reciprocalFusion(
   lists: { chunkIdx: number; rank: number }[][]
 ): { chunkIdx: number; rrf: number }[] {
   const scores = new Map<number, number>()
@@ -185,6 +238,10 @@ export interface RetrievalResult {
 }
 
 export async function retrieve(code: string, question: string): Promise<RetrievalResult> {
+  // Route by session index mode (analyzer decision at index time).
+  const session = await StoredSession.findOne({ code }).select('aiMode').lean()
+  if (session?.aiMode === 'direct') return retrieveDirect(code)
+
   const idx = await ensureSessionIndex(code)
 
   // Leg 1: BM25
