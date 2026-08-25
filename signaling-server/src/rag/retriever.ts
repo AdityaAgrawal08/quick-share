@@ -4,7 +4,7 @@ import logger from '../logger'
 import { CONFIG } from '../config'
 import type { Chunk, Source } from './types'
 import {
-  embedQuery,
+  embedQueryForGeneration,
   GenerationMismatchError,
   ACTIVE_GENERATION_ID,
 } from './embedding/orchestrator'
@@ -78,8 +78,11 @@ export function putSessionIndex(
   return idx
 }
 
-/** Build (or reuse) the in-memory index straight from Mongo. */
-export async function ensureSessionIndex(code: string): Promise<SessionIndex> {
+/** Build (or reuse) the in-memory index straight from Mongo.
+ *  expectedGen: the embedding generation this session's index MUST be in —
+ *  the session's recorded serving generation, defaulting to the active local
+ *  one for legacy corpora. */
+export async function ensureSessionIndex(code: string, expectedGen: string): Promise<SessionIndex> {
   const cached = indexCache.get(code)
   if (cached) return cached
   // Legacy chunks (pre durable-units deploy) carry no `st` field — they must
@@ -97,8 +100,8 @@ export async function ensureSessionIndex(code: string): Promise<SessionIndex> {
   // embedding generations. A mismatch triggers one transparent reindex via
   // the /ai/query handler instead of silently comparing incommensurable
   // vectors.
-  const mismatched = docs.find(d => (d.gen ?? null) !== ACTIVE_GENERATION_ID)
-  if (mismatched) throw new GenerationMismatchError(mismatched.gen ?? 'legacy', ACTIVE_GENERATION_ID)
+  const mismatched = docs.find(d => (d.gen ?? null) !== (expectedGen ?? null))
+  if (mismatched) throw new GenerationMismatchError(mismatched.gen ?? 'legacy', expectedGen)
   return putSessionIndex(
     code,
     docs.map(d => ({ fileId: String(d.fileId), name: d.name, page: d.page ?? null, idx: d.idx, text: d.text })),
@@ -239,16 +242,19 @@ export interface RetrievalResult {
 
 export async function retrieve(code: string, question: string): Promise<RetrievalResult> {
   // Route by session index mode (analyzer decision at index time).
-  const session = await StoredSession.findOne({ code }).select('aiMode').lean()
+  const session = await StoredSession.findOne({ code }).select('aiMode aiStats.gen').lean()
   if (session?.aiMode === 'direct') return retrieveDirect(code)
 
-  const idx = await ensureSessionIndex(code)
+  // Ask the question in the SAME vector space the index was built in
+  // (doc §54 Option 1). Legacy corpora default to the active generation.
+  const expectedGen = session?.aiStats?.gen ?? ACTIVE_GENERATION_ID
+  const idx = await ensureSessionIndex(code, expectedGen)
 
   // Leg 1: BM25
   const bmHits = idx.minisearch.search(question).slice(0, CANDIDATES_PER_LEG)
 
-  // Leg 2: semantic
-  const qvec = Float32Array.from(await embedQuery(question))
+  // Leg 2: semantic — embedded with the index's own generation.
+  const qvec = Float32Array.from(await embedQueryForGeneration(question, expectedGen))
   const cosScores: { chunkIdx: number; score: number }[] = []
   for (let i = 0; i < idx.vectors.length; i++) {
     cosScores.push({ chunkIdx: i, score: cosine(qvec, idx.vectors[i]) })

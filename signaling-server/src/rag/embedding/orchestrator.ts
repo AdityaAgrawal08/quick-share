@@ -42,7 +42,9 @@ export interface EmbedResult {
 
 export interface Orchestrator {
   embed(texts: string[]): Promise<EmbedResult>
+  embedForGeneration(text: string, generationId: string): Promise<number[]>
   health(): { id: string; state: string }[]
+  generations(): string[]
 }
 
 interface ProviderEntry {
@@ -108,6 +110,38 @@ export function createOrchestrator(
     health() {
       return entries.map(e => ({ id: e.provider.id, state: e.breaker.state() }))
     },
+
+    generations() {
+      return entries.map(e => e.provider.generationId)
+    },
+
+    async embedForGeneration(text: string, generationId: string): Promise<number[]> {
+      const entry = entries.find(e => e.provider.generationId === generationId)
+      if (!entry) throw new GenerationMismatchError(generationId, entries[0].provider.generationId)
+      if (!entry.breaker.canPass()) {
+        // Same generation, temporarily unhealthy — the job that would serve
+        // this query cannot proceed; surface as unavailable (retryable).
+        throw new EmbeddingUnavailableError(
+          `generation ${generationId} provider circuit open`,
+        )
+      }
+      try {
+        const [vector] = await entry.provider.embed([text])
+        if (!Array.isArray(vector) || vector.length === 0 || vector.some(n => !Number.isFinite(n))) {
+          throw new EmbeddingError('provider', 'query embedding malformed')
+        }
+        entry.breaker.recordSuccess()
+        return vector
+      } catch (err) {
+        const classified = classifyEmbeddingError(err)
+        entry.breaker.recordFailure()
+        logger.warn(
+          { provider: entry.provider.id, kind: classified.kind, err: classified.message },
+          '[rag] query embedding failure',
+        )
+        throw classified
+      }
+    },
   }
 }
 
@@ -133,8 +167,28 @@ export function providerHealth(): { id: string; state: string }[] {
   return defaultOrchestrator.health()
 }
 
+/** Generations this process can currently serve queries/indexing for. */
+export function listRegisteredGenerations(): string[] {
+  return defaultOrchestrator.generations()
+}
+
+/** Embed a single query via the active provider chain. */
+
 /** Embed a single query via the active provider chain. */
 export async function embedQuery(text: string): Promise<number[]> {
   const { vectors } = await embedWithFailover([text])
   return vectors[0]
+}
+
+/**
+ * Embed a query with the provider of a SPECIFIC generation (doc §54 Option 1):
+ * retrieval must ask questions in the same vector space as the index it
+ * searches. Unknown generation → GenerationMismatchError, which callers map
+ * to a transparent rebuild onto the active generation.
+ */
+export function embedQueryForGeneration(
+  text: string,
+  expectedGeneration: string,
+): Promise<number[]> {
+  return defaultOrchestrator.embedForGeneration(text, expectedGeneration)
 }

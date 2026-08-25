@@ -5,6 +5,10 @@ import { Readable } from 'stream'
 
 import { CONFIG } from './config'
 
+// Re-exported for tooling/tests that need the live connection handle
+// (e.g. dropping an isolated integration-test database).
+export { mongoose }
+
 let bucket: GridFSBucket | null = null
 const MONGOOSE_OPTIONS = {
   serverSelectionTimeoutMS: 5000,
