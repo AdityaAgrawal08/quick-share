@@ -234,6 +234,29 @@ export function listRegisteredGenerations(): string[] {
 }
 
 /**
+ * Providers still able to take work RIGHT NOW (breaker closed or half-open
+ * probe available). When this is 0 mid-job, callers may degrade to BM25
+ * instead of pausing — the Render-free never-fail rule.
+ */
+export function usableProviderCount(): number {
+  const o = getDefaultOrchestrator()
+  // health() reports breaker states per entry in registry order.
+  return o.health().filter(h => h.state !== 'open').length
+}
+
+export interface ProviderSnapshot {
+  id: string
+  state: string
+  generationId?: string
+}
+
+export function providerSnapshots(): ProviderSnapshot[] {
+  const o = getDefaultOrchestrator()
+  const gens = o.generations()
+  return o.health().map((h, i) => ({ ...h, generationId: gens[i] }))
+}
+
+/**
  * Whether ANY embedding provider is permitted+configured on this host.
  * When false, vector indexing is impossible — callers must fall back to
  * BM25-only mode instead of pausing jobs (Render-free guarantee).

@@ -11,7 +11,7 @@ import { extractFileText, isSupportedForExtraction } from './extractor'
 import { chunkPages } from './chunker'
 import { planCorpus } from './analyzer'
 import type { CorpusPlan } from './analyzer'
-import { embedWithFailover, EmbeddingUnavailableError, listRegisteredGenerations, embeddingPathAvailable } from './embedding/orchestrator'
+import { embedWithFailover, EmbeddingUnavailableError, listRegisteredGenerations, embeddingPathAvailable, usableProviderCount } from './embedding/orchestrator'
 import { EmbeddingError } from './embedding/provider'
 import type { Chunk } from './types'
 import { dropSessionIndex } from './retriever'
@@ -445,19 +445,58 @@ async function runIndex(code: string): Promise<void> {
       mode: 'vector',
     }, '[rag] session indexed')
   } catch (err) {
-    if (
+    const providerRelated =
       err instanceof PipelinePausedError ||
       err instanceof EmbeddingUnavailableError ||
       err instanceof EmbeddingError
-    ) {
-      // Resource/provider pause — NOT a corpus problem. Completed batches
-      // stay durable; recovery re-kicks and resumes from pending units.
+
+    if (providerRelated && (await degradeToBm25IfHopeless(code, err))) {
+      // Quota/auth exhaustion with NO usable provider left: never strand the
+      // user — complete the canonical units keyword-style instead.
+      logger.warn({ err, code }, '[rag] providers exhausted — finalized as BM25-only (degraded)')
+      return
+    }
+
+    if (providerRelated) {
+      // Transient/resource pause — completed batches stay durable; recovery
+      // re-kicks and resumes from pending units.
       logger.warn({ err, code }, '[rag] index paused')
     } else {
       logger.error({ err, code }, '[rag] index job failed')
     }
     await StoredSession.updateOne({ code }, { $set: { aiStatus: 'failed' } }).catch(() => {})
   }
+}
+
+/**
+ * Never-fail ladder, step 2: when every embedding provider is DOWN (quota,
+ * auth, circuit-open) mid-job, convert remaining pending work units to
+ * BM25-completed so the session answers immediately in keyword mode.
+ * Adding a healthy key later upgrades on next publish/reindex.
+ */
+async function degradeToBm25IfHopeless(code: string, err: unknown): Promise<boolean> {
+  // Hopeless NOW when: nothing usable remains, OR the failure class itself
+  // is non-transient for this window (monthly quota / bad credentials).
+  // The orchestrator already tried every registered provider this batch.
+  const quotaOrAuthDead =
+    err instanceof EmbeddingError && (err.kind === 'quota' || err.kind === 'auth')
+  if (!quotaOrAuthDead && usableProviderCount() > 0) return false
+  const pending = await RagChunk.countDocuments({ code, st: 'pending' })
+  if (pending === 0) return false
+  await RagChunk.updateMany(
+    { code, st: 'pending' },
+    { $set: { st: 'completed', gen: null } },
+  )
+  const s = await StoredSession.findOne({ code }).select('files aiStats').lean()
+  const failedFiles = s?.aiStats?.failedFiles ?? []
+  await finalizeReady(code, {
+    mode: 'bm25',
+    chunks: await RagChunk.countDocuments({ code }),
+    files: (s?.files?.length ?? 0) - failedFiles.length,
+    failedFiles,
+  })
+  dropSessionIndex(code)
+  return true
 }
 
 async function finalizeReady(

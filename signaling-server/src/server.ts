@@ -21,7 +21,7 @@ import { CONFIG } from './config'
 import { detectMemoryProfile } from './rag/memory-profile'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
 import { retrieve } from './rag/retriever'
-import { GenerationMismatchError } from './rag/embedding/orchestrator'
+import { GenerationMismatchError, EmbeddingUnavailableError } from './rag/embedding/orchestrator'
 import { getAnswer, putAnswer } from './rag/answerCache'
 import { generateAnswer, llmConfigured, streamAnswer } from './rag/llm'
 
@@ -807,6 +807,7 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
     res.json({
       aiStatus: session.aiStatus ?? 'none',
       aiMode: session.aiMode ?? null,
+      qualityTier: session.aiMode === 'bm25' ? 'keyword' : 'full',
       aiStats: session.aiStats ?? null,
       llmConfigured: llmConfigured(),
     })
@@ -907,6 +908,30 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     try {
       retrieval = await retrieve(code, question)
     } catch (err) {
+      // Never-fail ladder at query time: a vector session whose embedding
+      // provider died between questions still answers — keyword mode.
+      const modeDoc = await StoredSession.findOne({ code }).select('aiMode').lean()
+      if (
+        (err instanceof EmbeddingUnavailableError ||
+         err instanceof GenerationMismatchError) &&
+        modeDoc?.aiMode === 'vector'
+      ) {
+        try {
+          const { retrieveBm25Only } = await import('./rag/retriever.js')
+          const fb = await retrieveBm25Only(code, question)
+          logger.warn({ code }, '[ai] query degraded to BM25 (embedding provider unavailable)')
+          res.status(200).json({
+            sources: fb.sources,
+            degraded: true,
+            qualityTier: 'keyword',
+            notice: 'Answered with keyword search — full AI indexing is temporarily unavailable.',
+          })
+        } catch {
+          void indexSession(code)
+          res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
+        }
+        return
+      }
       if (err instanceof GenerationMismatchError) {
         // Stored vectors come from a different embedding generation — never
         // mix vector spaces (Invariant 4). Re-index transparently; the client
