@@ -34,7 +34,14 @@ interface SessionIndex {
   vectors: Float32Array[] // parallel to chunks
 }
 
+/** BM25-only session index (mode='bm25'): no vectors exist by design. */
+interface Bm25Index {
+  minisearch: MiniSearch<Chunk>
+  chunks: Chunk[]
+}
+
 const indexCache = new Map<string, SessionIndex>()
+const bm25Cache = new Map<string, Bm25Index>()
 const INDEX_CACHE_MAX = CONFIG.RAG_INDEX_CACHE_MAX // bounded so the LRU can never balloon RAM on small hosts
 
 function evictIfNeeded(): void {
@@ -48,6 +55,7 @@ function evictIfNeeded(): void {
 
 export function dropSessionIndex(code: string): void {
   indexCache.delete(code)
+  bm25Cache.delete(code)
   // Keep answer cache consistent with the (possibly re-indexed) corpus.
   clearAnswerCache(code)
 }
@@ -121,12 +129,16 @@ async function retrieveDirect(code: string): Promise<RetrievalResult> {
   if (!Array.isArray(docs) || docs.length === 0) throw new Error('no_chunks')
 
   let budget = CONFIG.DIRECT_STUFF_MAX_CHARS + DIRECT_BUDGET_MARGIN_CHARS
+  // Per-source overhead (citation prefix + separator) must be reserved or the
+  // joined context silently exceeds the LLM input budget (bug found by test G).
+  const JOINER = '\n\n---\n\n'
+  const PER_SOURCE_OVERHEAD = 16 // "[[nn]] " + joiner share, rounded up
   const sources: Source[] = []
   const parts: string[] = []
   for (const d of docs) {
-    if (budget <= 0) break
-    const take = d.text.slice(0, budget)
-    budget -= take.length
+    if (budget <= PER_SOURCE_OVERHEAD) break
+    const take = d.text.slice(0, budget - PER_SOURCE_OVERHEAD)
+    budget -= take.length + PER_SOURCE_OVERHEAD
     parts.push(`[[${sources.length + 1}]] ${take}`)
     sources.push({
       name: d.name,
@@ -136,7 +148,7 @@ async function retrieveDirect(code: string): Promise<RetrievalResult> {
       snippet: d.text.slice(0, 240),
     })
   }
-  return { sources, context: parts.join('\n\n---\n\n') }
+  return { sources, context: parts.join(JOINER) }
 }
 
 // Exported for unit tests — pure ranking math.
@@ -235,6 +247,63 @@ async function rerank(query: string, candidates: Chunk[]): Promise<{ chunk: Chun
   }
 }
 
+
+/** Build (or reuse) the keyword-only index for BM25-mode sessions. */
+async function ensureBm25Index(code: string): Promise<Bm25Index> {
+  const cached = bm25Cache.get(code)
+  if (cached) return cached
+  const docs = await RagChunk.find({ code })
+    .select('fileId name page idx text')
+    .sort({ idx: 1 })
+    .lean()
+  const chunks: Chunk[] = (Array.isArray(docs) ? docs : []).map(d => ({
+    fileId: String(d.fileId),
+    name: d.name,
+    page: d.page ?? null,
+    idx: d.idx,
+    text: d.text,
+  }))
+  const minisearch = new MiniSearch<Chunk>({
+    fields: ['text'],
+    storeFields: ['name', 'page'],
+    searchOptions: { prefix: true, fuzzy: 0.2, boost: { text: 1 } },
+  })
+  minisearch.addAll(chunks.map(c => ({ ...c, id: c.idx })))
+  const idx: Bm25Index = { minisearch, chunks }
+  if (bm25Cache.size >= INDEX_CACHE_MAX) {
+    // Map preserves insertion order — evict oldest.
+    const oldest = bm25Cache.keys().next().value as string | undefined
+    if (oldest) bm25Cache.delete(oldest)
+  }
+  bm25Cache.set(code, idx)
+  return idx
+}
+
+/**
+ * BM25-only retrieval — the Render-free guarantee path. No embeddings are
+ * consulted or required: exact terminology ranks strongly, semantic
+ * fuzziness is sacrificed. Used when a corpus exceeds the direct-stuff
+ * budget AND no embedding provider is permitted/configured on the host.
+ */
+async function retrieveBm25Only(code: string, question: string): Promise<RetrievalResult> {
+  const idx = await ensureBm25Index(code)
+  if (idx.chunks.length === 0) throw new Error('no_chunks')
+  const hits = idx.minisearch.search(question).slice(0, 10)
+  const picked = hits.length
+    ? hits.map(h => ({ chunk: idx.chunks.find(c => c.idx === h.id), score: h.score }))
+        .filter((t): t is { chunk: Chunk; score: number } => Boolean(t.chunk))
+    : idx.chunks.slice(0, 5).map(c => ({ chunk: c, score: 1 })) // keyword miss ⇒ grounded head
+  const sources: Source[] = picked.map(({ chunk }, i) => ({
+    name: chunk.name,
+    fileId: chunk.fileId,
+    page: chunk.page,
+    score: Number(Math.min(1, picked[i].score).toFixed(4)),
+    snippet: chunk.text.slice(0, 240),
+  }))
+  const context = picked.map(({ chunk }, i) => `[[${i + 1}]] ${chunk.text}`).join('\n\n---\n\n')
+  return { sources, context }
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 export interface RetrievalResult {
@@ -246,6 +315,7 @@ export async function retrieve(code: string, question: string): Promise<Retrieva
   // Route by session index mode (analyzer decision at index time).
   const session = await StoredSession.findOne({ code }).select('aiMode aiStats.gen').lean()
   if (session?.aiMode === 'direct') return retrieveDirect(code)
+  if (session?.aiMode === 'bm25') return retrieveBm25Only(code, question)
 
   // Ask the question in the SAME vector space the index was built in
   // (doc §54 Option 1). Legacy corpora default to the active generation.

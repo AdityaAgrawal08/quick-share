@@ -794,7 +794,7 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
       return
     }
     const session = await StoredSession.findOne({ code })
-      .select('aiStatus aiStats expiresAt burnedAt')
+      .select('aiStatus aiMode aiStats expiresAt burnedAt')
       .lean()
     if (!session) {
       res.status(404).json({ error: 'not_found' })
@@ -806,6 +806,7 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
     }
     res.json({
       aiStatus: session.aiStatus ?? 'none',
+      aiMode: session.aiMode ?? null,
       aiStats: session.aiStats ?? null,
       llmConfigured: llmConfigured(),
     })

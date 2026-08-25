@@ -77,13 +77,15 @@ export const CONFIG = {
   // Portion of the window usable for stuffed content (~25%; rest = prompt +
   // answer headroom). Conservative 3 chars/token converts to the char gate
   // below, so we UNDER-stuff if the estimator is wrong — the safe direction.
+  // ~75% of the window (raised from 25% after the Render-free incident:
+  // most real sessions must answer WITHOUT any embedding provider).
   DIRECT_STUFF_MAX_TOKENS: parseInt(
-    process.env.RAG_DIRECT_STUFF_MAX_TOKENS ?? String(Math.floor(131072 * 0.25)),
+    process.env.RAG_DIRECT_STUFF_MAX_TOKENS ?? String(Math.floor(131072 * 0.75)),
     10,
   ),
   DIRECT_STUFF_MAX_CHARS: parseInt(
     process.env.RAG_DIRECT_STUFF_CHARS ??
-      String(parseInt(process.env.RAG_DIRECT_STUFF_MAX_TOKENS ?? '32768', 10) * 3),
+      String(parseInt(process.env.RAG_DIRECT_STUFF_MAX_TOKENS ?? '98304', 10) * 3),
     10,
   ),
   // Emergency kill switch: force EVERY corpus through direct stuffing so the

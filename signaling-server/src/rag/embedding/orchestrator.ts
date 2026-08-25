@@ -212,6 +212,14 @@ export function __setProvidersForTests(providers: EmbeddingProvider[], deps?: Or
     : createOrchestrator(buildRegistryFromEnv(), deps, { allowEmpty: true })
 }
 
+/**
+ * TEST-ONLY: force a truly EMPTY registry (Render-free posture) regardless of
+ * env/config — avoids module-instance ambiguity when suites cache requires.
+ */
+export function __setEmptyRegistryForTests(deps?: OrchestratorDeps): void {
+  defaultOrchestrator = createOrchestrator([], deps ?? {}, { allowEmpty: true })
+}
+
 export function embedWithFailover(texts: string[], opts: EmbedOptions = {}): Promise<EmbedResult> {
   return getDefaultOrchestrator().embed(texts, opts)
 }
@@ -223,6 +231,15 @@ export function providerHealth(): { id: string; state: string }[] {
 /** Generations this process can currently serve queries/indexing for. */
 export function listRegisteredGenerations(): string[] {
   return getDefaultOrchestrator().generations()
+}
+
+/**
+ * Whether ANY embedding provider is permitted+configured on this host.
+ * When false, vector indexing is impossible — callers must fall back to
+ * BM25-only mode instead of pausing jobs (Render-free guarantee).
+ */
+export function embeddingPathAvailable(): boolean {
+  return getDefaultOrchestrator().generations().length > 0
 }
 
 /** Embed a single query via the active provider chain. */

@@ -360,13 +360,15 @@ export interface IStoredSession {
   burnOnRead?: boolean
   burnedAt?: Date | null // Set on first read of a burn-on-read session; blocks further reads until deletion
   aiStatus?: 'none' | 'pending' | 'ready' | 'failed'
-  /** How this session is queried: 'direct' = full-content stuffing, 'vector' = hybrid retrieval. */
-  aiMode?: 'direct' | 'vector'
+  /** How this session is queried: 'direct' = full-content stuffing,
+   *  'bm25' = keyword-only retrieval (no embedding provider available),
+   *  'vector' = hybrid retrieval. */
+  aiMode?: 'direct' | 'bm25' | 'vector'
   aiStats?: {
     chunks: number
     files: number
     failedFiles: string[]
-    mode?: 'direct' | 'vector'
+    mode?: 'direct' | 'bm25' | 'vector'
     gen?: string          // embedding generation that produced the vectors
     fingerprint?: string  // corpus fingerprint enabling resume-without-re-extraction
     directChars?: number  // total chars when mode='direct'
@@ -386,12 +388,12 @@ const storedSessionSchema = new mongoose.Schema<IStoredSession>({
   burnOnRead: { type: Boolean, default: false },
   burnedAt:   { type: Date,   default: null },
   aiStatus: { type: String, enum: ['none', 'pending', 'ready', 'failed'], default: 'none' },
-  aiMode:   { type: String, enum: ['direct', 'vector'], default: null },
+  aiMode:   { type: String, enum: ['direct', 'bm25', 'vector'], default: null },
   aiStats:  {
     chunks:      { type: Number, default: 0 },
     files:       { type: Number, default: 0 },
     failedFiles: { type: [String], default: [] },
-    mode:        { type: String, enum: ['direct', 'vector'], default: null },
+    mode:        { type: String, enum: ['direct', 'bm25', 'vector'], default: null },
     gen:         { type: String, default: null },
     fingerprint: { type: String, default: null },
     directChars: { type: Number, default: null },

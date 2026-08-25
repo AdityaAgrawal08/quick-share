@@ -1,4 +1,5 @@
 import { CONFIG } from '../config'
+import { detectMemoryProfile } from './memory-profile'
 import logger from '../logger'
 import {
   StoredSession,
@@ -10,7 +11,7 @@ import { extractFileText, isSupportedForExtraction } from './extractor'
 import { chunkPages } from './chunker'
 import { planCorpus } from './analyzer'
 import type { CorpusPlan } from './analyzer'
-import { embedWithFailover, EmbeddingUnavailableError, listRegisteredGenerations } from './embedding/orchestrator'
+import { embedWithFailover, EmbeddingUnavailableError, listRegisteredGenerations, embeddingPathAvailable } from './embedding/orchestrator'
 import { EmbeddingError } from './embedding/provider'
 import type { Chunk } from './types'
 import { dropSessionIndex } from './retriever'
@@ -34,11 +35,18 @@ const MONGO_INSERT_BATCH = Number(process.env.RAG_MONGO_INSERT_BATCH ?? 100)
 // RSS budget guard (doc Invariant 8): pause the JOB instead of letting the
 // process be OOM-killed. A pause leaves durable pending units behind, so a
 // later retry resumes cheaply; an OOM-kill takes the whole server down.
-const EMBED_MAX_RSS_MB = Number(process.env.RAG_EMBED_MAX_RSS_MB ?? 384)
+// RSS budget guard (doc Invariant 8): pause the JOB instead of letting the
+// process be OOM-killed. The ceiling is TOTAL-PROCESS-AWARE: derived from the
+// detected cgroup limit minus baseline/headroom (memory-profile.ts) — NOT an
+// isolated "embedding budget" (review §5/§8). On TINY hosts this resolves to
+// min(RAG_EMBED_MAX_RSS_MB, limit−96) = 384MB on a 512MB Render instance.
+// A pause leaves durable pending units behind, so a later retry resumes
+// cheaply; an OOM kill takes the whole server down.
 function rssOverBudget(): boolean {
+  const ceilingMb = detectMemoryProfile().workloadCeilingMb
   const rssMb = process.memoryUsage().rss / 1048576
-  if (rssMb > EMBED_MAX_RSS_MB) {
-    logger.warn({ rssMb: Math.round(rssMb), budgetMb: EMBED_MAX_RSS_MB }, '[rag] RSS over embedding budget')
+  if (rssMb > ceilingMb) {
+    logger.warn({ rssMb: Math.round(rssMb), ceilingMb }, '[rag] RSS over workload ceiling')
     return true
   }
   return false
@@ -294,9 +302,23 @@ async function runIndex(code: string): Promise<void> {
     // persisted under.)
     if (!plan) plan = planCorpus(totalChars, workChunks.length)
 
-    // Persist canonical chunk docs FIRST (durable work units). Direct mode
-    // completes them immediately with no vectors; vector mode leaves them
-    // 'pending' until their batch lands in Mongo (§44 ordering).
+    // Render-free guarantee: when NO embedding provider is permitted on this
+    // host (TINY tier without keys), a vector-needing corpus must NOT fail —
+    // it degrades to BM25-only retrieval over the same canonical chunks.
+    // Answers stay available; semantic recall returns when keys are added
+    // (next reindex upgrades the generation automatically).
+    let effectiveMode: 'direct' | 'bm25' | 'vector' = plan.mode
+    if (plan.mode === 'vector' && !embeddingPathAvailable()) {
+      effectiveMode = 'bm25'
+      logger.warn(
+        { code },
+        '[rag] no embedding provider permitted — indexing as BM25-only (answers stay available)',
+      )
+    }
+
+    // Persist canonical chunk docs FIRST (durable work units). Direct/BM25
+    // modes complete them immediately with no vectors; vector mode leaves
+    // them 'pending' until their batch lands in Mongo (§44 ordering).
     for (let i = 0; i < workChunks.length; i += MONGO_INSERT_BATCH) {
       const slice = workChunks.slice(i, i + MONGO_INSERT_BATCH)
       await RagChunk.collection.bulkWrite(
@@ -310,18 +332,18 @@ async function runIndex(code: string): Promise<void> {
                 name: c.name,
                 page: c.page,
                 text: c.text,
-                st: plan.mode === 'direct' ? 'completed' : 'pending',
+                st: effectiveMode === 'vector' ? 'pending' : 'completed',
                 gen: null,
               },
             },
-            upsert: true,
+          upsert: true,
           },
         })),
         { ordered: false }
       )
     }
 
-    if (plan.mode === 'vector') {
+    if (effectiveMode === 'vector') {
       // Record the resume anchor BEFORE embedding starts (Bug fix): if the
       // process dies mid-job, recovery finds fingerprint+mode+chunk-count and
       // resumes from pending units instead of re-extracting everything.
@@ -338,9 +360,10 @@ async function runIndex(code: string): Promise<void> {
       })
     }
 
-    if (plan.mode === 'direct') {
+    if (effectiveMode !== 'vector') {
+      // Direct or BM25: canonical units are already completed — finalize.
       await finalizeReady(code, {
-        mode: 'direct',
+        mode: effectiveMode,
         chunks: workChunks.length,
         files: session.files.length - failedFiles.length,
         failedFiles,
@@ -348,8 +371,10 @@ async function runIndex(code: string): Promise<void> {
         fingerprint,
       })
       logger.info(
-        { code, chars: plan.totalChars, mode: 'direct', truncated },
-        '[rag] session indexed (direct stuffing — no embeddings)',
+        { code, chars: plan.totalChars, mode: effectiveMode, truncated },
+        effectiveMode === 'direct'
+          ? '[rag] session indexed (direct stuffing — no embeddings)'
+          : '[rag] session indexed (BM25-only — no embedding provider permitted)',
       )
       return
     }
@@ -438,7 +463,7 @@ async function runIndex(code: string): Promise<void> {
 async function finalizeReady(
   code: string,
   stats: {
-    mode: 'direct' | 'vector'
+    mode: 'direct' | 'bm25' | 'vector'
     chunks: number
     files: number
     failedFiles: string[]
