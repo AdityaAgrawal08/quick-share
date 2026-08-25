@@ -55,6 +55,12 @@ export const CONFIG = {
   // to this many extracted chars skip embeddings entirely — the full content
   // goes into the Groq prompt at query time (~48k chars ≈ 12k tokens).
   DIRECT_STUFF_MAX_CHARS: parseInt(process.env.RAG_DIRECT_STUFF_CHARS ?? '48000', 10),
+  // Emergency kill switch: force EVERY corpus through direct stuffing so the
+  // local embedder can never load. Use on hosts without measured headroom.
+  RAG_FORCE_DIRECT: process.env.RAG_FORCE_DIRECT === 'true',
+  // Pause (not OOM-kill) vector jobs once process RSS crosses this budget.
+  // Durable work units make the eventual retry cheap.
+  EMBED_MAX_RSS_MB: parseInt(process.env.RAG_EMBED_MAX_RSS_MB ?? '384', 10),
   // Resume-without-re-extraction of durable chunk work units after a
   // provider failure or process death.
   RAG_RESUME_ENABLED: process.env.RAG_RESUME_ENABLED !== 'false',

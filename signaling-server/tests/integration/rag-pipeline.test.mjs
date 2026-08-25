@@ -46,6 +46,9 @@ const URI = withIsolatedTestDb(RAW_URI)
 // config.js already ran once (above) and froze CONFIG.MONGODB_URI to the RAW
 // uri — evict it from the CJS cache so db/pipeline re-require a fresh CONFIG
 // bound to the isolated throwaway database instead.
+// Integration tests exercise LOGIC, not the RSS budget — disable the guard
+// here (the test process itself carries mongoose+transformers overhead).
+process.env.RAG_EMBED_MAX_RSS_MB = '4096'
 process.env.MONGODB_URI = URI
 delete require.cache[require.resolve('../../dist/config.js')]
 
