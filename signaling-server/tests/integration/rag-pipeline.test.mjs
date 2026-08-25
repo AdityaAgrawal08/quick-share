@@ -1,12 +1,18 @@
 // Integration tests — durable work units, resume, generation consistency,
 // direct stuffing, breaker pause/recovery. Runs against REAL MongoDB.
 //
-// Usage (never touches your app database — uses its own DB and drops it):
-//   MONGODB_URI_TEST="mongodb+srv://user:pass@cluster/?retryWrites=true" npm run test:integration
+// Usage:
+//   npm run test:integration
+//     → falls back to the credentials in signaling-server/.env automatically.
+//   MONGODB_URI_TEST="mongodb+srv://user:pass@cluster/?…" npm run test:integration
+//     → explicit override.
+//
+// Isolation guarantee: the suite ALWAYS connects to a dedicated throwaway
+// database `qs-it-<random>` (any /dbname in the URI is replaced) and drops
+// only that database at the end. Your app data is never touched.
 //
 // No ONNX model is downloaded: a deterministic stub embedding provider is
-// injected via the orchestrator's test seam. Set RAG_IT_REAL_EMBEDDER=1 to
-// additionally run one vector round with the real local BGE model (slow).
+// injected via the orchestrator's test seam.
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
@@ -15,16 +21,36 @@ import { randomUUID } from 'node:crypto'
 const require = createRequire(import.meta.url)
 const dist = p => require(`../../dist/${p}`)
 
-const URI = process.env.MONGODB_URI_TEST
-if (!URI) {
-  console.log('ℹ MONGODB_URI_TEST not set — integration suite skipped.')
+// Load .env-backed config FIRST so MONGODB_URI/GROQ_API_KEY are populated
+// exactly like a real boot (dist/config.js never overrides existing vars).
+require('../../dist/config.js')
+
+const RAW_URI = process.env.MONGODB_URI_TEST ?? process.env.MONGODB_URI
+if (!RAW_URI) {
+  console.log('ℹ No MONGODB_URI_TEST / .env MONGODB_URI — integration suite skipped.')
   process.exit(0)
 }
 
-// ── Env must be set BEFORE config/db modules load ────────────────────────────
+/** Force an isolated throwaway database name; keep auth/query params. */
+function withIsolatedTestDb(uri) {
+  const qIdx = uri.indexOf('?')
+  const base = qIdx >= 0 ? uri.slice(0, qIdx) : uri
+  const query = qIdx >= 0 ? uri.slice(qIdx) : ''
+  const m = base.match(/^(mongodb(?:\+srv)?:\/\/[^/]+)\/?/)
+  if (!m) throw new Error(`Unrecognized MongoDB URI shape: ${uri.replace(/:[^:@/]*@/, ':***@')}`)
+  return `${m[1]}/qs-it-${randomUUID().slice(0, 8)}${query}`
+}
+const URI = withIsolatedTestDb(RAW_URI)
+
+// ── Env must be final BEFORE config/db modules load ──────────────────────────
+// config.js already ran once (above) and froze CONFIG.MONGODB_URI to the RAW
+// uri — evict it from the CJS cache so db/pipeline re-require a fresh CONFIG
+// bound to the isolated throwaway database instead.
 process.env.MONGODB_URI = URI
+delete require.cache[require.resolve('../../dist/config.js')]
 
 const { connectDB, StoredSession, RagChunk, mongoose, deleteRagChunks } = dist('db.js')
+const { ObjectId } = require('mongodb')
 const { indexSession, corpusFingerprint, recoverPendingIndexes } = dist('rag/pipeline.js')
 const { retrieve } = dist('rag/retriever.js')
 const {
@@ -72,11 +98,18 @@ async function freshSession(code, text, extra = {}) {
 describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
   before(async () => {
     await connectDB()
+    // Safety interlock: only ever drop a throwaway qs-it-* database.
+    const dbName = mongoose.connection.name
+    assert.ok(dbName.startsWith('qs-it-'), `refusing to run against non-test db: ${dbName}`)
+    console.log(`ℹ integration db: ${dbName}`)
     provider = makeProvider('stub-primary')
     __setProvidersForTests([provider], { threshold: 3, cooldownMs: 200 })
   })
 
   after(async () => {
+    if (!mongoose.connection.name.startsWith('qs-it-')) {
+      throw new Error('interlock tripped — refusing to drop non-test database')
+    }
     await mongoose.connection.dropDatabase()
     await mongoose.disconnect()
   })
@@ -227,7 +260,8 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
 
   it('F. legacy chunks (pre-deploy, no st/gen) self-heal instead of erroring', async () => {
     const code = '900006'
-    await freshSession(code, '')
+    // Session carries real content so the rebuild has something to index.
+    await freshSession(code, 'legacy indexed content about quotas and limits')
     // Hand-insert a pre-deploy shape doc.
     await RagChunk.collection.insertOne({
       code, fileId: 'legacy', name: 'old.txt', page: null, idx: 0,
@@ -248,8 +282,9 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
     // Hand-seed a "direct" session larger than the planner would ever allow,
     // isolating the retriever-side budget enforcement.
     const perChunk = 'x'.repeat(1000)
+    const fid = new ObjectId()
     for (let i = 0; i < 60; i++) { // 60k chars total > DIRECT_STUFF_MAX_CHARS + margin
-      await RagChunk.create({ code, fileId: 'f', name: 'n.txt', page: null, idx: i, text: perChunk, st: 'completed' })
+      await RagChunk.create({ code, fileId: fid, name: 'n.txt', page: null, idx: i, text: perChunk, st: 'completed' })
     }
     await StoredSession.updateOne({ code }, { $set: { aiStatus: 'ready', aiMode: 'direct' } })
     const r = await retrieve(code, 'q')
@@ -261,6 +296,8 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
 
   it('H. breaker exhaustion fails fast; cooldown probe recovers', async () => {
     const code = '900008'
+    // Vector-sized corpus so embedding is actually exercised.
+    await freshSession(code, 'Circuit breaker corpus body. '.repeat(2400))
     const alwaysBroken = makeProvider('broken', { failWhen: () => true })
     __setProvidersForTests([alwaysBroken], { threshold: 2, cooldownMs: 150 })
     const t0 = Date.now()

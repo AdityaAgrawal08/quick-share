@@ -10,7 +10,7 @@ import { extractFileText, isSupportedForExtraction } from './extractor'
 import { chunkPages } from './chunker'
 import { planCorpus } from './analyzer'
 import type { CorpusPlan } from './analyzer'
-import { embedWithFailover, ACTIVE_GENERATION_ID, EmbeddingUnavailableError } from './embedding/orchestrator'
+import { embedWithFailover, EmbeddingUnavailableError, listRegisteredGenerations } from './embedding/orchestrator'
 import { EmbeddingError } from './embedding/provider'
 import type { Chunk } from './types'
 import { dropSessionIndex } from './retriever'
@@ -83,37 +83,71 @@ async function runIndex(code: string): Promise<void> {
     const prevChunks = prevStats?.chunks
     const prevFailedFiles = prevStats?.failedFiles ?? []
 
-    // ── Resume path: canonical chunks survive provider failures (§33/§41).
-    // Same corpus + vector mode → skip extraction/chunking entirely and
-    // finish only the still-pending work units.
+    // ── Resume / rebuild classification (doc §33, §38–§40):
+    //   • resume  — same corpus, completed units in ONE registered generation
+    //               → finish only pending units (cheap).
+    //   • rebuild — same corpus but the persisted index is mixed-generation or
+    //               from an unregistered model → reset ALL units and re-embed
+    //               from canonical chunks; NEVER re-read source files (§41).
+    //   • fresh   — anything else → full extraction/chunking.
     let failedFiles: string[]
     let workChunks: Chunk[]
     let truncated = false
     let totalChars: number
-    // Resume always continues in vector mode — the plan was already made and
-    // canonical units persisted when the job first ran.
-    const resumed = Boolean(
-      CONFIG.RAG_RESUME_ENABLED &&
+    const anchorMatches = Boolean(
       prevStats?.fingerprint === fingerprint &&
       prevStats?.mode === 'vector' &&
       typeof prevChunks === 'number' &&
       prevChunks > 0
     )
-    let plan: CorpusPlan | null = resumed ? { mode: 'vector', totalChars: 0, chunkCount: 0 } : null
+    let resumable = false
+    let rebuild = false
+    if (CONFIG.RAG_RESUME_ENABLED && anchorMatches) {
+      const gens = await RagChunk.distinct('gen', { code, st: 'completed' }).catch(() => [] as (string | null)[])
+      const registered = listRegisteredGenerations()
+      if (gens.length === 1 && gens[0] && registered.includes(gens[0])) {
+        resumable = true
+      } else if (gens.length > 0) {
+        rebuild = true
+      } // zero completed units → nothing durable to keep: fresh
+    }
+    const resumed = resumable
+    let plan: CorpusPlan | null = resumed || rebuild ? { mode: 'vector', totalChars: 0, chunkCount: 0 } : null
 
-    if (resumed) {
+    if (rebuild) {
+      logger.info({ code }, '[rag] rebuilding index — generation change detected')
+      await RagChunk.updateMany(
+        { code },
+        { $set: { st: 'pending', embedding: [], gen: null } },
+      )
+      const docs = await RagChunk.find({ code }).select('fileId name page idx text').lean()
+      workChunks = docs.map(d => ({
+        fileId: String(d.fileId),
+        name: d.name,
+        page: d.page ?? null,
+        idx: d.idx,
+        text: d.text,
+      }))
+      failedFiles = prevFailedFiles
+      totalChars = workChunks.reduce((n, c) => n + c.text.length, 0)
+      truncated = false
+    } else if (resumed) {
       const pendDocs = await RagChunk.find({ code, st: 'pending' })
         .select('fileId name page idx text')
         .lean()
       if (pendDocs.length === 0) {
         // Everything already completed (e.g. crashed after last write but
-        // before the status flip) → just finalize.
+        // before the status flip) → just finalize from DB truth.
+        const [persisted, gens] = await Promise.all([
+          RagChunk.countDocuments({ code }),
+          RagChunk.distinct('gen', { code, st: 'completed' }),
+        ])
         await finalizeReady(code, {
           mode: 'vector',
-          chunks: await RagChunk.countDocuments({ code }),
+          chunks: persisted,
           files: session.files.length - prevFailedFiles.length,
           failedFiles: prevFailedFiles,
-          gen: ACTIVE_GENERATION_ID,
+          gen: gens.length === 1 ? gens[0] : undefined,
           fingerprint,
         })
         return
@@ -296,9 +330,21 @@ async function runIndex(code: string): Promise<void> {
 
     // ── Vector path: embed in small durable batches via the orchestrator.
     let done = 0
+    let servingGen: string | null = null
     for (let i = 0; i < workChunks.length; i += EMBED_BATCH) {
       const batch = workChunks.slice(i, i + EMBED_BATCH)
       const { vectors, generationId } = await embedWithFailover(batch.map(c => c.text))
+      // Invariant 4 guard: a provider failover that CHANGES the embedding
+      // space mid-job is a model switch (doc §34) — never mix silently.
+      // Abort; durable completed batches keep their single generation and
+      // recovery restarts the remainder under one consistent generation.
+      if (servingGen && servingGen !== generationId) {
+        throw new EmbeddingError(
+          'provider',
+          `embedding generation changed mid-job (${servingGen} → ${generationId})`,
+        )
+      }
+      servingGen = generationId
       // Durable completion ordering (§44): persist vectors BEFORE counting
       // the batch complete; a crash here just leaves units pending.
       await RagChunk.collection.bulkWrite(
@@ -316,15 +362,21 @@ async function runIndex(code: string): Promise<void> {
     releaseMemory()
     logger.debug({ code, rssMb: Math.round(process.memoryUsage().rss / 1048576) }, '[rag] post-embed rss')
 
-    // The DB is the source of truth for completion counts (doc §44) — never
-    // report an in-memory number the persisted index may not match.
-    const persisted = await RagChunk.countDocuments({ code })
+    // The DB is the source of truth for completion counts AND generation
+    // identity (doc §44/Invariant 3) — derive both from persisted docs.
+    const [persisted, gens] = await Promise.all([
+      RagChunk.countDocuments({ code }),
+      RagChunk.distinct('gen', { code, st: 'completed' }),
+    ])
+    if (gens.length !== 1 || !gens[0]) {
+      throw new Error(`inconsistent index generations after embedding: ${gens.join(',')}`)
+    }
     await finalizeReady(code, {
       mode: 'vector',
       chunks: persisted,
       files: session.files.length - failedFiles.length,
       failedFiles,
-      gen: ACTIVE_GENERATION_ID,
+      gen: gens[0],
       fingerprint,
     })
 
