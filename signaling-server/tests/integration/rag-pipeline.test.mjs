@@ -71,11 +71,14 @@ function embedStub(text) {
 
 function makeProvider(name, behavior = {}) {
   const log = []
+  const state = { calls: 0 }
   return {
     id: name,
     generationId: behavior.generationId ?? GEN,
     log,
+    get calls() { return state.calls },
     async embed(texts) {
+      state.calls++
       for (const t of texts) log.push(t)
       if (behavior.failWhen?.(texts)) throw behavior.error ?? new Error('stub failure')
       return texts.map(t => embedStub(t))
@@ -300,13 +303,21 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
     await freshSession(code, 'Circuit breaker corpus body. '.repeat(2400))
     const alwaysBroken = makeProvider('broken', { failWhen: () => true })
     __setProvidersForTests([alwaysBroken], { threshold: 2, cooldownMs: 150 })
-    const t0 = Date.now()
-    await indexSession(code) // two attempts trip breaker instantly
-    assert.ok(Date.now() - t0 < 5000, 'failed fast, no hammering')
+    await indexSession(code)
+    // "Fails fast, no hammering": the breaker admits at most `threshold`
+    // batch attempts (+1 half-open probe if cooldown elapses mid-job) —
+    // count-based, NOT wall-clock, so slow Atlas links can't flake.
+    const maxAttempts = 2 + 1
+    assert.ok(
+      alwaysBroken.calls <= maxAttempts,
+      `expected ≤${maxAttempts} embed attempts, got ${alwaysBroken.calls}`,
+    )
+    let s = await StoredSession.findOne({ code }).lean()
+    assert.equal(s.aiStatus, 'failed', 'job pauses as failed when circuit opens')
 
     __setProvidersForTests([makeProvider('healed')], { threshold: 2, cooldownMs: 150 })
     await indexSession(code)
-    const s = await StoredSession.findOne({ code }).lean()
+    s = await StoredSession.findOne({ code }).lean()
     assert.equal(s.aiStatus, 'ready')
   })
 
