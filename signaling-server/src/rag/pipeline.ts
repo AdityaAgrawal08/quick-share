@@ -1,4 +1,5 @@
 import { CONFIG } from '../config'
+import { detectMemoryProfile } from './memory-profile'
 import logger from '../logger'
 import {
   StoredSession,
@@ -34,11 +35,18 @@ const MONGO_INSERT_BATCH = Number(process.env.RAG_MONGO_INSERT_BATCH ?? 100)
 // RSS budget guard (doc Invariant 8): pause the JOB instead of letting the
 // process be OOM-killed. A pause leaves durable pending units behind, so a
 // later retry resumes cheaply; an OOM-kill takes the whole server down.
-const EMBED_MAX_RSS_MB = Number(process.env.RAG_EMBED_MAX_RSS_MB ?? 384)
+// RSS budget guard (doc Invariant 8): pause the JOB instead of letting the
+// process be OOM-killed. The ceiling is TOTAL-PROCESS-AWARE: derived from the
+// detected cgroup limit minus baseline/headroom (memory-profile.ts) — NOT an
+// isolated "embedding budget" (review §5/§8). On TINY hosts this resolves to
+// min(RAG_EMBED_MAX_RSS_MB, limit−96) = 384MB on a 512MB Render instance.
+// A pause leaves durable pending units behind, so a later retry resumes
+// cheaply; an OOM kill takes the whole server down.
 function rssOverBudget(): boolean {
+  const ceilingMb = detectMemoryProfile().workloadCeilingMb
   const rssMb = process.memoryUsage().rss / 1048576
-  if (rssMb > EMBED_MAX_RSS_MB) {
-    logger.warn({ rssMb: Math.round(rssMb), budgetMb: EMBED_MAX_RSS_MB }, '[rag] RSS over embedding budget')
+  if (rssMb > ceilingMb) {
+    logger.warn({ rssMb: Math.round(rssMb), ceilingMb }, '[rag] RSS over workload ceiling')
     return true
   }
   return false
