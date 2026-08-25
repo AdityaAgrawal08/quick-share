@@ -138,4 +138,18 @@ describe('env registry assembly (RAG_PROVIDER_ORDER)', () => {
     process.env.INSTANCE_MEMORY_MB = '512'
     assert.deepEqual(freshOrchestrator(), [])
   })
+
+  it('embeddingPathAvailable() tracks registry emptiness (Render-free gate)', () => {
+    const orch = dist('rag/embedding/orchestrator.js')
+    // Empty registry → unavailable
+    orch.__setEmptyRegistryForTests({ threshold: 3, cooldownMs: 10 })
+    assert.equal(orch.embeddingPathAvailable(), false)
+    // Register a provider → available again
+    orch.__setProvidersForTests([{
+      id: 'cohere',
+      generationId: 'cohere:embed-v4.0:1536:cosine',
+      embed: async () => [[1]],
+    }])
+    assert.equal(orch.embeddingPathAvailable(), true)
+  })
 })

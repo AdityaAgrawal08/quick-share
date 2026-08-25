@@ -48,6 +48,10 @@ const URI = withIsolatedTestDb(RAW_URI)
 // bound to the isolated throwaway database instead.
 // Integration tests exercise LOGIC, not the host budget — give the suite a
 // LARGE profile so the RSS ceiling guard never fires on stub workloads.
+// Deterministic planning budgets (operator .env must not skew modes):
+// small token gate keeps vector/bm25 paths exercised by these corpora.
+process.env.RAG_DIRECT_STUFF_MAX_TOKENS = '32768'
+process.env.RAG_DIRECT_STUFF_CHARS = '96000'
 process.env.INSTANCE_MEMORY_MB = '4096'
 process.env.MONGODB_URI = URI
 delete require.cache[require.resolve('../../dist/config.js')]
@@ -59,6 +63,7 @@ const { retrieve } = dist('rag/retriever.js')
 const {
   GenerationMismatchError,
   __setProvidersForTests,
+  __setEmptyRegistryForTests,
 } = dist('rag/embedding/orchestrator.js')
 
 const GEN = 'stub:v1'
@@ -287,17 +292,22 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
     await freshSession(code, '')
     // Hand-seed a "direct" session larger than the planner would ever allow,
     // isolating the retriever-side budget enforcement.
+    const { CONFIG: CFG } = dist('config.js')
+    const capChars = CFG.DIRECT_STUFF_MAX_CHARS + 4096
     const perChunk = 'x'.repeat(1000)
+    const count = Math.ceil((capChars + 20_000) / perChunk.length) // guarantees overflow
     const fid = new ObjectId()
-    for (let i = 0; i < 60; i++) { // 60k chars total > DIRECT_STUFF_MAX_CHARS + margin
+    for (let i = 0; i < count; i++) {
       await RagChunk.create({ code, fileId: fid, name: 'n.txt', page: null, idx: i, text: perChunk, st: 'completed' })
     }
     await StoredSession.updateOne({ code }, { $set: { aiStatus: 'ready', aiMode: 'direct' } })
     const r = await retrieve(code, 'q')
     const ctxLen = r.context.length
-    const cap = 48_000 + 4096 + r.sources.length * ('[[nn]] '.length + 2)
-    assert.ok(ctxLen <= cap + 4096, `context ${ctxLen} within budget`)
-    assert.ok(r.sources.length < 60, 'sources truncated with budget')
+    assert.ok(
+      ctxLen <= capChars + r.sources.length * 12,
+      `context ${ctxLen} within budget ${capChars}`,
+    )
+    assert.ok(r.sources.length < count, `sources truncated (${r.sources.length}/${count})`)
   })
 
   it('H. breaker exhaustion fails fast; cooldown probe recovers', async () => {
@@ -331,5 +341,39 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
     const s = await StoredSession.findOne({ code }).select('+password').lean()
     assert.equal(s.aiStatus, 'none')
     assert.equal(await RagChunk.countDocuments({ code }), 0)
+  })
+
+  it('J. THE RENDER-FREE GUARANTEE: no providers + huge corpus ⇒ BM25 answers, never failure', async () => {
+    const code = '900010'
+    // Exact production incident shape: corpus exceeds the direct-stuff
+    // token budget AND zero embedding providers are permitted.
+    const marker = 'QUANTUM-ANCHOR unique retrievable fact. '
+    const text = 'Ordinary filler paragraph about networking. '.repeat(3600) + marker.repeat(15)
+    await freshSession(code, text) // ~162k chars ≈ 54k est-tokens → vector needed
+
+    // Render-free posture: EMPTY embedding registry (no keys, local excluded).
+    __setEmptyRegistryForTests({ threshold: 3, cooldownMs: 200 })
+    await indexSession(code)
+
+    const s = await StoredSession.findOne({ code }).lean()
+    assert.equal(s.aiStatus, 'ready', 'session MUST be ready — never failed on Render-free')
+    assert.equal(s.aiMode, 'bm25', 'degrades to BM25-only mode')
+    const chunks = await RagChunk.find({ code }).lean()
+    assert.ok(chunks.length > 100)
+    assert.ok(chunks.every(c => c.st === 'completed'), 'canonical units completed without vectors')
+    assert.ok(chunks.every(c => !c.embedding || c.embedding.length === 0))
+
+    // Query path serves grounded, cited content with ZERO embedding calls.
+    const r = await retrieve(code, 'what does QUANTUM-ANCHOR say?')
+    assert.ok(r.sources.length > 0, 'sources returned')
+    assert.ok(r.context.includes('QUANTUM-ANCHOR'), 'marker retrieved')
+
+    // Adding a provider later upgrades on next reindex (no dead end).
+    __setProvidersForTests([makeProvider('late')], { threshold: 3, cooldownMs: 200 })
+    await indexSession(code)
+    const s2 = await StoredSession.findOne({ code }).lean()
+    assert.equal(s2.aiMode, 'vector', 'upgrade path to vector works')
+    const r2 = await retrieve(code, 'quantum anchor again?')
+    assert.ok(r2.sources.length > 0)
   })
 })

@@ -10,7 +10,7 @@ import { extractFileText, isSupportedForExtraction } from './extractor'
 import { chunkPages } from './chunker'
 import { planCorpus } from './analyzer'
 import type { CorpusPlan } from './analyzer'
-import { embedWithFailover, EmbeddingUnavailableError, listRegisteredGenerations } from './embedding/orchestrator'
+import { embedWithFailover, EmbeddingUnavailableError, listRegisteredGenerations, embeddingPathAvailable } from './embedding/orchestrator'
 import { EmbeddingError } from './embedding/provider'
 import type { Chunk } from './types'
 import { dropSessionIndex } from './retriever'
@@ -294,9 +294,23 @@ async function runIndex(code: string): Promise<void> {
     // persisted under.)
     if (!plan) plan = planCorpus(totalChars, workChunks.length)
 
-    // Persist canonical chunk docs FIRST (durable work units). Direct mode
-    // completes them immediately with no vectors; vector mode leaves them
-    // 'pending' until their batch lands in Mongo (§44 ordering).
+    // Render-free guarantee: when NO embedding provider is permitted on this
+    // host (TINY tier without keys), a vector-needing corpus must NOT fail —
+    // it degrades to BM25-only retrieval over the same canonical chunks.
+    // Answers stay available; semantic recall returns when keys are added
+    // (next reindex upgrades the generation automatically).
+    let effectiveMode: 'direct' | 'bm25' | 'vector' = plan.mode
+    if (plan.mode === 'vector' && !embeddingPathAvailable()) {
+      effectiveMode = 'bm25'
+      logger.warn(
+        { code },
+        '[rag] no embedding provider permitted — indexing as BM25-only (answers stay available)',
+      )
+    }
+
+    // Persist canonical chunk docs FIRST (durable work units). Direct/BM25
+    // modes complete them immediately with no vectors; vector mode leaves
+    // them 'pending' until their batch lands in Mongo (§44 ordering).
     for (let i = 0; i < workChunks.length; i += MONGO_INSERT_BATCH) {
       const slice = workChunks.slice(i, i + MONGO_INSERT_BATCH)
       await RagChunk.collection.bulkWrite(
@@ -310,18 +324,18 @@ async function runIndex(code: string): Promise<void> {
                 name: c.name,
                 page: c.page,
                 text: c.text,
-                st: plan.mode === 'direct' ? 'completed' : 'pending',
+                st: effectiveMode === 'vector' ? 'pending' : 'completed',
                 gen: null,
               },
             },
-            upsert: true,
+          upsert: true,
           },
         })),
         { ordered: false }
       )
     }
 
-    if (plan.mode === 'vector') {
+    if (effectiveMode === 'vector') {
       // Record the resume anchor BEFORE embedding starts (Bug fix): if the
       // process dies mid-job, recovery finds fingerprint+mode+chunk-count and
       // resumes from pending units instead of re-extracting everything.
@@ -338,9 +352,10 @@ async function runIndex(code: string): Promise<void> {
       })
     }
 
-    if (plan.mode === 'direct') {
+    if (effectiveMode !== 'vector') {
+      // Direct or BM25: canonical units are already completed — finalize.
       await finalizeReady(code, {
-        mode: 'direct',
+        mode: effectiveMode,
         chunks: workChunks.length,
         files: session.files.length - failedFiles.length,
         failedFiles,
@@ -348,8 +363,10 @@ async function runIndex(code: string): Promise<void> {
         fingerprint,
       })
       logger.info(
-        { code, chars: plan.totalChars, mode: 'direct', truncated },
-        '[rag] session indexed (direct stuffing — no embeddings)',
+        { code, chars: plan.totalChars, mode: effectiveMode, truncated },
+        effectiveMode === 'direct'
+          ? '[rag] session indexed (direct stuffing — no embeddings)'
+          : '[rag] session indexed (BM25-only — no embedding provider permitted)',
       )
       return
     }
@@ -438,7 +455,7 @@ async function runIndex(code: string): Promise<void> {
 async function finalizeReady(
   code: string,
   stats: {
-    mode: 'direct' | 'vector'
+    mode: 'direct' | 'bm25' | 'vector'
     chunks: number
     files: number
     failedFiles: string[]
