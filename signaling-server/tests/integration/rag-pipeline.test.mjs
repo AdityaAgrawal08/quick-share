@@ -376,4 +376,26 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
     const r2 = await retrieve(code, 'quantum anchor again?')
     assert.ok(r2.sources.length > 0)
   })
+
+  it('K. enumeration question over BM25 session returns WIDE coverage (chapter-listing bug)', async () => {
+    const code = '900012'
+    let text = ''
+    for (let n = 1; n <= 24; n++) {
+      text += `Chapter ${n}: The Art of Persistence Number ${n}. `
+      text += 'Body filler about discipline and craft. '.repeat(110)
+    }
+    await freshSession(code, text)
+    __setEmptyRegistryForTests({ threshold: 3, cooldownMs: 200 })
+    await indexSession(code)
+    const s = await StoredSession.findOne({ code }).lean()
+    assert.equal(s.aiMode, 'bm25')
+
+    const r = await retrieve(code, 'List all the names of the chapters mentioned in the entire book.')
+    assert.ok(r.sources.length >= 20, `wide recall expected, got ${r.sources.length}`)
+    const ctxTitles = (r.context.match(/Chapter \d+/g) ?? []).map(x => x.replace('Chapter ', ''))
+    assert.ok(new Set(ctxTitles).size >= 20, `≥20 distinct chapters in context, got ${new Set(ctxTitles).size}`)
+
+    const r2 = await retrieve(code, 'persistence discipline')
+    assert.ok(r2.sources.length > 0 && r2.sources.length < r.sources.length)
+  })
 })

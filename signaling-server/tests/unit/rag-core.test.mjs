@@ -24,7 +24,7 @@ const {
 } = dist('rag/embedding/orchestrator.js')
 const { planCorpus } = dist('rag/analyzer.js')
 const { corpusFingerprint } = dist('rag/pipeline.js')
-const { cosine, reciprocalFusion } = dist('rag/retriever.js')
+const { cosine, reciprocalFusion, isEnumerativeQuery } = dist('rag/retriever.js')
 const { chunkPages } = dist('rag/chunker.js')
 
 // ── Deterministic fake providers ─────────────────────────────────────────────
@@ -198,9 +198,22 @@ describe('hybrid ranking math', () => {
     assert.deepEqual([...new Set(idxs)].sort((x, y) => x - y), [3, 7, 11].sort((x, y) => x - y))
   })
 
-  it('reciprocalFusion caps output at FUSION_KEEP entries', () => {
+  it('reciprocalFusion caps output at FUSION_KEEP entries (default) and honors keep override', () => {
     const leg = Array.from({ length: 50 }, (_, i) => ({ chunkIdx: i, rank: 50 - i }))
     assert.ok(reciprocalFusion([leg]).length <= 12)
+    assert.equal(reciprocalFusion([leg], 80).length, 50, 'enumerative keep=80 passes all through')
+  })
+
+  it('isEnumerativeQuery detects aggregation intent', () => {
+    for (const q of [
+      'Write all the names of the chapters mentioned in the entire book.',
+      'list every section heading',
+      'How many appendices are there?',
+      'count the parts',
+      'enumerate all chapter titles',
+    ]) assert.ok(isEnumerativeQuery(q), q)
+    for (const q of ['how does authentication work?', 'explain section 4', 'summarize the document'])
+      assert.ok(!isEnumerativeQuery(q), q)
   })
 })
 

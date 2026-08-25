@@ -24,9 +24,27 @@ const RRF_K = 60
 const CANDIDATES_PER_LEG = 25
 const FUSION_KEEP = 12
 const FINAL_TOP_K = 5
+// Aggregation questions ("list ALL chapters…") need WIDE recall, not top-K:
+// the LLM can only enumerate what the context actually contains.
+const ENUM_HITS_BM25 = 80
+const ENUM_CANDIDATES_PER_LEG = 60
+const ENUM_FUSION_KEEP = 80
+const ENUM_FINAL_TOP_K = 40
 // Safety margin over DIRECT_STUFF_MAX_CHARS so a planner-approved corpus is
 // never truncated here even after per-chunk prefix overhead.
 const DIRECT_BUDGET_MARGIN_CHARS = 4096
+
+/**
+ * Detects enumeration/aggregation intent — questions whose correct answer
+ * requires scanning large portions of the document rather than locating a
+ * single relevant passage ("list all chapters", "how many sections…").
+ */
+export function isEnumerativeQuery(question: string): boolean {
+  return /\b(list|enumerate|all\s+(the\s+)?(chapter|section|name|title|part)|how many|count|every|entire|whole)\b/i.test(question)
+}
+
+/** Structural headings worth surfacing wholesale on enumerative queries. */
+const STRUCTURAL_HEADING = /(chapter|section|part|appendix)\s*[\dIVXivx]+/i
 
 interface SessionIndex {
   minisearch: MiniSearch<Chunk>
@@ -160,7 +178,8 @@ export function cosine(a: Float32Array, b: Float32Array): number {
 
 // Exported for unit tests — pure ranking math.
 export function reciprocalFusion(
-  lists: { chunkIdx: number; rank: number }[][]
+  lists: { chunkIdx: number; rank: number }[][],
+  keep = FUSION_KEEP,
 ): { chunkIdx: number; rrf: number }[] {
   const scores = new Map<number, number>()
   for (const list of lists) {
@@ -171,7 +190,7 @@ export function reciprocalFusion(
   return [...scores.entries()]
     .map(([chunkIdx, rrf]) => ({ chunkIdx, rrf }))
     .sort((a, b) => b.rrf - a.rrf)
-    .slice(0, FUSION_KEEP)
+    .slice(0, keep)
 }
 
 // ── Cross-encoder reranker ───────────────────────────────────────────────────
@@ -288,20 +307,53 @@ async function ensureBm25Index(code: string): Promise<Bm25Index> {
 async function retrieveBm25Only(code: string, question: string): Promise<RetrievalResult> {
   const idx = await ensureBm25Index(code)
   if (idx.chunks.length === 0) throw new Error('no_chunks')
-  const hits = idx.minisearch.search(question).slice(0, 10)
-  const picked = hits.length
-    ? hits.map(h => ({ chunk: idx.chunks.find(c => c.idx === h.id), score: h.score }))
-        .filter((t): t is { chunk: Chunk; score: number } => Boolean(t.chunk))
-    : idx.chunks.slice(0, 5).map(c => ({ chunk: c, score: 1 })) // keyword miss ⇒ grounded head
-  const sources: Source[] = picked.map(({ chunk }, i) => ({
-    name: chunk.name,
-    fileId: chunk.fileId,
-    page: chunk.page,
-    score: Number(Math.min(1, picked[i].score).toFixed(4)),
-    snippet: chunk.text.slice(0, 240),
-  }))
-  const context = picked.map(({ chunk }, i) => `[[${i + 1}]] ${chunk.text}`).join('\n\n---\n\n')
-  return { sources, context }
+
+  const enumerative = isEnumerativeQuery(question)
+  const maxHits = enumerative ? ENUM_HITS_BM25 : 10
+  const hits = idx.minisearch.search(question).slice(0, maxHits)
+  const pickedMap = new Map<number, { chunk: Chunk; score: number }>()
+  for (const h of hits) {
+    const chunk = idx.chunks.find(c => c.idx === h.id)
+    if (chunk) pickedMap.set(chunk.idx, { chunk, score: h.score })
+  }
+  // Structural union (review §5 of enumerative gap): on "list all chapters"
+  // style questions, keyword search alone misses headings that don't repeat
+  // the query terms. Scan canonical chunks for heading patterns and merge.
+  if (enumerative) {
+    for (const c of idx.chunks) {
+      if (pickedMap.size >= ENUM_HITS_BM25 * 2) break
+      if (!pickedMap.has(c.idx) && STRUCTURAL_HEADING.test(c.text)) {
+        pickedMap.set(c.idx, { chunk: c, score: 0.5 })
+      }
+    }
+  }
+  let picked = [...pickedMap.values()]
+  if (picked.length === 0) {
+    picked = idx.chunks.slice(0, 5).map(c => ({ chunk: c, score: 1 })) // keyword miss ⇒ grounded head
+  }
+  picked.sort((a, b) => a.chunk.idx - b.chunk.idx)
+
+  // Assemble under the LLM input budget with per-source overhead reserved
+  // (same discipline as retrieveDirect).
+  const JOINER = '\n\n---\n\n'
+  const OVERHEAD = 16
+  let budget = CONFIG.DIRECT_STUFF_MAX_CHARS + DIRECT_BUDGET_MARGIN_CHARS
+  const sources: Source[] = []
+  const parts: string[] = []
+  for (const { chunk } of picked) {
+    if (budget <= OVERHEAD) break
+    const take = chunk.text.slice(0, budget - OVERHEAD)
+    budget -= take.length + OVERHEAD
+    parts.push(`[[${sources.length + 1}]] ${take}`)
+    sources.push({
+      name: chunk.name,
+      fileId: chunk.fileId,
+      page: chunk.page,
+      score: Number(Math.min(1, picked.find(p2 => p2.chunk === chunk)?.score ?? 1).toFixed(4)),
+      snippet: chunk.text.slice(0, 240),
+    })
+  }
+  return { sources, context: parts.join(JOINER) }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -322,8 +374,14 @@ export async function retrieve(code: string, question: string): Promise<Retrieva
   const expectedGen = session?.aiStats?.gen ?? ACTIVE_GENERATION_ID
   const idx = await ensureSessionIndex(code, expectedGen)
 
+  // Enumeration questions widen every leg (review: aggregation gap).
+  const enumQ = isEnumerativeQuery(question)
+  const candLeg = enumQ ? ENUM_CANDIDATES_PER_LEG : CANDIDATES_PER_LEG
+  const fusionKeep = enumQ ? ENUM_FUSION_KEEP : FUSION_KEEP
+  const finalK = enumQ ? ENUM_FINAL_TOP_K : FINAL_TOP_K
+
   // Leg 1: BM25
-  const bmHits = idx.minisearch.search(question).slice(0, CANDIDATES_PER_LEG)
+  const bmHits = idx.minisearch.search(question).slice(0, candLeg)
 
   // Leg 2: semantic — embedded with the index's own generation.
   const qvec = Float32Array.from(await embedQueryForGeneration(question, expectedGen))
@@ -332,31 +390,40 @@ export async function retrieve(code: string, question: string): Promise<Retrieva
     cosScores.push({ chunkIdx: i, score: cosine(qvec, idx.vectors[i]) })
   }
   cosScores.sort((a, b) => b.score - a.score)
-  const vecHits = cosScores.slice(0, CANDIDATES_PER_LEG)
+  const vecHits = cosScores.slice(0, candLeg)
 
   // Fuse
   const fused = reciprocalFusion([
     bmHits.map(h => ({ chunkIdx: idx.chunks.findIndex(c => c.idx === h.id), rank: h.score })),
     vecHits.map(h => ({ chunkIdx: h.chunkIdx, rank: h.score })),
-  ]).filter(f => f.chunkIdx >= 0)
+  ], fusionKeep).filter(f => f.chunkIdx >= 0)
 
   const candidates = fused.map(f => idx.chunks[f.chunkIdx])
 
   // Rerank → final top-K
   const ranked = await rerank(question, candidates)
-  const top = ranked.slice(0, FINAL_TOP_K)
+  const top = ranked.slice(0, finalK)
 
-  const sources: Source[] = top.map(({ chunk, score }) => ({
+  const JOINER = '\n\n---\n\n'
+  const OVERHEAD = 16
+  let budget = CONFIG.DIRECT_STUFF_MAX_CHARS + DIRECT_BUDGET_MARGIN_CHARS
+  const kept: typeof top = []
+  for (const t of top) {
+    if (budget <= OVERHEAD) break
+    const take = t.chunk.text.slice(0, budget - OVERHEAD)
+    budget -= take.length + OVERHEAD
+    kept.push({ ...t, chunk: { ...t.chunk, text: take } })
+  }
+  const sources: Source[] = kept.map(({ chunk, score }) => ({
     name: chunk.name,
     fileId: chunk.fileId,
     page: chunk.page,
     score: Number(score.toFixed(4)),
     snippet: chunk.text.slice(0, 240),
   }))
-
-  const context = top
+  const context = kept
     .map(({ chunk }, i) => `[[${i + 1}]] ${chunk.text}`)
-    .join('\n\n---\n\n')
+    .join(JOINER)
 
   return { sources, context }
 }
