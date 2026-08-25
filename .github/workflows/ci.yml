@@ -15,7 +15,7 @@ jobs:
       # ── Backend: install + typecheck ────────────────────────────────────
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: signaling-server/package-lock.json
       - name: Backend — install & typecheck
@@ -27,7 +27,7 @@ jobs:
       # ── Frontend: install + lint + typecheck + build ───────────────────
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: client/package-lock.json
       - name: Frontend — install, lint, build
