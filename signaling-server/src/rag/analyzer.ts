@@ -23,6 +23,11 @@ export interface CorpusPlan {
 }
 
 export function planCorpus(totalChars: number, chunkCount: number): CorpusPlan {
+  // Emergency kill switch for constrained hosts: force EVERY corpus through
+  // direct stuffing so the ONNX embedder can never load (doc §53 fallback).
+  if (CONFIG.RAG_FORCE_DIRECT) {
+    return { mode: 'direct', totalChars, chunkCount }
+  }
   const mode: IndexMode =
     totalChars > 0 && totalChars <= CONFIG.DIRECT_STUFF_MAX_CHARS ? 'direct' : 'vector'
   return { mode, totalChars, chunkCount }

@@ -131,6 +131,21 @@ describe('planCorpus (adaptive workload selection)', () => {
   it('reports totals verbatim for stats', () => {
     assert.deepEqual(planCorpus(1234, 12), { mode: 'direct', totalChars: 1234, chunkCount: 12 })
   })
+  it('RAG_FORCE_DIRECT=true forces every corpus to direct (kill switch)', () => {
+    process.env.RAG_FORCE_DIRECT = 'true'
+    // CONFIG is frozen at import — evict caches so analyzer re-reads env.
+    delete require.cache[require.resolve('../../dist/config.js')]
+    delete require.cache[require.resolve('../../dist/rag/analyzer.js')]
+    const fresh = createRequire(import.meta.url)('../../dist/rag/analyzer.js')
+    try {
+      assert.equal(fresh.planCorpus(10_000_000, 4000).mode, 'direct')
+      assert.equal(fresh.planCorpus(0, 0).mode, 'direct')
+    } finally {
+      delete process.env.RAG_FORCE_DIRECT
+      delete require.cache[require.resolve('../../dist/config.js')]
+      delete require.cache[require.resolve('../../dist/rag/analyzer.js')]
+    }
+  })
 })
 
 describe('corpusFingerprint (resume anchor)', () => {
