@@ -22,6 +22,7 @@ import { detectMemoryProfile } from './rag/memory-profile'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
 import { retrieve } from './rag/retriever'
 import { GenerationMismatchError, EmbeddingUnavailableError } from './rag/embedding/orchestrator'
+import { startHealthMonitor } from './rag/embedding/health-monitor'
 import { getAnswer, putAnswer } from './rag/answerCache'
 import { generateAnswer, llmConfigured, streamAnswer } from './rag/llm'
 
@@ -1243,6 +1244,7 @@ async function start() {
         storedModeEnabled = true
         logger.info('[server] Connected to MongoDB — Stored Mode enabled')
         if (CONFIG.RAG_ENABLED) {
+          startHealthMonitor()
           void recoverPendingIndexes()
           // Re-kick jobs whose process died mid-index.
           setInterval(() => { void recoverPendingIndexes() }, 5 * 60 * 1000).unref()
