@@ -4,6 +4,8 @@ import type { EmbeddingProvider } from './provider'
 import { classifyEmbeddingError, EmbeddingError } from './provider'
 import { CircuitBreaker } from './circuit-breaker'
 import { getLocalProvider, ACTIVE_GENERATION } from './local-provider'
+import { detectMemoryProfile } from '../memory-profile'
+import type { EmbedOptions, EmbedInputType } from './provider'
 
 // ── Embedding orchestrator (architecture doc §19/§20/§25) ───────────────────
 // Ordered provider list; pick the highest-priority provider whose circuit
@@ -41,7 +43,7 @@ export interface EmbedResult {
 }
 
 export interface Orchestrator {
-  embed(texts: string[]): Promise<EmbedResult>
+  embed(texts: string[], opts?: EmbedOptions): Promise<EmbedResult>
   embedForGeneration(text: string, generationId: string): Promise<number[]>
   health(): { id: string; state: string }[]
   generations(): string[]
@@ -55,14 +57,32 @@ interface ProviderEntry {
 export function createOrchestrator(
   providers: EmbeddingProvider[],
   deps: OrchestratorDeps = {},
+  opts: { allowEmpty?: boolean } = {},
 ): Orchestrator {
   const threshold = deps.threshold ?? CONFIG.BREAKER_THRESHOLD
   const cooldownMs = deps.cooldownMs ?? CONFIG.BREAKER_COOLDOWN_MS
-  const entries: ProviderEntry[] = providers.map(provider => ({
+  // Eligibility predicate (review §8): registered ∧ compatible ∧ permitted.
+  // The memory profile decides whether the LOCAL provider may exist on this
+  // host at all — on TINY tiers without explicit opt-in it is excluded so the
+  // ONNX model can never be allocated, guaranteeing the ≤480MB posture.
+  const profile = detectMemoryProfile()
+  const eligibleProviders = providers.filter(p => {
+    if (p.id === 'local-bge' && !profile.localEmbedderAllowed) return false
+    return true
+  })
+  const entries: ProviderEntry[] = eligibleProviders.map(provider => ({
     provider,
     breaker: new CircuitBreaker(provider.id, threshold, cooldownMs),
   }))
-  if (entries.length === 0) throw new Error('createOrchestrator requires at least one provider')
+  // An EMPTY registry is legal (TINY host without local permission and without
+  // API keys): the server boots fine for DIRECT-mode sessions; any embedding
+  // request fails closed via EmbeddingUnavailableError → jobs pause cleanly.
+  // Zero providers is ONLY legal for the env-built registry (keys absent on
+  // a TINY host): the server boots fine for DIRECT-mode sessions and any
+  // embedding request fails closed via EmbeddingUnavailableError.
+  if (providers.length === 0 && !opts.allowEmpty) {
+    throw new Error('createOrchestrator requires at least one provider')
+  }
 
   return {
     /**
@@ -70,12 +90,12 @@ export function createOrchestrator(
      * EmbeddingUnavailableError when every circuit is open) so callers can
      * branch on error classes instead of strings.
      */
-    async embed(texts: string[]): Promise<EmbedResult> {
+    async embed(texts: string[], opts: EmbedOptions = {}): Promise<EmbedResult> {
       let lastErr: EmbeddingError | null = null
       for (const entry of entries) {
         if (!entry.breaker.canPass()) continue
         try {
-          const vectors = await entry.provider.embed(texts)
+          const vectors = await entry.provider.embed(texts, opts)
           // Batch accounting (doc §43.2): partial/short responses are
           // failures, never silently "completed".
           if (!Array.isArray(vectors) || vectors.length !== texts.length) {
@@ -117,7 +137,12 @@ export function createOrchestrator(
 
     async embedForGeneration(text: string, generationId: string): Promise<number[]> {
       const entry = entries.find(e => e.provider.generationId === generationId)
-      if (!entry) throw new GenerationMismatchError(generationId, entries[0].provider.generationId)
+      if (!entry) {
+        throw new GenerationMismatchError(
+          generationId,
+          entries[0]?.provider.generationId ?? 'none-permitted',
+        )
+      }
       if (!entry.breaker.canPass()) {
         // Same generation, temporarily unhealthy — the job that would serve
         // this query cannot proceed; surface as unavailable (retryable).
@@ -126,7 +151,8 @@ export function createOrchestrator(
         )
       }
       try {
-        const [vector] = await entry.provider.embed([text])
+        const inputType: EmbedInputType = 'query'
+        const [vector] = await entry.provider.embed([text], { inputType })
         if (!Array.isArray(vector) || vector.length === 0 || vector.some(n => !Number.isFinite(n))) {
           throw new EmbeddingError('provider', 'query embedding malformed')
         }
@@ -145,8 +171,33 @@ export function createOrchestrator(
   }
 }
 
-/** Production singleton — local BGE is today's only (guaranteed) provider. */
-let defaultOrchestrator = createOrchestrator([getLocalProvider()])
+/**
+ * Build the production registry FROM ENV (review §8 eligibility starts at
+ * configuration): [COHERE_API_KEY]→cohere, [VOYAGE_API_KEY]→voyage, then the
+ * local BGE fallback — reordered by RAG_PROVIDER_ORDER. An empty external set
+ * + forbidden local ⇒ empty registry ⇒ embedding jobs pause cleanly while
+ * DIRECT-mode sessions keep working.
+ */
+function buildRegistryFromEnv(): EmbeddingProvider[] {
+  const byId: Record<string, EmbeddingProvider> = {}
+  if (CONFIG.COHERE_API_KEY) {
+    // Lazy-require to keep this module import-light for tests.
+    const { CohereProvider } = require('./providers/cohere.js')
+    byId.cohere = new CohereProvider(CONFIG.COHERE_API_KEY, fetch)
+  }
+  if (CONFIG.VOYAGE_API_KEY) {
+    const { VoyageProvider } = require('./providers/voyage.js')
+    byId.voyage = new VoyageProvider(CONFIG.VOYAGE_API_KEY, fetch)
+  }
+  byId.local = getLocalProvider()
+  return CONFIG.RAG_PROVIDER_ORDER.map(id => byId[id]).filter(Boolean)
+}
+
+let defaultOrchestrator: Orchestrator | null = null
+function getDefaultOrchestrator(): Orchestrator {
+  if (!defaultOrchestrator) defaultOrchestrator = createOrchestrator(buildRegistryFromEnv(), undefined, { allowEmpty: true })
+  return defaultOrchestrator
+}
 
 export const ACTIVE_GENERATION_ID = ACTIVE_GENERATION
 
@@ -156,20 +207,22 @@ export const ACTIVE_GENERATION_ID = ACTIVE_GENERATION
  * from server code.
  */
 export function __setProvidersForTests(providers: EmbeddingProvider[], deps?: OrchestratorDeps): void {
-  defaultOrchestrator = createOrchestrator(providers, deps)
+  defaultOrchestrator = providers.length
+    ? createOrchestrator(providers, deps)
+    : createOrchestrator(buildRegistryFromEnv(), deps, { allowEmpty: true })
 }
 
-export function embedWithFailover(texts: string[]): Promise<EmbedResult> {
-  return defaultOrchestrator.embed(texts)
+export function embedWithFailover(texts: string[], opts: EmbedOptions = {}): Promise<EmbedResult> {
+  return getDefaultOrchestrator().embed(texts, opts)
 }
 
 export function providerHealth(): { id: string; state: string }[] {
-  return defaultOrchestrator.health()
+  return getDefaultOrchestrator().health()
 }
 
 /** Generations this process can currently serve queries/indexing for. */
 export function listRegisteredGenerations(): string[] {
-  return defaultOrchestrator.generations()
+  return getDefaultOrchestrator().generations()
 }
 
 /** Embed a single query via the active provider chain. */
@@ -190,5 +243,5 @@ export function embedQueryForGeneration(
   text: string,
   expectedGeneration: string,
 ): Promise<number[]> {
-  return defaultOrchestrator.embedForGeneration(text, expectedGeneration)
+  return getDefaultOrchestrator().embedForGeneration(text, expectedGeneration)
 }
