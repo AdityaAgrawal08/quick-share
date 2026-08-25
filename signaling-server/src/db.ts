@@ -5,6 +5,10 @@ import { Readable } from 'stream'
 
 import { CONFIG } from './config'
 
+// Re-exported for tooling/tests that need the live connection handle
+// (e.g. dropping an isolated integration-test database).
+export { mongoose }
+
 let bucket: GridFSBucket | null = null
 const MONGOOSE_OPTIONS = {
   serverSelectionTimeoutMS: 5000,
@@ -356,7 +360,19 @@ export interface IStoredSession {
   burnOnRead?: boolean
   burnedAt?: Date | null // Set on first read of a burn-on-read session; blocks further reads until deletion
   aiStatus?: 'none' | 'pending' | 'ready' | 'failed'
-  aiStats?: { chunks: number; files: number; failedFiles: string[] }
+  /** How this session is queried: 'direct' = full-content stuffing,
+   *  'bm25' = keyword-only retrieval (no embedding provider available),
+   *  'vector' = hybrid retrieval. */
+  aiMode?: 'direct' | 'bm25' | 'vector'
+  aiStats?: {
+    chunks: number
+    files: number
+    failedFiles: string[]
+    mode?: 'direct' | 'bm25' | 'vector'
+    gen?: string          // embedding generation that produced the vectors
+    fingerprint?: string  // corpus fingerprint enabling resume-without-re-extraction
+    directChars?: number  // total chars when mode='direct'
+  }
 }
 
 const storedSessionSchema = new mongoose.Schema<IStoredSession>({
@@ -372,10 +388,15 @@ const storedSessionSchema = new mongoose.Schema<IStoredSession>({
   burnOnRead: { type: Boolean, default: false },
   burnedAt:   { type: Date,   default: null },
   aiStatus: { type: String, enum: ['none', 'pending', 'ready', 'failed'], default: 'none' },
+  aiMode:   { type: String, enum: ['direct', 'bm25', 'vector'], default: null },
   aiStats:  {
     chunks:      { type: Number, default: 0 },
     files:       { type: Number, default: 0 },
     failedFiles: { type: [String], default: [] },
+    mode:        { type: String, enum: ['direct', 'bm25', 'vector'], default: null },
+    gen:         { type: String, default: null },
+    fingerprint: { type: String, default: null },
+    directChars: { type: Number, default: null },
   },
   // Deletion design (do NOT add a MongoDB TTL index here):
   //   1. scheduleExpiry() Node timer deletes GridFS files, then the doc.
@@ -400,9 +421,15 @@ export interface IRagChunk {
   fileId: ObjectId
   name: string
   page: number | null
+  /** Globally unique per session (running offset across files). */
   idx: number
   text: string
-  embedding: number[]
+  /** Canonical chunk → durable work unit (doc §29–§32): stored BEFORE its
+   *  embedding exists; embedding is filled in per batch. */
+  st: 'pending' | 'completed'
+  /** Embedding generation that produced `embedding` — vector-space identity. */
+  gen: string | null
+  embedding?: number[]
 }
 
 const ragChunkSchema = new mongoose.Schema<IRagChunk>({
@@ -412,8 +439,13 @@ const ragChunkSchema = new mongoose.Schema<IRagChunk>({
   page:      { type: Number, default: null },
   idx:       { type: Number, required: true },
   text:      { type: String, required: true },
-  embedding: { type: [Number], required: true },
+  st:        { type: String, enum: ['pending', 'completed'], default: 'pending' },
+  gen:       { type: String, default: null },
+  embedding: { type: [Number], default: undefined },
 }, { collection: 'ragchunks' })
+
+// Idempotent writes (doc §45): retries/upserts key on the natural unit id.
+ragChunkSchema.index({ code: 1, idx: 1 }, { unique: true })
 
 export const RagChunk = mongoose.model<IRagChunk>('RagChunk', ragChunkSchema)
 

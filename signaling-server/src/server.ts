@@ -18,9 +18,10 @@ import { connectDB, reconnectDB, isRetryableMongoError, StoredSession, uploadFil
 
 import logger from './logger'
 import { CONFIG } from './config'
+import { detectMemoryProfile } from './rag/memory-profile'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
-import { preloadEmbedder } from './rag/embedder'
 import { retrieve } from './rag/retriever'
+import { GenerationMismatchError } from './rag/embedding/orchestrator'
 import { getAnswer, putAnswer } from './rag/answerCache'
 import { generateAnswer, llmConfigured, streamAnswer } from './rag/llm'
 
@@ -793,7 +794,7 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
       return
     }
     const session = await StoredSession.findOne({ code })
-      .select('aiStatus aiStats expiresAt burnedAt')
+      .select('aiStatus aiMode aiStats expiresAt burnedAt')
       .lean()
     if (!session) {
       res.status(404).json({ error: 'not_found' })
@@ -805,6 +806,7 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
     }
     res.json({
       aiStatus: session.aiStatus ?? 'none',
+      aiMode: session.aiMode ?? null,
       aiStats: session.aiStats ?? null,
       llmConfigured: llmConfigured(),
     })
@@ -852,12 +854,23 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     }
     if (!llmConfigured()) {
       // Retrieval works; generation needs the operator's free-tier key.
-      const { sources } = await retrieve(code, question)
-      res.status(503).json({
-        error: 'ai_not_configured',
-        message: 'Server has no GROQ_API_KEY — retrieval results only',
-        sources,
-      })
+      try {
+        const { sources } = await retrieve(code, question)
+        res.status(503).json({
+          error: 'ai_not_configured',
+          message: 'Server has no GROQ_API_KEY — retrieval results only',
+          sources,
+        })
+      } catch (err) {
+        if (err instanceof GenerationMismatchError) {
+          // Vectors predate the active embedding generation → transparent
+          // one-time rebuild, client re-polls.
+          void indexSession(code)
+          res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
+          return
+        }
+        throw err
+      }
       return
     }
 
@@ -890,7 +903,21 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
       return
     }
 
-    const { sources, context } = await retrieve(code, question)
+    let retrieval: Awaited<ReturnType<typeof retrieve>>
+    try {
+      retrieval = await retrieve(code, question)
+    } catch (err) {
+      if (err instanceof GenerationMismatchError) {
+        // Stored vectors come from a different embedding generation — never
+        // mix vector spaces (Invariant 4). Re-index transparently; the client
+        // already handles the 202 'indexing' polling loop.
+        void indexSession(code)
+        res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
+        return
+      }
+      throw err
+    }
+    const { sources, context } = retrieval
 
     // ---- Streaming mode ----
     if (wantsStream) {
@@ -1059,6 +1086,25 @@ app.get('/health', async (_req: Request, res: Response) => {
     }
   }
 
+  // Adaptive RAG posture (no secrets): tier, ceiling, provider breaker
+  // states, active generation — operators see WHY indexing behaves a way.
+  const memProfile = detectMemoryProfile()
+  let ragHealth: Record<string, unknown> | undefined
+  if (storedModeEnabled && CONFIG.RAG_ENABLED) {
+    try {
+      const { providerHealth } = await import('./rag/embedding/orchestrator.js')
+      ragHealth = {
+        tier: memProfile.tier,
+        limitMb: memProfile.limitMb,
+        workloadCeilingMb: memProfile.workloadCeilingMb,
+        localEmbedderAllowed: memProfile.localEmbedderAllowed,
+        providers: providerHealth(),
+      }
+    } catch {
+      ragHealth = { tier: memProfile.tier, providers: 'unavailable' }
+    }
+  }
+
   res.json({
     status:             mongoPing === -2 ? 'degraded' : 'ok',
     version:            '1.1.0',
@@ -1068,6 +1114,7 @@ app.get('/health', async (_req: Request, res: Response) => {
     gridfsStatus,
     activeLiveSessions: activeSessions(),
     uptime:             Math.floor(process.uptime()),
+    ...(ragHealth ? { rag: ragHealth } : {}),
   })
 })
 
@@ -1162,13 +1209,15 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 
 async function start() {
   try {
+    // Surface the adaptive memory posture on EVERY boot (first log line of
+    // the RAG subsystem — review §11: operators must see tier + ceiling).
+    detectMemoryProfile()
     if (CONFIG.MONGODB_URI) {
       try {
         await connectDB()
         storedModeEnabled = true
         logger.info('[server] Connected to MongoDB — Stored Mode enabled')
         if (CONFIG.RAG_ENABLED) {
-          void preloadEmbedder()
           void recoverPendingIndexes()
           // Re-kick jobs whose process died mid-index.
           setInterval(() => { void recoverPendingIndexes() }, 5 * 60 * 1000).unref()
