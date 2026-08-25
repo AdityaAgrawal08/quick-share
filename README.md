@@ -134,9 +134,14 @@ Environment variables:
 | `GROQ_API_KEY` | Enables AI answers (**must be set in the hosting dashboard** — `.env` is gitignored) |
 | `GROQ_MODEL` | Default `openai/gpt-oss-120b` |
 | `RAG_RERANK_ENABLED` | Leave unset on 512MB tiers (~400MB RAM). Opt-in on ≥1GB hosts |
+| `RAG_DIRECT_STUFF_CHARS` | Corpora up to this many extracted chars (default `48000`) skip embeddings — full content goes into the Groq prompt; the ONNX model never loads |
+| `RAG_RESUME_ENABLED` | Default on. After a crash/provider failure, indexing resumes from durable per-chunk work units without re-extracting files |
+| `RAG_BREAKER_THRESHOLD` / `RAG_BREAKER_COOLDOWN_MS` | Embedding-provider circuit breaker (default open after 3 failures, probe again after 30s) |
+| `RAG_EMBED_MODEL` / `RAG_EMBED_DTYPE` | Local embedder + ONNX quantization (defaults `Xenova/bge-small-en-v1.5`, `q8`) |
+| `RAG_MAX_CHUNKS` / `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` / `RAG_EMBED_BATCH` | Indexing tuning (defaults `4000` / `600` / `90` / `16`) |
 | `NODE_OPTIONS` | Recommended: `--max-old-space-size=384` — GC before container OOM |
 
-Notes: cold start downloads ~90MB ONNX weights once; boot logs warn if `GROQ_API_KEY` is missing ("retrieval-only mode").
+Notes: ONNX weights (~25MB q8) download lazily on first *vector-mode* index only — small sessions use direct stuffing and never trigger it. Boot logs warn if `GROQ_API_KEY` is missing ("retrieval-only mode"). Sessions indexed before an embedder-model change self-heal: the first AI query returns `202 indexing` once while the index transparently rebuilds.
 
 ---
 

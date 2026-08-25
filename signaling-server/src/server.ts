@@ -19,8 +19,8 @@ import { connectDB, reconnectDB, isRetryableMongoError, StoredSession, uploadFil
 import logger from './logger'
 import { CONFIG } from './config'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
-import { preloadEmbedder } from './rag/embedder'
 import { retrieve } from './rag/retriever'
+import { GenerationMismatchError } from './rag/embedding/orchestrator'
 import { getAnswer, putAnswer } from './rag/answerCache'
 import { generateAnswer, llmConfigured, streamAnswer } from './rag/llm'
 
@@ -852,12 +852,23 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     }
     if (!llmConfigured()) {
       // Retrieval works; generation needs the operator's free-tier key.
-      const { sources } = await retrieve(code, question)
-      res.status(503).json({
-        error: 'ai_not_configured',
-        message: 'Server has no GROQ_API_KEY — retrieval results only',
-        sources,
-      })
+      try {
+        const { sources } = await retrieve(code, question)
+        res.status(503).json({
+          error: 'ai_not_configured',
+          message: 'Server has no GROQ_API_KEY — retrieval results only',
+          sources,
+        })
+      } catch (err) {
+        if (err instanceof GenerationMismatchError) {
+          // Vectors predate the active embedding generation → transparent
+          // one-time rebuild, client re-polls.
+          void indexSession(code)
+          res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
+          return
+        }
+        throw err
+      }
       return
     }
 
@@ -890,7 +901,21 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
       return
     }
 
-    const { sources, context } = await retrieve(code, question)
+    let retrieval: Awaited<ReturnType<typeof retrieve>>
+    try {
+      retrieval = await retrieve(code, question)
+    } catch (err) {
+      if (err instanceof GenerationMismatchError) {
+        // Stored vectors come from a different embedding generation — never
+        // mix vector spaces (Invariant 4). Re-index transparently; the client
+        // already handles the 202 'indexing' polling loop.
+        void indexSession(code)
+        res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
+        return
+      }
+      throw err
+    }
+    const { sources, context } = retrieval
 
     // ---- Streaming mode ----
     if (wantsStream) {
@@ -1168,7 +1193,6 @@ async function start() {
         storedModeEnabled = true
         logger.info('[server] Connected to MongoDB — Stored Mode enabled')
         if (CONFIG.RAG_ENABLED) {
-          void preloadEmbedder()
           void recoverPendingIndexes()
           // Re-kick jobs whose process died mid-index.
           setInterval(() => { void recoverPendingIndexes() }, 5 * 60 * 1000).unref()
