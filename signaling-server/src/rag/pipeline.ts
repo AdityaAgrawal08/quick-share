@@ -31,6 +31,19 @@ import { dropSessionIndex } from './retriever'
 const EMBED_BATCH = Number(process.env.RAG_EMBED_BATCH ?? 16) // small batches keep ORT activation memory low on 512MB hosts
 const MONGO_INSERT_BATCH = Number(process.env.RAG_MONGO_INSERT_BATCH ?? 100)
 
+// RSS budget guard (doc Invariant 8): pause the JOB instead of letting the
+// process be OOM-killed. A pause leaves durable pending units behind, so a
+// later retry resumes cheaply; an OOM-kill takes the whole server down.
+const EMBED_MAX_RSS_MB = Number(process.env.RAG_EMBED_MAX_RSS_MB ?? 384)
+function rssOverBudget(): boolean {
+  const rssMb = process.memoryUsage().rss / 1048576
+  if (rssMb > EMBED_MAX_RSS_MB) {
+    logger.warn({ rssMb: Math.round(rssMb), budgetMb: EMBED_MAX_RSS_MB }, '[rag] RSS over embedding budget')
+    return true
+  }
+  return false
+}
+
 const inFlight = new Map<string, Promise<void>>()
 let globalJob: Promise<void> = Promise.resolve()
 
@@ -54,6 +67,15 @@ export function indexSession(code: string): Promise<void> {
 /** Free V8 heap between heavy stages when --expose-gc is enabled. */
 function releaseMemory(): void {
   if (typeof globalThis.gc === 'function') globalThis.gc()
+}
+
+/** Raised when the job must PAUSE for resource reasons — not a failure of
+ *  the corpus or provider. Durable units make the retry cheap. */
+class PipelinePausedError extends Error {
+  constructor(reason: string) {
+    super(`index job paused: ${reason}`)
+    this.name = 'PipelinePausedError'
+  }
 }
 
 /** Stable corpus fingerprint — resume only when the corpus is unchanged. */
@@ -196,6 +218,9 @@ async function runIndex(code: string): Promise<void> {
       }
 
       for (const f of session.files ?? []) {
+        // PDF/OCR parsing is the other big transient consumer — pause before
+        // starting another file if the process is already over budget.
+        if (rssOverBudget()) throw new PipelinePausedError('rss over budget during extraction')
         if (!isSupportedForExtraction(f.name, f.mimeType)) {
           failedFiles.push(f.name)
           continue
@@ -329,9 +354,14 @@ async function runIndex(code: string): Promise<void> {
     }
 
     // ── Vector path: embed in small durable batches via the orchestrator.
+    // Budget check BEFORE the first batch — this is also the point where the
+    // ONNX model would lazily load, so an already-fat process never even
+    // pays the model-load cost it cannot afford.
+    if (rssOverBudget()) throw new PipelinePausedError('rss over budget before embedding')
     let done = 0
     let servingGen: string | null = null
     for (let i = 0; i < workChunks.length; i += EMBED_BATCH) {
+      if (rssOverBudget()) throw new PipelinePausedError('rss over budget during embedding')
       const batch = workChunks.slice(i, i + EMBED_BATCH)
       const { vectors, generationId } = await embedWithFailover(batch.map(c => c.text))
       // Invariant 4 guard: a provider failover that CHANGES the embedding
@@ -389,10 +419,14 @@ async function runIndex(code: string): Promise<void> {
       mode: 'vector',
     }, '[rag] session indexed')
   } catch (err) {
-    if (err instanceof EmbeddingUnavailableError || err instanceof EmbeddingError) {
-      // Provider/circuit exhaustion: NOT a corpus problem. Completed batches
+    if (
+      err instanceof PipelinePausedError ||
+      err instanceof EmbeddingUnavailableError ||
+      err instanceof EmbeddingError
+    ) {
+      // Resource/provider pause — NOT a corpus problem. Completed batches
       // stay durable; recovery re-kicks and resumes from pending units.
-      logger.warn({ err, code }, '[rag] index paused — embedding providers unavailable')
+      logger.warn({ err, code }, '[rag] index paused')
     } else {
       logger.error({ err, code }, '[rag] index job failed')
     }
