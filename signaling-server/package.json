@@ -8,8 +8,8 @@
     "prebuild": "npm install",
     "build": "tsc",
     "start": "node dist/server.js",
-    "test": "node --test tests/unit/",
-    "test:integration": "node --test tests/integration/"
+    "test": "node --test \"tests/unit/*.test.mjs\"",
+    "test:integration": "node --test \"tests/integration/*.test.mjs\""
   },
   "keywords": [],
   "author": "",
