@@ -18,6 +18,7 @@ const SYSTEM_PROMPT = [
   '3. If the context does not contain the answer, reply exactly:',
   '   "I could not find that in the shared files." and nothing else.',
   '4. Be concise. Prefer short paragraphs or bullet lists.',
+  '5. For enumeration questions (e.g. "list all chapters/sections/names"), scan EVERY context block and list EACH matching item exactly once. Never stop early; never invent items not present in the blocks.',
 ].join('\n')
 
 export function llmConfigured(): boolean {
