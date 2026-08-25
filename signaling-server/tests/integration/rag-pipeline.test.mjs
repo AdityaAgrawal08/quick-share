@@ -46,9 +46,9 @@ const URI = withIsolatedTestDb(RAW_URI)
 // config.js already ran once (above) and froze CONFIG.MONGODB_URI to the RAW
 // uri — evict it from the CJS cache so db/pipeline re-require a fresh CONFIG
 // bound to the isolated throwaway database instead.
-// Integration tests exercise LOGIC, not the RSS budget — disable the guard
-// here (the test process itself carries mongoose+transformers overhead).
-process.env.RAG_EMBED_MAX_RSS_MB = '4096'
+// Integration tests exercise LOGIC, not the host budget — give the suite a
+// LARGE profile so the RSS ceiling guard never fires on stub workloads.
+process.env.INSTANCE_MEMORY_MB = '4096'
 process.env.MONGODB_URI = URI
 delete require.cache[require.resolve('../../dist/config.js')]
 
@@ -153,7 +153,7 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
   it('B. large corpus → vector mode with gen-stamped embeddings', async () => {
     const code = '900002'
     const marker = 'ZEBRA-MARKER unique content for retrieval. '
-    const text = 'Filler sentence about databases and caching. '.repeat(1200) + marker.repeat(20) // ~60k chars
+    const text = 'Filler sentence about databases and caching. '.repeat(3200) + marker.repeat(20) // ~153k chars ≈ 51k est-tokens > gate
     await freshSession(code, text)
     await indexSession(code)
 
@@ -175,7 +175,7 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
 
   it('C. crash resume embeds ONLY pending units; completed vectors untouched', async () => {
     const code = '900003'
-    const text = 'Resumable chunk body. '.repeat(4000) // ~88k chars → vector
+    const text = 'Resumable chunk body. '.repeat(6500) // ~143k chars → vector
     await freshSession(code, text)
     await indexSession(code)
     const before = await RagChunk.find({ code }).sort({ idx: 1 }).lean()
@@ -207,7 +207,7 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
 
   it('D. provider death mid-job → durable partials; swap heals on recovery', async () => {
     const code = '900004'
-    const text = 'Failure injection corpus line. '.repeat(2600) // ~78k chars
+    const text = 'Failure injection corpus line. '.repeat(4800) // ~148k chars → vector
     await freshSession(code, text)
 
     const flaky = makeProvider('flaky', {
@@ -248,7 +248,7 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
 
   it('E. mixed-generation vectors are refused, then self-heal', async () => {
     const code = '900005'
-    const text = 'Generation guard corpus. '.repeat(2800)
+    const text = 'Generation guard corpus. '.repeat(5600) // ~140k chars → vector
     await freshSession(code, text)
     await indexSession(code)
 
@@ -303,7 +303,7 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
   it('H. breaker exhaustion fails fast; cooldown probe recovers', async () => {
     const code = '900008'
     // Vector-sized corpus so embedding is actually exercised.
-    await freshSession(code, 'Circuit breaker corpus body. '.repeat(2400))
+    await freshSession(code, 'Circuit breaker corpus body. '.repeat(5200)) // ~135k chars → vector
     const alwaysBroken = makeProvider('broken', { failWhen: () => true })
     __setProvidersForTests([alwaysBroken], { threshold: 2, cooldownMs: 150 })
     await indexSession(code)

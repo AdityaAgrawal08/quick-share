@@ -134,7 +134,8 @@ async function runIndex(code: string): Promise<void> {
       } // zero completed units → nothing durable to keep: fresh
     }
     const resumed = resumable
-    let plan: CorpusPlan | null = resumed || rebuild ? { mode: 'vector', totalChars: 0, chunkCount: 0 } : null
+    let plan: CorpusPlan | null =
+      resumed || rebuild ? { mode: 'vector', totalChars: 0, chunkCount: 0, estimatedTokens: 0 } : null
 
     if (rebuild) {
       logger.info({ code }, '[rag] rebuilding index — generation change detected')

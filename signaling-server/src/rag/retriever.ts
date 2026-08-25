@@ -1,5 +1,4 @@
 import MiniSearch from 'minisearch'
-import { AutoTokenizer, AutoModelForSequenceClassification } from '@huggingface/transformers'
 import logger from '../logger'
 import { CONFIG } from '../config'
 import type { Chunk, Source } from './types'
@@ -177,11 +176,14 @@ let rerankerPromise: Promise<RerankerBundle> | null = null
 function getReranker(): Promise<RerankerBundle> {
   if (!rerankerPromise) {
     rerankerPromise = (async () => {
+      // LAZY import — same RAM discipline as the embedder (TINY hosts that
+      // never enable reranking must not map onnxruntime native libs).
+      const { AutoTokenizer, AutoModelForSequenceClassification } = await import('@huggingface/transformers')
       const start = Date.now()
       const tokenizer = await AutoTokenizer.from_pretrained(CONFIG.RERANK_MODEL)
       const model = await AutoModelForSequenceClassification.from_pretrained(
         CONFIG.RERANK_MODEL,
-        { dtype: 'q8' }
+        { dtype: CONFIG.EMBED_DTYPE as 'q8' }
       )
       logger.info({ ms: Date.now() - start, model: CONFIG.RERANK_MODEL }, '[rag] reranker loaded')
       return {

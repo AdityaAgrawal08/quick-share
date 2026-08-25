@@ -18,6 +18,7 @@ import { connectDB, reconnectDB, isRetryableMongoError, StoredSession, uploadFil
 
 import logger from './logger'
 import { CONFIG } from './config'
+import { detectMemoryProfile } from './rag/memory-profile'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
 import { retrieve } from './rag/retriever'
 import { GenerationMismatchError } from './rag/embedding/orchestrator'
@@ -1084,6 +1085,25 @@ app.get('/health', async (_req: Request, res: Response) => {
     }
   }
 
+  // Adaptive RAG posture (no secrets): tier, ceiling, provider breaker
+  // states, active generation — operators see WHY indexing behaves a way.
+  const memProfile = detectMemoryProfile()
+  let ragHealth: Record<string, unknown> | undefined
+  if (storedModeEnabled && CONFIG.RAG_ENABLED) {
+    try {
+      const { providerHealth } = await import('./rag/embedding/orchestrator.js')
+      ragHealth = {
+        tier: memProfile.tier,
+        limitMb: memProfile.limitMb,
+        workloadCeilingMb: memProfile.workloadCeilingMb,
+        localEmbedderAllowed: memProfile.localEmbedderAllowed,
+        providers: providerHealth(),
+      }
+    } catch {
+      ragHealth = { tier: memProfile.tier, providers: 'unavailable' }
+    }
+  }
+
   res.json({
     status:             mongoPing === -2 ? 'degraded' : 'ok',
     version:            '1.1.0',
@@ -1093,6 +1113,7 @@ app.get('/health', async (_req: Request, res: Response) => {
     gridfsStatus,
     activeLiveSessions: activeSessions(),
     uptime:             Math.floor(process.uptime()),
+    ...(ragHealth ? { rag: ragHealth } : {}),
   })
 })
 
@@ -1187,6 +1208,9 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 
 async function start() {
   try {
+    // Surface the adaptive memory posture on EVERY boot (first log line of
+    // the RAG subsystem — review §11: operators must see tier + ceiling).
+    detectMemoryProfile()
     if (CONFIG.MONGODB_URI) {
       try {
         await connectDB()
