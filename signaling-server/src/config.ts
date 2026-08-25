@@ -51,10 +51,41 @@ export const CONFIG = {
   CHUNK_SIZE_CHARS: parseInt(process.env.RAG_CHUNK_SIZE ?? '600', 10),
   CHUNK_OVERLAP_CHARS: parseInt(process.env.RAG_CHUNK_OVERLAP ?? '90', 10),
   MAX_CHUNKS_PER_SESSION: parseInt(process.env.RAG_MAX_CHUNKS ?? '4000', 10),
-  // Direct-stuffing threshold (adaptive workload selection): corpora with up
-  // to this many extracted chars skip embeddings entirely — the full content
-  // goes into the Groq prompt at query time (~48k chars ≈ 12k tokens).
-  DIRECT_STUFF_MAX_CHARS: parseInt(process.env.RAG_DIRECT_STUFF_CHARS ?? '48000', 10),
+  // ── External embedding providers (optional; local BGE remains fallback) ───
+  // Registry order defaults to [cohere → voyage → local]; override sequence:
+  RAG_PROVIDER_ORDER: (process.env.RAG_PROVIDER_ORDER ?? 'cohere,voyage,local')
+    .split(',').map(s => s.trim()).filter(Boolean),
+  COHERE_API_KEY: process.env.COHERE_API_KEY,
+  COHERE_EMBED_MODEL: process.env.COHERE_EMBED_MODEL || 'embed-v4.0',
+  COHERE_EMBED_DIM: parseInt(process.env.COHERE_EMBED_DIM ?? '1536', 10),
+  VOYAGE_API_KEY: process.env.VOYAGE_API_KEY,
+  VOYAGE_EMBED_MODEL: process.env.VOYAGE_EMBED_MODEL || 'voyage-4-lite',
+  VOYAGE_EMBED_DIM: parseInt(process.env.VOYAGE_EMBED_DIM ?? '1024', 10),
+  // Per-request timeout and min spacing between requests to one provider
+  // (basic pacing — review §9 check-then-act races).
+  PROVIDER_TIMEOUT_MS: parseInt(process.env.RAG_PROVIDER_TIMEOUT_MS ?? '20000', 10),
+  PROVIDER_MIN_INTERVAL_MS: parseInt(process.env.RAG_PROVIDER_MIN_INTERVAL_MS ?? '250', 10),
+  // ── Adaptive memory tiers (see rag/memory-profile.ts) ─────────────────────
+  // Local ONNX embedder on TINY hosts (<768MB): OFF by default — native
+  // inference allocations cannot be guaranteed under a 480MB target.
+  RAG_ALLOW_LOCAL_TINY: process.env.RAG_ALLOW_LOCAL_TINY === 'true',
+  // Disable the local embedder entirely (APIs only), any tier.
+  RAG_DISABLE_LOCAL: process.env.RAG_DISABLE_LOCAL === 'true',
+  // Direct-stuffing budget is TOKEN-based, tied to the active Groq model's
+  // context window (review §4) — never a bare character constant.
+  LLM_CONTEXT_TOKENS: parseInt(process.env.LLM_CONTEXT_TOKENS ?? '131072', 10),
+  // Portion of the window usable for stuffed content (~25%; rest = prompt +
+  // answer headroom). Conservative 3 chars/token converts to the char gate
+  // below, so we UNDER-stuff if the estimator is wrong — the safe direction.
+  DIRECT_STUFF_MAX_TOKENS: parseInt(
+    process.env.RAG_DIRECT_STUFF_MAX_TOKENS ?? String(Math.floor(131072 * 0.25)),
+    10,
+  ),
+  DIRECT_STUFF_MAX_CHARS: parseInt(
+    process.env.RAG_DIRECT_STUFF_CHARS ??
+      String(parseInt(process.env.RAG_DIRECT_STUFF_MAX_TOKENS ?? '32768', 10) * 3),
+    10,
+  ),
   // Emergency kill switch: force EVERY corpus through direct stuffing so the
   // local embedder can never load. Use on hosts without measured headroom.
   RAG_FORCE_DIRECT: process.env.RAG_FORCE_DIRECT === 'true',

@@ -5,6 +5,11 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
+// Pin planning inputs BEFORE dist/config.js is ever required. NOTE: config's
+// .env loader only fills MISSING vars, so deleting is not enough — we must
+// PRESENT an explicit override or signaling-server/.env wins.
+process.env.RAG_DIRECT_STUFF_CHARS = String(32_768 * 3)
+process.env.RAG_DIRECT_STUFF_MAX_TOKENS ||= '32768'
 const dist = p => require(`../../dist/${p}`)
 
 // ── Modules under test ───────────────────────────────────────────────────────
@@ -115,25 +120,29 @@ describe('classifyEmbeddingError (doc §26)', () => {
   })
 })
 
-describe('planCorpus (adaptive workload selection)', () => {
-  const MAX = 48_000
+describe('planCorpus (token-based adaptive planning)', () => {
+  // Defaults: DIRECT_STUFF_MAX_TOKENS = 32768, estimator = ceil(chars/3)
+  // ⇒ char gate = 32768*3 = 98304.
+  const MAXCHARS = 32_768 * 3
   it('routes tiny corpora to direct stuffing', () => {
     assert.equal(planCorpus(1, 1).mode, 'direct')
-    assert.equal(planCorpus(MAX, 80).mode, 'direct')
+    assert.equal(planCorpus(MAXCHARS, 500).mode, 'direct')
   })
-  it('routes corpora over the cap to vector mode', () => {
-    assert.equal(planCorpus(MAX + 1, 81).mode, 'vector')
+  it('routes corpora over the TOKEN budget to vector mode', () => {
+    assert.equal(planCorpus(MAXCHARS + 1, 501).mode, 'vector')
     assert.equal(planCorpus(10_000_000, 4000).mode, 'vector')
   })
   it('treats zero chars as vector (nothing to stuff)', () => {
     assert.equal(planCorpus(0, 0).mode, 'vector')
   })
-  it('reports totals verbatim for stats', () => {
-    assert.deepEqual(planCorpus(1234, 12), { mode: 'direct', totalChars: 1234, chunkCount: 12 })
+  it('reports conservative token estimates', () => {
+    assert.deepEqual(
+      planCorpus(3000, 5),
+      { mode: 'direct', totalChars: 3000, chunkCount: 5, estimatedTokens: 1000 },
+    )
   })
   it('RAG_FORCE_DIRECT=true forces every corpus to direct (kill switch)', () => {
     process.env.RAG_FORCE_DIRECT = 'true'
-    // CONFIG is frozen at import — evict caches so analyzer re-reads env.
     delete require.cache[require.resolve('../../dist/config.js')]
     delete require.cache[require.resolve('../../dist/rag/analyzer.js')]
     const fresh = createRequire(import.meta.url)('../../dist/rag/analyzer.js')

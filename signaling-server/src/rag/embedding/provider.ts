@@ -4,17 +4,27 @@
 // vectors. Every provider stamps its output with a generation id so vectors
 // from different embedding spaces can never be silently mixed (§35, §37).
 
+export type EmbedInputType = 'document' | 'query'
+
+export interface EmbedOptions {
+  /** Retrieval intent — several APIs apply asymmetric instruction prefixes. */
+  inputType?: EmbedInputType
+}
+
 export interface EmbeddingProvider {
-  /** Stable identifier, e.g. 'local-bge'. Used for breaker/health state. */
+  /** Stable identifier, e.g. 'cohere' | 'voyage' | 'local-bge'. */
   readonly id: string
   /**
-   * Identifies the exact model+config that produced vectors, e.g.
-   * 'local:Xenova/bge-small-en-v1.5'. Vectors carry this; retrieval refuses
-   * to query across generations.
+   * FULL vector-space identity: provider:model:dimension:metric — e.g.
+   * 'cohere:embed-v4.0:1536:cosine'. Vectors carry this; retrieval refuses to
+   * query across generations (doc §35, Invariant 4).
    */
   readonly generationId: string
-  /** Embed a batch of texts into L2-normalized vectors. */
-  embed(texts: string[]): Promise<number[][]>
+  /**
+   * Embed a batch of texts into L2-normalized vectors. Batches are bounded by
+   * BOTH max items and estimated tokens (token-aware splitter upstream).
+   */
+  embed(texts: string[], opts?: EmbedOptions): Promise<number[][]>
 }
 
 // ── Error classification (doc §26) ──────────────────────────────────────────
