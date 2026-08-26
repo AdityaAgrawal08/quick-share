@@ -5,6 +5,7 @@ import { classifyEmbeddingError, EmbeddingError } from './provider'
 import { CircuitBreaker } from './circuit-breaker'
 import { getLocalProvider, ACTIVE_GENERATION } from './local-provider'
 import { detectMemoryProfile } from '../memory-profile'
+import { selectOrder } from './selector'
 import type { EmbedOptions, EmbedInputType } from './provider'
 
 // ── Embedding orchestrator (architecture doc §19/§20/§25) ───────────────────
@@ -92,7 +93,18 @@ export function createOrchestrator(
      */
     async embed(texts: string[], opts: EmbedOptions = {}): Promise<EmbedResult> {
       let lastErr: EmbeddingError | null = null
-      for (const entry of entries) {
+      // Dynamic priority (selector service): health-aware ordering instead
+      // of static env order — fastest healthy provider first.
+      const ordered = selectOrder(
+        entries.map(e => ({
+          provider: e.provider,
+          breakerState: e.breaker.state() as 'healthy' | 'open' | 'half_open',
+        })),
+        { estimatedTokens: opts.estimatedTokens ?? 0 },
+      ).map(c => entries.find(e => e.provider === c.provider)!)
+        .filter(Boolean)
+
+      for (const entry of ordered.length ? ordered : entries) {
         if (!entry.breaker.canPass()) continue
         try {
           const vectors = await entry.provider.embed(texts, opts)
@@ -231,6 +243,29 @@ export function providerHealth(): { id: string; state: string }[] {
 /** Generations this process can currently serve queries/indexing for. */
 export function listRegisteredGenerations(): string[] {
   return getDefaultOrchestrator().generations()
+}
+
+/**
+ * Providers still able to take work RIGHT NOW (breaker closed or half-open
+ * probe available). When this is 0 mid-job, callers may degrade to BM25
+ * instead of pausing — the Render-free never-fail rule.
+ */
+export function usableProviderCount(): number {
+  const o = getDefaultOrchestrator()
+  // health() reports breaker states per entry in registry order.
+  return o.health().filter(h => h.state !== 'open').length
+}
+
+export interface ProviderSnapshot {
+  id: string
+  state: string
+  generationId?: string
+}
+
+export function providerSnapshots(): ProviderSnapshot[] {
+  const o = getDefaultOrchestrator()
+  const gens = o.generations()
+  return o.health().map((h, i) => ({ ...h, generationId: gens[i] }))
 }
 
 /**

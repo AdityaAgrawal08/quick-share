@@ -304,7 +304,7 @@ async function ensureBm25Index(code: string): Promise<Bm25Index> {
  * fuzziness is sacrificed. Used when a corpus exceeds the direct-stuff
  * budget AND no embedding provider is permitted/configured on the host.
  */
-async function retrieveBm25Only(code: string, question: string): Promise<RetrievalResult> {
+export async function retrieveBm25Only(code: string, question: string): Promise<RetrievalResult> {
   const idx = await ensureBm25Index(code)
   if (idx.chunks.length === 0) throw new Error('no_chunks')
 
@@ -353,14 +353,18 @@ async function retrieveBm25Only(code: string, question: string): Promise<Retriev
       snippet: chunk.text.slice(0, 240),
     })
   }
-  return { sources, context: parts.join(JOINER) }
+  return { sources, context: parts.join(JOINER), qualityTier: 'keyword' }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+export type QualityTier = 'full' | 'keyword'
+
 export interface RetrievalResult {
   sources: Source[]
   context: string
+  /** 'keyword' ⇒ BM25-only answer (no embedding provider usable). */
+  qualityTier?: QualityTier
 }
 
 export async function retrieve(code: string, question: string): Promise<RetrievalResult> {

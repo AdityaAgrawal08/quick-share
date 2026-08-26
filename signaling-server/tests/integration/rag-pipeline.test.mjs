@@ -377,6 +377,40 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
     assert.ok(r2.sources.length > 0)
   })
 
+  it('L. quota-dead provider mid-job ⇒ BM25 completion + degraded answers (never failed)', async () => {
+    const code = '900013'
+    const text = 'Exhaustion ladder corpus line. '.repeat(4800) // vector-needed size
+    await freshSession(code, text)
+
+    // Provider that ALWAYS rejects with HTTP 429 (quota class).
+    const dead = makeProvider('quota-dead', {
+      failWhen: () => true,
+      error: Object.assign(new Error('monthly quota exhausted'), { status: 429 }),
+    })
+    __setProvidersForTests([dead], { threshold: 2, cooldownMs: 60_000 })
+    await indexSession(code)
+
+    const s = await StoredSession.findOne({ code }).lean()
+    assert.equal(s.aiStatus, 'ready', 'degraded BM25 — never failed')
+    assert.equal(s.aiMode, 'bm25', 'ladder finalized as keyword mode')
+    const chunks = await RagChunk.find({ code }).lean()
+    assert.ok(chunks.length > 50)
+    assert.ok(chunks.every(c => c.st === 'completed'), 'all units completed gen-less')
+
+    // Retrieval serves the degraded session.
+    const r = await retrieve(code, 'exhaustion ladder?')
+    assert.ok(r.sources.length > 0)
+    assert.equal(r.qualityTier, 'keyword')
+
+    // Recovery: healthy provider arrives → next reindex upgrades.
+    __setProvidersForTests([makeProvider('recovered')], { threshold: 3, cooldownMs: 200 })
+    await StoredSession.updateOne({ code }, { $set: { aiStatus: 'failed' } })
+    await indexSession(code)
+    const s2 = await StoredSession.findOne({ code }).lean()
+    assert.equal(s2.aiMode, 'vector', 'upgrade after key recovery works')
+    assert.equal(s2.aiStats.gen, 'stub:v1')
+  })
+
   it('K. enumeration question over BM25 session returns WIDE coverage (chapter-listing bug)', async () => {
     const code = '900012'
     let text = ''

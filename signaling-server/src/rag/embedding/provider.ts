@@ -9,6 +9,8 @@ export type EmbedInputType = 'document' | 'query'
 export interface EmbedOptions {
   /** Retrieval intent — several APIs apply asymmetric instruction prefixes. */
   inputType?: EmbedInputType
+  /** Conservative token estimate for THIS call — feeds health-aware selection. */
+  estimatedTokens?: number
 }
 
 export interface EmbeddingProvider {
