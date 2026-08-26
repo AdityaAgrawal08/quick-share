@@ -10,6 +10,7 @@ import {
 import { extractFileText, isSupportedForExtraction } from './extractor'
 import { chunkPages } from './chunker'
 import { planCorpus } from './analyzer'
+import { analyzeFile } from './analyzer/file-analyzer'
 import type { CorpusPlan } from './analyzer'
 import { embedWithFailover, EmbeddingUnavailableError, listRegisteredGenerations, embeddingPathAvailable, usableProviderCount } from './embedding/orchestrator'
 import { EmbeddingError } from './embedding/provider'
@@ -238,6 +239,12 @@ async function runIndex(code: string): Promise<void> {
         try {
           buffer = await readGridFile(f.gridfsId)
           const doc = await extractFileText(f.name, f.mimeType, buffer)
+          const fa = analyzeFile({ name: f.name, mimeType: f.mimeType, sizeBytes: f.size ?? 0, doc })
+          if (fa.notice) logger.info({ code, file: f.name, notice: fa.notice }, '[rag] file analysis')
+          if (fa.requiresOcr && doc.pages.length === 0 && !doc.error) {
+            failedFiles.push(`${f.name} (${fa.notice ?? 'requires OCR'})`)
+            continue
+          }
           if (doc.error && doc.pages.length === 0) {
             failedFiles.push(f.name)
             continue
@@ -389,7 +396,7 @@ async function runIndex(code: string): Promise<void> {
     for (let i = 0; i < workChunks.length; i += EMBED_BATCH) {
       if (rssOverBudget()) throw new PipelinePausedError('rss over budget during embedding')
       const batch = workChunks.slice(i, i + EMBED_BATCH)
-      const { vectors, generationId } = await embedWithFailover(batch.map(c => c.text))
+      const { vectors, generationId } = await embedWithFailover(batch.map(c => c.text), { estimatedTokens: batch.reduce((n, c2) => n + Math.ceil(c2.text.length / 3), 0) })
       // Invariant 4 guard: a provider failover that CHANGES the embedding
       // space mid-job is a model switch (doc §34) — never mix silently.
       // Abort; durable completed batches keep their single generation and

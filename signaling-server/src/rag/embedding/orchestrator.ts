@@ -100,7 +100,7 @@ export function createOrchestrator(
           provider: e.provider,
           breakerState: e.breaker.state() as 'healthy' | 'open' | 'half_open',
         })),
-        { estimatedTokens: 0 },
+        { estimatedTokens: opts.estimatedTokens ?? 0 },
       ).map(c => entries.find(e => e.provider === c.provider)!)
         .filter(Boolean)
 

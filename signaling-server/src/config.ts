@@ -71,6 +71,14 @@ export const CONFIG = {
   RAG_ALLOW_LOCAL_TINY: process.env.RAG_ALLOW_LOCAL_TINY === 'true',
   // Disable the local embedder entirely (APIs only), any tier.
   RAG_DISABLE_LOCAL: process.env.RAG_DISABLE_LOCAL === 'true',
+  // ── Content analysis / OCR (P2) ─────────────────────────────────────────
+  // Image-file OCR via tesseract.js. OFF by default: OCR allocates 120–200MB
+  // transiently (WASM runtime + language data), which cannot be guaranteed
+  // under a 480MB target — TINY hosts keep it off unless explicitly enabled,
+  // and every page is RSS-guarded before recognition starts.
+  RAG_OCR_ENABLED: process.env.RAG_OCR_ENABLED === 'true',
+  RAG_OCR_LANG: process.env.RAG_OCR_LANG || 'eng',
+  RAG_OCR_MAX_BYTES: parseInt(process.env.RAG_OCR_MAX_BYTES ?? String(5 * 1024 * 1024), 10),
   // Direct-stuffing budget is TOKEN-based, tied to the active Groq model's
   // context window (review §4) — never a bare character constant.
   LLM_CONTEXT_TOKENS: parseInt(process.env.LLM_CONTEXT_TOKENS ?? '131072', 10),

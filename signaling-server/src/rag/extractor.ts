@@ -2,15 +2,22 @@ import { extractText, getDocumentProxy } from 'unpdf'
 import mammoth from 'mammoth'
 import * as XLSX from 'xlsx'
 import logger from '../logger'
+import { CONFIG } from '../config'
+import { detectMemoryProfile } from './memory-profile'
 import type { ExtractedDoc, ExtractedPage } from './types'
 
 // ── Text extraction ──────────────────────────────────────────────────────────
 // Dispatches on MIME type / extension and returns page-structured text.
-// Scope note (v1): images and scanned PDFs are NOT OCR'd — a file with no
-// text layer yields an empty doc, which the pipeline reports honestly.
+// Image files are OCR'd via tesseract.js when RAG_OCR_ENABLED is set — and
+// only on hosts whose memory profile allows it (the WASM runtime allocates
+// 120–200MB transiently, so TINY tiers keep this off: review §5). Scanned
+// PDFs (image-only pages) are DETECTED but not rasterized — unpdf has no
+// renderer; the pipeline surfaces an honest notice instead.
 //
 // Every extractor is wrapped so one bad file can never fail the whole
 // session index — the caller records per-file errors instead.
+
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp'])
 
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'markdown', 'json', 'xml', 'yml', 'yaml', 'csv', 'log',
@@ -30,7 +37,43 @@ export function isSupportedForExtraction(name: string, mimeType: string): boolea
   if (['docx'].includes(ext) || mimeType.includes('wordprocessingml')) return true
   if (['xlsx', 'xls', 'xlsm'].includes(ext) || mimeType.includes('spreadsheetml') || mimeType === 'application/vnd.ms-excel') return true
   if (TEXT_EXTENSIONS.has(ext)) return true
-  return mimeType.startsWith('text/')
+  if (mimeType.startsWith('text/')) return true
+  if (
+    CONFIG.RAG_OCR_ENABLED &&
+    detectMemoryProfile().workloadCeilingMb >= 300 && // OCR needs real headroom
+    (mimeType.startsWith('image/') || IMAGE_EXTENSIONS.has(ext))
+  ) {
+    return true
+  }
+  return false
+}
+
+/** OCR a single image buffer via tesseract.js (lazy import, RSS-guarded). */
+async function extractImageOcr(buffer: Buffer): Promise<ExtractedDoc> {
+  const profile = detectMemoryProfile()
+  if (!CONFIG.RAG_OCR_ENABLED || profile.workloadCeilingMb < 300) {
+    throw new Error('ocr_disabled_for_host')
+  }
+  if (buffer.length > CONFIG.RAG_OCR_MAX_BYTES) {
+    throw new Error(`ocr_input_too_large:${buffer.length}`)
+  }
+  const rssMb = process.memoryUsage().rss / 1048576
+  if (rssMb + 200 > profile.workloadCeilingMb) {
+    throw new Error(`ocr_rss_headroom_exceeded:${Math.round(rssMb)}MB`)
+  }
+  const start = Date.now()
+  const { createWorker } = await import('tesseract.js')
+  const worker = await createWorker(CONFIG.RAG_OCR_LANG)
+  try {
+    const { data } = await worker.recognize(buffer)
+    logger.info({ ms: Date.now() - start, chars: data.text.length }, '[rag] ocr image extracted')
+    return {
+      pages: [{ page: 1, text: (data.text ?? '').trim() }],
+      ...(data.text ? {} : { error: 'ocr_empty_result' }),
+    }
+  } finally {
+    await worker.terminate().catch(() => {})
+  }
 }
 
 async function extractPdf(buffer: Buffer): Promise<ExtractedDoc> {
@@ -80,6 +123,7 @@ export async function extractFileText(name: string, mimeType: string, buffer: Bu
     if (ext === 'docx' || mimeType.includes('wordprocessingml')) return await extractDocx(buffer)
     if (['xlsx', 'xls', 'xlsm'].includes(ext) || mimeType.includes('spreadsheetml')) return await extractXlsx(buffer)
     if (TEXT_EXTENSIONS.has(ext) || mimeType.startsWith('text/')) return extractPlainText(buffer)
+    if (mimeType.startsWith('image/') || IMAGE_EXTENSIONS.has(ext)) return await extractImageOcr(buffer)
     return { pages: [], error: `unsupported type: ${mimeType || ext || 'unknown'}` }
   } catch (err) {
     logger.warn({ name, mimeType, err }, '[rag] extraction failed for file')
