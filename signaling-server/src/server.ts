@@ -1119,12 +1119,20 @@ app.get('/health', async (_req: Request, res: Response) => {
   if (storedModeEnabled && CONFIG.RAG_ENABLED) {
     try {
       const { providerHealth } = await import('./rag/embedding/orchestrator.js')
+      const { runHealthCheck } = await import('./rag/embedding/health-monitor.js')
+      const monitored = await runHealthCheck().catch(() => [])
       ragHealth = {
         tier: memProfile.tier,
         limitMb: memProfile.limitMb,
         workloadCeilingMb: memProfile.workloadCeilingMb,
         localEmbedderAllowed: memProfile.localEmbedderAllowed,
         providers: providerHealth(),
+        monitored: monitored.map(m => ({
+          id: m.providerId,
+          generationId: m.generationId || undefined,
+          state: m.state,
+          discontinued: m.discontinued || undefined,
+        })),
       }
     } catch {
       ragHealth = { tier: memProfile.tier, providers: 'unavailable' }
