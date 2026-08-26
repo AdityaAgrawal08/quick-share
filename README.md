@@ -107,6 +107,36 @@ rm -rf .evalbuild
 
 ---
 
+## 🧠 Adaptive AI services (memory-aware RAG)
+
+The AI layer **detects the memory of the machine it deploys to** (cgroup limit at boot) and adapts automatically:
+
+| Tier | Detected | Behaviour |
+|---|---|---|
+| **TINY** | <768 MB (Render free = 512) | Local ONNX embedder **excluded** — small/medium corpora answer via full-content stuffing, large ones via BM25 keywords. OCR off. Peak ≤ ~200MB measured. |
+| **STANDARD** | ≤2048 MB | + API-first embeddings, local BGE fallback, image OCR allowed |
+| **LARGE** | >2048 MB | + cross-encoder reranker eligible |
+
+### Never-fail ladder (in order)
+```text
+1. Direct stuffing      corpus fits the Groq window (~75% of context tokens)
+2. Embedding providers  Cohere → Voyage → local BGE   (circuit breakers,
+                        quota cooldowns, health-aware ordering per call)
+3. BM25 keyword mode    every provider down/exhausted ⇒ session still answers
+        └─ flagged degraded:true · qualityTier:'keyword' · UI shows notice
+```
+`aiStatus:'failed'` now means a genuine bug — resource/provider problems degrade instead.
+
+Enumeration questions (*"list all chapters"*) trigger wide-recall: up to 80 blocks plus a structural heading scan (`Chapter N`, `Appendix…`), assembled under the LLM token budget.
+
+### Provider keys (all optional)
+`COHERE_API_KEY` · `VOYAGE_API_KEY` → registry order via `RAG_PROVIDER_ORDER` (default `cohere,voyage,local`). Health monitor snapshots breaker states to Mongo every 60s (survives restarts); `/health` exposes `{tier, ceilingMb, providers[], monitored[]}`.
+
+### Content analysis & OCR
+Every upload is classified (kind, scanned-page ratio, token estimate, workload tier). Image files (`png/jpg/webp/bmp`) are OCR'd via tesseract.js **only when** `RAG_OCR_ENABLED=true` *and* the host has ≥300MB workload ceiling — TINY hosts get an honest notice instead. Scanned (image-only) PDFs are detected and reported; rasterizing them needs a larger instance.
+
+---
+
 ## 🚢 Production Deployment
 
 ### 1. Frontend (Cloudflare Pages)
@@ -154,8 +184,8 @@ Notes: ONNX weights (~25MB q8) download lazily on first *vector-mode* index only
 | `GET /retrieve/:code` | honors burn-on-read & expiry |
 | `GET /file/:fileId/:token` | token-gated stream |
 | `POST /session` · WS join | live P2P (password mandatory) |
-| `GET /ai/status/:code` | `{aiStatus, llmConfigured}` |
-| `POST /ai/query/:code` | `{question}` → `{answer, refused, sources[]}` |
+| `GET /ai/status/:code` | `{aiStatus, aiMode, qualityTier, llmConfigured}` |
+| `POST /ai/query/:code` | `{question}` → `{answer, refused, sources[]}` · degraded answers carry `degraded:true, qualityTier:'keyword', notice` |
 | `GET /ice-servers` | cached STUN/TURN |
 | `GET /health`, `GET /stats` | ops visibility (`/stats` needs `STATS_KEY`) |
 
@@ -166,7 +196,8 @@ Notes: ONNX weights (~25MB q8) download lazily on first *vector-mode* index only
 | `AI answering needs the operator to configure GROQ_API_KEY` | Key missing in **hosting dashboard** env (gitignored `.env` doesn't deploy) |
 | `AI is rate-limited…` | Free-tier quota or per-IP limiter — wait/retry |
 | `This session has expired and was cleaned up.` | TTL passed (default 1h, max 10h) — publish again |
-| `Indexing failed` | Check logs; re-publish retries. Unsupported binaries are skipped, not fatal |
+| `Indexing failed` | Genuine bug — check logs. Provider/quota exhaustion **degrades to keyword mode instead** (`aiMode:'bm25'`); re-publish after adding a key to upgrade |
+| Big book answers only some chapters | Enumeration questions now trigger wide recall (80 blocks + heading scan). Still short? The OCR notice in logs means scanned pages were skipped |
 | CORS errors in browser | Client origin must be listed in `ALLOWED_ORIGINS` (dev ports pinned: client 4000, server 3002) |
 
 ---
