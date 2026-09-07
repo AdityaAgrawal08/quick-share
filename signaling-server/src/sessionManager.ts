@@ -1,10 +1,10 @@
 import { WebSocket } from 'ws'
 import { Session, Peer, PeerRole, SignalMessage } from './types'
-import { randomInt, randomUUID } from 'crypto'
+import { randomUUID } from 'crypto'
 import logger from './logger'
+import { generateShareCode } from './shareCode'
 
 const sessions = new Map<string, Session>()
-const CODE_LENGTH = 6
 const MAX_ATTEMPTS = 20
 
 // FIX 7: Idle timeout — destroy sessions where publisher never joins.
@@ -16,13 +16,9 @@ const IDLE_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
 // thousands of RTCPeerConnections simultaneously (DoS / OOM).
 const MAX_RECIPIENTS_PER_SESSION = 50
 
-function generateCode(): string {
-  return randomInt(0, 1_000_000).toString().padStart(CODE_LENGTH, '0')
-}
-
 function generateUniqueCode(): string {
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    const code = generateCode()
+    const code = generateShareCode()
     if (!sessions.has(code)) return code
   }
   throw new Error('Failed to generate unique session code')

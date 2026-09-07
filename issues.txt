@@ -1,0 +1,231 @@
+Executive Summary
+
+  The backend is not safe to deploy as-is. I found multiple remotely exploitable high-severity issues in the public attack surface, plus a
+  backend dependency tree that still contains several advisories. The most serious practical paths are: brute-forcing the 6-digit session
+  namespace to read open stored sessions, crashing the WebSocket relay with known ws parser bugs, and using crafted uploads/spreadsheets to
+  take down or corrupt the server during automatic indexing.
+
+  I audited the HTTP APIs, WebSocket signaling, file upload/streaming, RAG indexing/retrieval, client-side preview/decryption logic, config/env
+  handling, and CI. The frontend dependency tree was clean under npm audit; the backend tree was not.
+
+  Critical Findings
+
+  None confirmed.
+
+  High Findings
+
+  [High] 6-digit session codes make open stored sessions brute-forceable
+
+  - Location: signaling-server/src/sessionManager.ts:19, signaling-server/src/server.ts:320, signaling-server/src/server.ts:622, signaling-
+    server/src/server.ts:787
+
+  - CWE: CWE-331
+  - Attack surface: GET /retrieve/:code, GET /ai/status/:code, POST /ai/query/:code
+  - Root cause: The stored-session secret is only a 6-digit code space, and open stored sessions have no second factor.
+  - Exploit path: Enumerate the 1,000,000 possible codes; use /retrieve or /ai/status to distinguish valid codes; once a code hits, read the
+    session body and file metadata, then download files with the returned tokens.
+
+  - Preconditions: A stored session exists in open mode. No authentication is required.
+  - Impact: Remote disclosure of open-session text and files, plus access to AI query results and file download tokens.
+  - Why existing protections fail: Per-IP rate limits and artificial delays slow one source, but they do not defend against distributed probing
+    or proxy/IP spoofing.
+
+  - Recommended fix: Replace the 6-digit namespace with an unguessable token, or add a second unguessable join secret separate from the share
+    code. Add per-code throttling and explicit anti-enumeration responses.
+
+  - Regression risks: Shared-code UX and QR/manual entry flows will need a longer token or a two-part invite.
+  - Confidence: High
+
+  [High] Public WebSocket signaling is exposed to known ws memory-exhaustion DoS bugs
+
+  - Location: signaling-server/package.json:36, signaling-server/src/server.ts:1155, signaling-server/src/relay.ts:112
+  - CWE: CWE-400
+  - Attack surface: WebSocket upgrade and message parsing for live sessions
+  - Root cause: The app uses ws 8.19.0 on an unauthenticated public socket; the installed version is flagged for memory exhaustion from tiny
+    fragments/data chunks.
+
+  - Exploit path: Connect to the WebSocket endpoint and send crafted fragmented frames. The library-level parser is hit before the app’s 64 KB
+    message guard runs.
+
+  - Preconditions: Remote network access to the signaling server.
+  - Impact: Process memory growth, service crash, or forced restarts; live P2P sessions fail.
+  - Why existing protections fail: The app-layer message-size check happens after ws has already parsed the frames.
+  - Recommended fix: Upgrade ws to a release that fixes the advisory (>= 8.21.0 is the safe target), and add integration tests that fuzz
+    fragmented/oversized frames.
+
+  - Regression risks: WebSocket behavior may shift slightly on reconnect/error handling; test live session joins and ICE relay flows after
+    upgrade.
+
+  - Confidence: High
+
+  [High] Public multipart upload endpoints are vulnerable to multer DoS issues
+
+  - Location: signaling-server/package.json:31, signaling-server/src/server.ts:189, signaling-server/src/server.ts:352
+  - CWE: CWE-400
+  - Attack surface: POST /publish and PATCH /publish/:code
+  - Root cause: The server uses multer.memoryStorage() on public upload routes, and the installed multer 2.1.1 is flagged for multipart parser
+    DoS conditions.
+
+  - Exploit path: Send crafted multipart bodies with deeply nested field names, or abuse aborted-upload cleanup paths, to force parser CPU/
+    memory consumption before business logic runs.
+
+  - Preconditions: Remote access to the public upload endpoint. No auth is required for open stored sessions.
+  - Impact: High CPU/memory usage, request queue starvation, or process termination.
+  - Why existing protections fail: File-count and file-size limits do not stop parser-complexity attacks that happen before those checks
+    matter.
+
+  - Recommended fix: Upgrade multer to a fixed release (>= 2.2.0), keep multipart handling isolated, and add regression tests for nested-field
+    and abort cases.
+
+  - Regression risks: Multipart edge cases may parse differently; validate current upload forms and browser submissions.
+  - Confidence: High
+
+  [High] Crafted XLSX uploads can crash or corrupt the server during automatic indexing
+
+  - Location: signaling-server/package.json:37, signaling-server/src/rag/extractor.ts:61, signaling-server/src/rag/extractor.ts:81, signaling-
+    server/src/rag/pipeline.ts:229
+
+  - CWE: CWE-400, CWE-1321
+  - Attack surface: Stored uploads that end up in the RAG indexer
+  - Root cause: The server accepts .xlsx/.xls/.xlsm and feeds them directly to XLSX.read(buffer, { type: 'buffer' }) on the indexing path.
+  - Exploit path: Upload a malicious spreadsheet into a stored session. The publish flow stores it, then indexing automatically opens it and
+    walks sheets/cells. The installed xlsx 0.18.5 is flagged for prototype pollution and ReDoS.
+
+  - Preconditions: Ability to upload a spreadsheet to stored mode. No authentication required for open sessions.
+  - Impact: Server-side crash, event-loop blockage, or polluted in-memory state during extraction/indexing.
+  - Why existing protections fail: The file-size cap does not protect the parser from malicious workbook structure.
+  - Recommended fix: Upgrade xlsx to a fixed release (>= 0.20.2 covers the advisory set), and consider isolating spreadsheet parsing in a
+    separate worker/process.
+
+  - Regression risks: Some malformed-but-tolerated spreadsheets may stop indexing; add corpus tests for representative office files.
+  - Confidence: High
+
+  Medium / Low Findings
+
+  [Medium] IP-based rate limiting is not a stable security boundary here
+
+  - Location: signaling-server/src/server.ts:202, signaling-server/src/server.ts:249, signaling-server/src/server.ts:1135, signaling-server/
+    package.json:27
+
+  - CWE: CWE-290 / CWE-345 style trust-boundary issue
+  - Attack surface: All rate-limited HTTP routes
+  - Root cause: The app unconditionally trusts one proxy hop and relies on IP-derived throttling, while the installed express-rate-limit tree
+    pulls a vulnerable ip-address version.
+
+  - Exploit path: In a deployment where the proxy chain does not match the code’s assumption, or where the IP parser bug is reachable, an
+    attacker can rotate/spoof perceived client IPs and keep hammering the public endpoints.
+
+  - Preconditions: Public deployment plus either a misfit proxy topology or an attacker-controlled forwarded-address chain.
+  - Impact: Brute-force and enumeration defenses on /retrieve, /ai/query, /session, and upload routes become much weaker.
+  - Why existing protections fail: The code treats rate limiting as a security control, but the keying assumption is deployment-dependent and
+    the dependency stack is advisory-flagged.
+
+  - Recommended fix: Make proxy trust explicit per environment, verify rate-limit keying under the actual edge topology, and upgrade express-
+    rate-limit/ip-address together.
+
+  - Regression risks: If the proxy chain is misconfigured today, tightening it may suddenly change observed client IPs and throttle behavior.
+  - Confidence: Medium
+
+  [Medium] Previewing uploaded HTML/SVG/JS content can execute attacker-controlled script in a blob-backed tab
+
+  - Location: client/src/lib/mime.ts:19, client/src/lib/mime.ts:28, client/src/App.tsx:134, client/src/App.tsx:565, client/src/App.tsx:1233
+  - CWE: CWE-79
+  - Attack surface: Recipient clicks View on a file from a stored or live session
+  - Root cause: The UI deliberately maps .html, .svg, and .js to active MIME types and opens them in a new tab via blob: URLs.
+  - Exploit path: An attacker shares a malicious HTML/SVG file. The recipient clicks View. The browser renders active content, which can run
+    script in the blob document context.
+
+  - Preconditions: The victim must open the file preview. This is user-triggered, but it is a normal action in the app.
+  - Impact: Arbitrary JavaScript execution in the preview tab’s context; today the impact is bounded by window.opener = null and the absence of
+    cookies, but it is still a real script-execution surface.
+
+  - Why existing protections fail: The download endpoint is protected, but the client-side preview bypasses that protection by rehydrating file
+    content into an active browser document.
+
+  - Recommended fix: Do not preview active content from untrusted sessions as same-origin blob HTML/SVG. Force download, or sandbox previews in
+    an isolated origin/iframe with a restricted CSP.
+
+  - Regression risks: Inline previews for HTML/SVG/JS will disappear or become sandboxed; that is the expected tradeoff.
+  - Confidence: Medium
+
+  [Low] Health and error paths leak operational details
+
+  - Location: signaling-server/src/server.ts:1066, signaling-server/src/server.ts:1108, signaling-server/src/server.ts:1195, signaling-server/
+    src/server.ts:443, signaling-server/src/server.ts:699
+
+  - CWE: CWE-209 / CWE-200
+  - Attack surface: Unauthenticated /health, plus error responses from publish/retrieve
+  - Root cause: /health exposes storage state, live-session counts, and RAG provider/memory posture; route-level catch blocks return raw
+    err.message.
+
+  - Exploit path: Probe /health to fingerprint the deployment, then induce upload/retrieve failures to collect backend exception text.
+  - Preconditions: None beyond network access.
+  - Impact: Reconnaissance and minor information disclosure. This does not directly compromise content, but it helps an attacker tune follow-on
+    attacks.
+
+  - Why existing protections fail: These endpoints are intentionally public and return more detail than is needed for unauthenticated clients.
+  - Recommended fix: Keep /health minimal for public use, move richer diagnostics behind auth, and return generic route errors while logging
+    the full exception server-side only.
+
+  - Regression risks: Monitoring dashboards that rely on the richer payload will need an authenticated replacement.
+  - Confidence: High
+
+  Likely Issues Requiring Verification
+
+  npm audit on the backend tree reported additional advisories in mongoose, body-parser, qs, and the @huggingface/transformers / onnxruntime-
+  node / sharp stack. I did not find a clear attacker-controlled path that makes those advisories exploitable in the current code, so I am not
+  counting them as confirmed app vulnerabilities. They still need cleanup:
+
+  - mongoose 9.3.1 is below the advisory-fixed 9.7.2, but your current Mongoose usage does not accept arbitrary dotted update paths from
+    clients.
+
+  - body-parser / qs advisories are present in the dependency tree, but the app mostly uses fixed JSON/multipart forms and I did not trace a
+    reachable exploit path.
+
+  - The ML stack advisories are real in the installed tree, but the remote trigger is weaker because model loading is operator-controlled and
+    only happens on AI/vector paths.
+
+  Attack Chains
+
+  Spoofed/bypassed client IP → rate-limit evasion → 6-digit code brute force → open session disclosure
+
+  - Entry point: any public rate-limited HTTP route
+  - Vulnerability A: proxy/IP trust is deployment-dependent and the rate-limit stack is advisory-flagged
+  - Privilege/state transition: attacker keeps requests in the “fresh IP” bucket
+  - Vulnerability B: 6-digit session codes
+  - Final impact: open stored sessions can be enumerated and read at scale
+
+  Recommended Changes
+
+  1. Immediate security fixes
+      - Replace 6-digit share codes with unguessable tokens, or add a second secret.
+      - Upgrade ws, multer, and xlsx before the next deploy.
+      - Remove same-origin preview for active file types; sandbox or force download instead.
+      - Make proxy trust explicit per deployment and verify rate limiting against the real edge topology.
+
+  2. Architectural changes
+      - Separate “share code” from “authorization secret” so code guessing alone is never enough.
+      - Put untrusted parsing work in worker processes or a separate service.
+      - Treat rate limiting as defense-in-depth, not as the only gate protecting public endpoints.
+
+  3. Hardening
+      - Keep /health and /stats minimal unless authenticated.
+      - Return generic route errors; keep internal exception text in logs.
+      - Remove or tightly gate MONGODB_TLS_INSECURE.
+
+  4. Dependency / configuration changes
+      - Re-run npm audit after upgrading the backend tree and verify the report is clean.
+      - Pin GitHub Actions by commit SHA instead of moving tags.
+      - Rotate the live credentials currently present in the ignored signaling-server/.env on this checkout.
+
+  5. Defense in depth
+      - Add fuzz tests for multipart parsing, WebSocket fragmentation, and spreadsheet parsing.
+      - Add a test that rejects active-content preview for untrusted sessions.
+      - Add a regression test that the share-code namespace is not trivially enumerable.
+
+  Coverage Notes
+
+  I inspected the main HTTP routes, WebSocket relay/session state machine, upload and download handling, RAG extraction/indexing/retrieval,
+  client-side preview/decryption logic, environment/config loading, and CI workflow. I could not conclusively audit the actual production proxy
+  chain from the repo alone, so the IP/rate-limit finding depends on deployment topology as described above. I also verified the backend
+  dependency tree with npm audit; the frontend tree was clean.

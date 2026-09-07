@@ -58,6 +58,16 @@ const EXT_TO_MIME: Record<string, string> = {
 
 const GENERIC_TYPES = new Set(['', 'application/octet-stream', 'binary/octet-stream'])
 
+// Blob URLs inherit this application's origin. Only preview types that cannot
+// execute script in a navigation context; all other files remain downloadable.
+const SAFE_PREVIEW_TYPES = new Set([
+  'application/pdf',
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/x-icon', 'image/avif',
+  'text/plain', 'text/markdown', 'text/csv', 'application/json',
+  'video/mp4', 'video/webm', 'video/quicktime', 'video/x-matroska',
+  'audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/flac', 'audio/mp4',
+])
+
 /**
  * Prefer a meaningful declared type; otherwise infer from the file extension.
  */
@@ -68,4 +78,8 @@ export function guessMime(name: string, declared?: string): string {
   if (dot === -1) return 'application/octet-stream'
   const ext = name.slice(dot + 1).toLowerCase()
   return EXT_TO_MIME[ext] ?? 'application/octet-stream'
+}
+
+export function isSafePreviewMime(mimeType: string): boolean {
+  return SAFE_PREVIEW_TYPES.has(mimeType.trim().toLowerCase())
 }

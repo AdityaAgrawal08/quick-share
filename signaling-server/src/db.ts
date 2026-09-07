@@ -376,7 +376,7 @@ export interface IStoredSession {
 }
 
 const storedSessionSchema = new mongoose.Schema<IStoredSession>({
-  code:      { type: String, required: true, unique: true, index: true },
+  code:      { type: String, required: true, unique: true, index: true, match: /^[A-HJ-NP-Z2-9]{16}$/ },
   text:      { type: String, default: '' },
   files:     [{
     name:     String,

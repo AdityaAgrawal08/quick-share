@@ -2,6 +2,15 @@ import path from 'path'
 import fs from 'fs'
 import logger from './logger'
 
+function parseTrustProxyHops(value: string | undefined): number {
+  if (!value) return 0
+  if (!/^\d+$/.test(value)) {
+    logger.warn('Invalid TRUST_PROXY_HOPS; refusing to trust forwarded headers')
+    return 0
+  }
+  return Math.min(Number(value), 10)
+}
+
 // Load .env manually if not handled by external runner
 const envPath = path.resolve(__dirname, '../.env')
 if (fs.existsSync(envPath)) {
@@ -32,6 +41,9 @@ export const CONFIG = {
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
   : [],
+  // Do not trust X-Forwarded-* headers unless an operator explicitly declares
+  // the exact number of trusted reverse proxies in front of this process.
+  TRUST_PROXY_HOPS: parseTrustProxyHops(process.env.TRUST_PROXY_HOPS),
   SESSION_TTL_MS:   parseInt(process.env.SESSION_TTL_MS ?? '86400000', 10),
   STORED_MAX_BYTES: 10 * 1024 * 1024,
   MAX_FILE_SIZE:    100 * 1024 * 1024,
@@ -118,6 +130,7 @@ logger.info({
   msg: 'Configuration loaded',
   port: CONFIG.PORT,
   origins: CONFIG.ALLOWED_ORIGINS,
+  trustProxyHops: CONFIG.TRUST_PROXY_HOPS,
   storedMode: !!CONFIG.MONGODB_URI,
   mongoTlsInsecure: CONFIG.MONGODB_TLS_INSECURE
 })

@@ -3,6 +3,7 @@ import { IncomingMessage } from 'http'
 import { SignalMessage, JoinPayload, PeerRole } from './types'
 import { getSession, addPeer, removePeer, sendTo } from './sessionManager'
 import logger from './logger'
+import { normaliseShareCode } from './shareCode'
 import crypto from 'crypto'
 import { promisify } from 'util'
 
@@ -181,15 +182,16 @@ async function handleJoin(ws: WebSocket, ctx: PeerContext, payload: JoinPayload)
     return
   }
 
-  const { code, role } = payload
+  const code = normaliseShareCode(payload.code)
+  const { role } = payload
 
   if (role !== 'publisher' && role !== 'recipient') {
     sendTo(ws, { type: 'error', payload: 'role must be publisher or recipient' })
     return
   }
 
-  if (!/^\d{6}$/.test(code)) {
-    sendTo(ws, { type: 'error', payload: 'code must be 6 digits' })
+  if (!code) {
+    sendTo(ws, { type: 'error', payload: 'invalid_session_code' })
     return
   }
 

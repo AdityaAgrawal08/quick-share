@@ -4,7 +4,7 @@ import mongoose from 'mongoose'
 import { WebSocketServer } from 'ws'
 import multer from 'multer'
 import { ObjectId } from 'mongodb'
-import { randomInt, randomBytes } from 'crypto'
+import { randomBytes } from 'crypto'
 import rateLimit from 'express-rate-limit'
 import path from 'path'
 import crypto from 'crypto'
@@ -24,6 +24,7 @@ import { retrieve } from './rag/retriever'
 import { GenerationMismatchError } from './rag/embedding/orchestrator'
 import { getAnswer, putAnswer } from './rag/answerCache'
 import { generateAnswer, llmConfigured, streamAnswer } from './rag/llm'
+import { generateShareCode, normaliseShareCode } from './shareCode'
 
 // Security: Global rejection handler
 process.on('unhandledRejection', (reason, promise) => {
@@ -186,20 +187,81 @@ function gate(_req: Request, res: Response, next: NextFunction): void {
   })
 }
 
-const storage = multer.memoryStorage()
+const uploadBytesByRequest = new WeakMap<Request, number>()
+
+function initialiseUploadBudget(req: Request, res: Response, next: NextFunction): void {
+  uploadBytesByRequest.set(req, 0)
+  const clear = () => uploadBytesByRequest.delete(req)
+  res.once('finish', clear)
+  res.once('close', clear)
+  next()
+}
+
+function isUploadLimitError(err: unknown): boolean {
+  return err instanceof multer.MulterError ||
+    (err != null && typeof err === 'object' && 'message' in err &&
+      typeof (err as { message?: unknown }).message === 'string' &&
+      (err as { message: string }).message.includes('exceed'))
+}
+
+// Multer's fileSize setting is per file. This storage engine enforces the
+// session-wide file budget while bytes are streaming, so memoryStorage never
+// accumulates N individually valid files into an oversized request.
+const storage: multer.StorageEngine = {
+  _handleFile(req, file, callback) {
+    const chunks: Buffer[] = []
+    let size = 0
+    let settled = false
+
+    const fail = (err: Error) => {
+      if (settled) return
+      settled = true
+      chunks.length = 0
+      file.stream.resume()
+      callback(err)
+    }
+
+    file.stream.on('data', (chunk: Buffer) => {
+      if (settled) return
+      const total = (uploadBytesByRequest.get(req) ?? 0) + chunk.length
+      if (total > STORED_MAX_BYTES) {
+        fail(new multer.MulterError('LIMIT_FILE_SIZE', file.fieldname))
+        return
+      }
+      uploadBytesByRequest.set(req, total)
+      size += chunk.length
+      chunks.push(chunk)
+    })
+    file.stream.once('limit', () => fail(new multer.MulterError('LIMIT_FILE_SIZE', file.fieldname)))
+    file.stream.once('error', fail)
+    file.stream.once('end', () => {
+      if (settled) return
+      settled = true
+      callback(null, { buffer: Buffer.concat(chunks, size), size })
+    })
+  },
+  _removeFile(_req, file, callback) {
+    delete file.buffer
+    callback(null)
+  },
+}
+
 const upload  = multer({
   storage,
   limits: {
     fileSize: STORED_MAX_BYTES,
     files: MAX_UPLOAD_FILES,
     fieldSize: 1024 * 1024,
+    fields: 6,
+    parts: MAX_UPLOAD_FILES + 6,
+    fieldNameSize: 100,
   },
 })
 
 // ── Express ───────────────────────────────────────────────────────────────────
 
 const app = express()
-app.set('trust proxy', 1)
+app.set('trust proxy', CONFIG.TRUST_PROXY_HOPS)
 app.use(express.json({ limit: '2mb' }))
 
 // Security: Global Security Headers & CORS
@@ -317,13 +379,9 @@ const aiQueryLimiter = rateLimit({
 
 // ── Code generation ───────────────────────────────────────────────────────────
 
-function generateCode(): string {
-  return randomInt(0, 1_000_000).toString().padStart(6, '0')
-}
-
 async function generateUniqueStoredCode(): Promise<string> {
   for (let i = 0; i < 20; i++) {
-    const code = generateCode()
+    const code = generateShareCode()
     const inMongo = await StoredSession.findOne({ code }).lean()
     const inMemory = getSession(code)
     if (!inMongo && !inMemory) return code
@@ -354,6 +412,7 @@ app.post(
   publishLimiter,
   gate,
   requireStoredMode,
+  initialiseUploadBudget,
   upload.array('files'),
   async (req: Request, res: Response) => {
     try {
@@ -429,7 +488,7 @@ app.post(
 
               scheduleExpiry(code, expiresAt)
               kickIndex(code)
-              logger.info(`[publish] stored ${code} — expires ${expiresAt.toISOString()} — ${sanitisedFiles.length} file(s) — ${isPrivate ? 'PRIVATE' : 'open'}`)
+              logger.info({ expiresAt, files: sanitisedFiles.length, private: isPrivate }, '[publish] stored session created')
               res.status(201).json({ code, mode: 'stored', private: isPrivate, expiresAt: expiresAt.getTime(), ttlMs })
               return
             } catch (err) {
@@ -461,10 +520,9 @@ app.post(
     } catch (err: any) {
       logger.error({ err }, '[publish] error')
 
-      const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE' || err?.code === 'LIMIT_FILE_COUNT'
+      const isLimit = isUploadLimitError(err)
       res.status(isLimit ? 400 : 500).json({
         error: isLimit ? 'Upload limit exceeded' : 'Server error during publish',
-        details: err?.message
       })
     }
   }
@@ -472,19 +530,65 @@ app.post(
 
 // ── PATCH /publish/:code — stored mode update ─────────────────────────────────
 
+type StoredUpdateAccess = { code: string; passwordHash: string | null }
+
+class SessionAccessChangedError extends Error {
+  constructor() {
+    super('Session authorization changed during update')
+  }
+}
+
+// Authenticate before multer consumes a multipart body. This prevents a caller
+// without the session capability/password from using update uploads for memory
+// or parsing exhaustion. The handler repeats this state as an update predicate
+// to close the interval between verification and write.
+async function requireStoredUpdateAccess(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const code = normaliseShareCode(req.params['code'])
+    if (!code) {
+      res.status(400).json({ error: 'Invalid code format' })
+      return
+    }
+
+    const session = await StoredSession.findOne({ code, expiresAt: { $gt: new Date() } })
+      .select('+password')
+      .lean()
+    if (!session) {
+      res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
+      return
+    }
+
+    if (session.password) {
+      const clientPass = req.headers['x-session-password']
+      if (typeof clientPass !== 'string' || !(await verifyPassword(clientPass, session.password))) {
+        await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000))
+        res.status(401).json({ error: 'password_required', message: 'Correct password required to update this session' })
+        return
+      }
+    }
+
+    res.locals.storedUpdateAccess = { code, passwordHash: session.password ?? null } satisfies StoredUpdateAccess
+    next()
+  } catch (err) {
+    logger.error({ err }, '[publish] update authorization error')
+    res.status(500).json({ error: 'Server error during update' })
+  }
+}
+
 app.patch(
   '/publish/:code',
   patchLimiter,
-  gate,
+  passwordLimiter,
   requireStoredMode,
+  requireStoredUpdateAccess,
+  gate,
+  initialiseUploadBudget,
   upload.array('files'),
   async (req: Request, res: Response) => {
     try {
-      const code = req.params['code'] as string
-      if (!/^\d{6}$/.test(code)) {
-        res.status(400).json({ error: 'Invalid code format' })
-        return
-      }
+      const access = res.locals.storedUpdateAccess as StoredUpdateAccess | undefined
+      if (!access) throw new Error('Stored update access missing')
+      const { code } = access
 
       const text         = typeof req.body.text === 'string' ? req.body.text : ''
       const burnOnRead   = req.body.burnOnRead
@@ -511,24 +615,6 @@ app.patch(
         return
       }
 
-      // Security: verify ownership ONCE before the retry loop — re-verifying
-      // inside each attempt was redundant (same request, same credentials).
-      const existing = await StoredSession.findOne({ code, expiresAt: { $gt: new Date() } }).select('+password').lean()
-      if (!existing) {
-        res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
-        return
-      }
-
-      if (existing.password) {
-        const clientPass = req.headers['x-session-password'] as string
-        if (!clientPass || !(await verifyPassword(clientPass, existing.password))) {
-          // Artificial delay to slow down automated brute force
-          await new Promise(r => setTimeout(r, 500 + Math.random() * 1000))
-          res.status(401).json({ error: 'password_required', message: 'Correct password required to update this session' })
-          return
-        }
-      }
-
       // Security: sanitise filenames
       const sanitisedFiles = uploadedFiles.map((f) => ({
         ...f,
@@ -541,8 +627,8 @@ app.patch(
         try {
           // Fresh read per attempt: oldIds must reflect the doc state right
           // before this update so we never delete files a previous attempt
-          // already swapped in. Password is NOT re-checked — credentials were
-          // validated above and cannot change mid-request.
+          // already swapped in. The update predicate below re-checks the
+          // authorization state captured before multipart parsing.
           const current = await StoredSession.findOne({ code }).lean()
           if (!current || (current.expiresAt && current.expiresAt <= new Date())) {
             res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
@@ -567,7 +653,14 @@ app.patch(
           if (password) updateSet.password = await hashPassword(password)
           if (burnOnRead !== undefined) updateSet.burnOnRead = burnOnRead === 'true' || burnOnRead === true
 
-          await StoredSession.updateOne({ code }, { $set: updateSet })
+          const passwordPredicate: Record<string, unknown> = access.passwordHash
+            ? { password: access.passwordHash }
+            : { $or: [{ password: { $exists: false } }, { password: null }] }
+          const updated = await StoredSession.updateOne(
+            { code, expiresAt: { $gt: new Date() }, ...passwordPredicate },
+            { $set: updateSet },
+          )
+          if (updated.modifiedCount !== 1) throw new SessionAccessChangedError()
 
           // Delete old GridFS files only after session doc points to new ones
           const oldIds = current.files.map((f) => f.gridfsId)
@@ -577,13 +670,18 @@ app.patch(
           scheduleExpiry(code, expiresAt)
           kickIndex(code)
 
-          logger.info({ code, files: sanitisedFiles.length, expiresAt: expiresAt.toISOString() }, '[publish] updated stored session')
+          logger.info({ files: sanitisedFiles.length, expiresAt: expiresAt.toISOString() }, '[publish] updated stored session')
           res.json({ code, mode: 'stored', expiresAt: expiresAt.getTime(), ttlMs })
           return
         } catch (err: any) {
           lastErr = err
           if (newlyUploadedIds.length > 0) {
             await deleteFiles(newlyUploadedIds).catch(dErr => logger.error({ err: dErr }, '[publish] double-failure during update cleanup'))
+          }
+
+          if (err instanceof SessionAccessChangedError) {
+            res.status(409).json({ error: 'session_changed', message: 'Session authorization changed; retry with the current password' })
+            return
           }
 
           if (retryAttempt === 0 && CONFIG.MONGODB_URI && isRetryablePublishError(err)) {
@@ -599,10 +697,9 @@ app.patch(
       throw lastErr ?? new Error('Server error during update')
     } catch (err: any) {
       logger.error({ err }, '[publish] update error')
-      const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE' || err?.code === 'LIMIT_FILE_COUNT'
+      const isLimit = isUploadLimitError(err)
       res.status(isLimit ? 400 : 500).json({
         error: isLimit ? 'Upload limit exceeded' : 'Server error during update',
-        details: err?.message
       })
     }
   }
@@ -612,8 +709,8 @@ app.patch(
 
 app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request, res: Response) => {
   try {
-    const code = req.params['code'] as string
-    if (!/^\d{6}$/.test(code)) {
+    const code = normaliseShareCode(req.params['code'])
+    if (!code) {
       res.status(400).json({ error: 'Invalid code format' })
       return
     }
@@ -698,7 +795,7 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
     })
   } catch (err: any) {
     logger.error({ err }, '[retrieve] error')
-    res.status(500).json({ error: `Failed to retrieve session: ${err?.message || 'Unknown error'}` })
+    res.status(500).json({ error: 'Failed to retrieve session' })
   }
 })
 
@@ -788,8 +885,8 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
   const disabled = aiDisabledReason(res)
   if (disabled) return
   try {
-    const code = req.params['code'] as string
-    if (!/^\d{6}$/.test(code)) {
+    const code = normaliseShareCode(req.params['code'])
+    if (!code) {
       res.status(400).json({ error: 'Invalid code format' })
       return
     }
@@ -820,9 +917,9 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
   const disabled = aiDisabledReason(res)
   if (disabled) return
 
-  const code = req.params['code'] as string
+  const code = normaliseShareCode(req.params['code'])
   const question = typeof req.body?.question === 'string' ? req.body.question.trim() : ''
-  if (!/^\d{6}$/.test(code)) {
+  if (!code) {
     res.status(400).json({ error: 'Invalid code format' })
     return
   }
@@ -1065,7 +1162,6 @@ app.post('/session', sessionLimiter, async (req: Request, res: Response) => {
 
 app.get('/health', async (_req: Request, res: Response) => {
   let mongoPing = -1
-  let gridfsStatus = 'unknown'
   let isStorageFull = false
   
   if (storedModeEnabled) {
@@ -1074,7 +1170,6 @@ app.get('/health', async (_req: Request, res: Response) => {
       if (mongoose.connection.db) {
         await mongoose.connection.db.admin().ping()
         mongoPing = Date.now() - start
-        gridfsStatus = 'connected'
         const stats = await mongoose.connection.db.stats()
         if (stats && stats.dataSize > MAX_DATA_SIZE_BYTES) {
           isStorageFull = true
@@ -1082,39 +1177,13 @@ app.get('/health', async (_req: Request, res: Response) => {
       }
     } catch (err) {
       mongoPing = -2
-      gridfsStatus = 'failed'
-    }
-  }
-
-  // Adaptive RAG posture (no secrets): tier, ceiling, provider breaker
-  // states, active generation — operators see WHY indexing behaves a way.
-  const memProfile = detectMemoryProfile()
-  let ragHealth: Record<string, unknown> | undefined
-  if (storedModeEnabled && CONFIG.RAG_ENABLED) {
-    try {
-      const { providerHealth } = await import('./rag/embedding/orchestrator.js')
-      ragHealth = {
-        tier: memProfile.tier,
-        limitMb: memProfile.limitMb,
-        workloadCeilingMb: memProfile.workloadCeilingMb,
-        localEmbedderAllowed: memProfile.localEmbedderAllowed,
-        providers: providerHealth(),
-      }
-    } catch {
-      ragHealth = { tier: memProfile.tier, providers: 'unavailable' }
     }
   }
 
   res.json({
     status:             mongoPing === -2 ? 'degraded' : 'ok',
-    version:            '1.1.0',
     storedModeEnabled:  storedModeEnabled && !isStorageFull,
     isStorageFull,
-    mongoLatency:       mongoPing,
-    gridfsStatus,
-    activeLiveSessions: activeSessions(),
-    uptime:             Math.floor(process.uptime()),
-    ...(ragHealth ? { rag: ragHealth } : {}),
   })
 })
 
@@ -1196,12 +1265,10 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   logger.error({ err }, 'Unhandled error')
   
   const status = err.status || 500
-  const isProduction = process.env.NODE_ENV === 'production'
   
   res.status(status).json({
     error: status === 500 ? 'internal_server_error' : err.message,
     message: status === 500 ? 'Something went wrong on our end. Please try again later.' : err.message,
-    ...(isProduction ? {} : { stack: err.stack })
   })
 })
 

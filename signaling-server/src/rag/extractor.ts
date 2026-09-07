@@ -1,6 +1,6 @@
 import { extractText, getDocumentProxy } from 'unpdf'
 import mammoth from 'mammoth'
-import * as XLSX from 'xlsx'
+import ExcelJS from 'exceljs'
 import logger from '../logger'
 import type { ExtractedDoc, ExtractedPage } from './types'
 
@@ -28,7 +28,7 @@ export function isSupportedForExtraction(name: string, mimeType: string): boolea
   const ext = extOf(name)
   if (ext === 'pdf' || mimeType === 'application/pdf') return true
   if (['docx'].includes(ext) || mimeType.includes('wordprocessingml')) return true
-  if (['xlsx', 'xls', 'xlsm'].includes(ext) || mimeType.includes('spreadsheetml') || mimeType === 'application/vnd.ms-excel') return true
+  if (['xlsx', 'xlsm'].includes(ext) || mimeType.includes('spreadsheetml')) return true
   if (TEXT_EXTENSIONS.has(ext)) return true
   return mimeType.startsWith('text/')
 }
@@ -51,19 +51,26 @@ async function extractDocx(buffer: Buffer): Promise<ExtractedDoc> {
   return { pages: [{ page: null, text }] }
 }
 
-function sheetToText(sheet: XLSX.WorkSheet): string {
-  const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false })
+function sheetToText(sheet: ExcelJS.Worksheet): string {
+  const rows: string[] = []
+  sheet.eachRow({ includeEmpty: false }, row => {
+    const cells: string[] = []
+    row.eachCell({ includeEmpty: false }, cell => cells.push(cell.text))
+    if (cells.length > 0) rows.push(cells.join(','))
+  })
+  const csv = rows.join('\n')
   // Cap pathological sheets; a single sheet producing megabytes of CSV is
   // noise for retrieval, not signal.
   return csv.length > 500_000 ? csv.slice(0, 500_000) + '\n…[truncated]' : csv
 }
 
 async function extractXlsx(buffer: Buffer): Promise<ExtractedDoc> {
-  const wb = XLSX.read(buffer, { type: 'buffer' })
+  const wb = new ExcelJS.Workbook()
+  await wb.xlsx.load(buffer)
   const pages: ExtractedPage[] = []
-  wb.SheetNames.forEach((sheetName, i) => {
-    const text = `${sheetName}\n${sheetToText(wb.Sheets[sheetName])}`.trim()
-    if (text !== sheetName) pages.push({ page: i + 1, text })
+  wb.eachSheet((sheet, i) => {
+    const text = `${sheet.name}\n${sheetToText(sheet)}`.trim()
+    if (text !== sheet.name) pages.push({ page: i, text })
   })
   return { pages }
 }
