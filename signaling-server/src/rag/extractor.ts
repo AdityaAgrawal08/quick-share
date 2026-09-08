@@ -1,6 +1,6 @@
 import { extractText, getDocumentProxy } from 'unpdf'
 import mammoth from 'mammoth'
-import * as XLSX from 'xlsx'
+import { Workbook } from 'exceljs'
 import logger from '../logger'
 import { CONFIG } from '../config'
 import { detectMemoryProfile } from './memory-profile'
@@ -94,19 +94,38 @@ async function extractDocx(buffer: Buffer): Promise<ExtractedDoc> {
   return { pages: [{ page: null, text }] }
 }
 
-function sheetToText(sheet: XLSX.WorkSheet): string {
-  const csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false })
+function sheetToText(sheet: import('exceljs').Worksheet): string {
+  const rows: string[] = []
+  sheet.eachRow({ includeEmpty: false }, (row) => {
+    const cells: string[] = []
+    row.eachCell({ includeEmpty: false }, (cell) => {
+      const val = cell.value
+      if (val == null) return
+      // Handle rich text arrays
+      if (typeof val === 'object' && 'richText' in val && Array.isArray(val.richText)) {
+        cells.push(val.richText.map(r => r.text).join(''))
+      } else if (typeof val === 'object' && 'text' in val) {
+        cells.push(String(val.text))
+      } else {
+        cells.push(String(val))
+      }
+    })
+    if (cells.length > 0) rows.push(cells.join(','))
+  })
+  const csv = rows.join('\n')
   // Cap pathological sheets; a single sheet producing megabytes of CSV is
   // noise for retrieval, not signal.
   return csv.length > 500_000 ? csv.slice(0, 500_000) + '\n…[truncated]' : csv
 }
 
 async function extractXlsx(buffer: Buffer): Promise<ExtractedDoc> {
-  const wb = XLSX.read(buffer, { type: 'buffer' })
+  const wb = new Workbook()
+  // ExcelJS type defs expect a legacy Buffer; cast to satisfy TypeScript
+  await wb.xlsx.load(buffer as any)
   const pages: ExtractedPage[] = []
-  wb.SheetNames.forEach((sheetName, i) => {
-    const text = `${sheetName}\n${sheetToText(wb.Sheets[sheetName])}`.trim()
-    if (text !== sheetName) pages.push({ page: i + 1, text })
+  wb.eachSheet((sheet: import('exceljs').Worksheet, id: number) => {
+    const text = `${sheet.name}\n${sheetToText(sheet)}`.trim()
+    if (text !== sheet.name) pages.push({ page: id, text })
   })
   return { pages }
 }

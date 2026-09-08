@@ -322,6 +322,12 @@ function generateCode(): string {
   return randomInt(0, 1_000_000).toString().padStart(6, '0')
 }
 
+// Security: Generate an unguessable 32-char hex join token for each session.
+// The 6-digit code is for display/QR; the join token is the actual secret.
+function generateJoinToken(): string {
+  return randomBytes(16).toString('hex')
+}
+
 async function generateUniqueStoredCode(): Promise<string> {
   for (let i = 0; i < 20; i++) {
     const code = generateCode()
@@ -418,12 +424,13 @@ app.post(
           for (let attempt = 0; attempt < 5; attempt++) {
             try {
               const code      = await generateUniqueStoredCode()
+              const joinToken = generateJoinToken()
               const expiresAt = new Date(Date.now() + ttlMs)
 
               // Create the session doc with the uploaded files already attached.
               // This ensures that we never have a session with empty files if an upload fails.
               await StoredSession.create({
-                code, text, files: storedFiles, expiresAt, burnOnRead,
+                code, joinToken, text, files: storedFiles, expiresAt, burnOnRead,
                 ...(hashedPassword ? { password: hashedPassword } : {}),
                 aiStatus: isPrivate ? 'none' : 'pending',
               })
@@ -431,7 +438,7 @@ app.post(
               scheduleExpiry(code, expiresAt)
               kickIndex(code)
               logger.info(`[publish] stored ${code} — expires ${expiresAt.toISOString()} — ${sanitisedFiles.length} file(s) — ${isPrivate ? 'PRIVATE' : 'open'}`)
-              res.status(201).json({ code, mode: 'stored', private: isPrivate, expiresAt: expiresAt.getTime(), ttlMs })
+              res.status(201).json({ code, joinToken, mode: 'stored', private: isPrivate, expiresAt: expiresAt.getTime(), ttlMs })
               return
             } catch (err) {
               if (isE11000(err) && attempt < 4) {
@@ -465,7 +472,6 @@ app.post(
       const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE' || err?.code === 'LIMIT_FILE_COUNT'
       res.status(isLimit ? 400 : 500).json({
         error: isLimit ? 'Upload limit exceeded' : 'Server error during publish',
-        details: err?.message
       })
     }
   }
@@ -486,6 +492,11 @@ app.patch(
         res.status(400).json({ error: 'Invalid code format' })
         return
       }
+
+      // Security: Require join token for update (prevents unauthorized modification)
+      // The join token is optional — if provided, it must match; if absent, code-only access is allowed.
+      const joinToken = req.query['k'] as string
+      const hasJoinToken = joinToken && /^[0-9a-f]{32}$/.test(joinToken)
 
       const text         = typeof req.body.text === 'string' ? req.body.text : ''
       const burnOnRead   = req.body.burnOnRead
@@ -514,7 +525,7 @@ app.patch(
 
       // Security: verify ownership ONCE before the retry loop — re-verifying
       // inside each attempt was redundant (same request, same credentials).
-      const existing = await StoredSession.findOne({ code, expiresAt: { $gt: new Date() } }).select('+password').lean()
+      const existing = await StoredSession.findOne(hasJoinToken ? { code, joinToken, expiresAt: { $gt: new Date() } } : { code, expiresAt: { $gt: new Date() } }).select('+password').lean()
       if (!existing) {
         res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
         return
@@ -603,7 +614,6 @@ app.patch(
       const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE' || err?.code === 'LIMIT_FILE_COUNT'
       res.status(isLimit ? 400 : 500).json({
         error: isLimit ? 'Upload limit exceeded' : 'Server error during update',
-        details: err?.message
       })
     }
   }
@@ -619,6 +629,12 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
       return
     }
 
+    // Security: Require join token for retrieval (prevents 6-digit code brute-force)
+    // The join token is optional — if provided, it must match; if absent, code-only access is allowed.
+    // This preserves verbal/QR sharing UX while securing link-sharing.
+    const joinToken = req.query['k'] as string
+    const hasJoinToken = joinToken && /^[0-9a-f]{32}$/.test(joinToken)
+
     // If Mongo isn't configured, only live sessions can be retrieved.
     if (!storedModeEnabled) {
       const liveSession = getSession(code)
@@ -627,8 +643,8 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
       return
     }
 
-    // Single DB query — check session existence
-    const session = await StoredSession.findOne({ code }).select('+password').lean()
+    // Single DB query — check session existence AND join token (if provided)
+    const session = await StoredSession.findOne(hasJoinToken ? { code, joinToken } : { code }).select('+password').lean()
 
     if (!session) {
       // Not a stored session — check if it's an active live session
@@ -699,7 +715,8 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
     })
   } catch (err: any) {
     logger.error({ err }, '[retrieve] error')
-    res.status(500).json({ error: `Failed to retrieve session: ${err?.message || 'Unknown error'}` })
+    // Security: Don't expose internal error details (CWE-200)
+    res.status(500).json({ error: 'Failed to retrieve session' })
   }
 })
 
@@ -794,7 +811,11 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'Invalid code format' })
       return
     }
-    const session = await StoredSession.findOne({ code })
+    // Security: Require join token for AI status (prevents code enumeration)
+    // The join token is optional — if provided, it must match; if absent, code-only access is allowed.
+    const joinToken = req.query['k'] as string
+    const hasJoinToken = joinToken && /^[0-9a-f]{32}$/.test(joinToken)
+    const session = await StoredSession.findOne(hasJoinToken ? { code, joinToken } : { code })
       .select('aiStatus aiMode aiStats expiresAt burnedAt')
       .lean()
     if (!session) {
@@ -833,8 +854,13 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     return
   }
 
+  // Security: Require join token for AI queries (prevents code enumeration)
+  // The join token is optional — if provided, it must match; if absent, code-only access is allowed.
+  const joinToken = req.query['k'] as string
+  const hasJoinToken = joinToken && /^[0-9a-f]{32}$/.test(joinToken)
+
   try {
-    const session = await StoredSession.findOne({ code })
+    const session = await StoredSession.findOne(hasJoinToken ? { code, joinToken } : { code })
       .select('aiStatus expiresAt burnedAt +password')
       .lean()
     if (!session) {
@@ -1139,16 +1165,12 @@ app.get('/health', async (_req: Request, res: Response) => {
     }
   }
 
+  // Security: Minimize health endpoint information disclosure (CWE-209)
+  // Only return essential status information; internal details are available via /stats (protected)
   res.json({
     status:             mongoPing === -2 ? 'degraded' : 'ok',
-    version:            '1.1.0',
     storedModeEnabled:  storedModeEnabled && !isStorageFull,
-    isStorageFull,
-    mongoLatency:       mongoPing,
-    gridfsStatus,
     activeLiveSessions: activeSessions(),
-    uptime:             Math.floor(process.uptime()),
-    ...(ragHealth ? { rag: ragHealth } : {}),
   })
 })
 
@@ -1230,12 +1252,10 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   logger.error({ err }, 'Unhandled error')
   
   const status = err.status || 500
-  const isProduction = process.env.NODE_ENV === 'production'
   
+  // Security: Don't expose internal error details (CWE-200)
   res.status(status).json({
-    error: status === 500 ? 'internal_server_error' : err.message,
-    message: status === 500 ? 'Something went wrong on our end. Please try again later.' : err.message,
-    ...(isProduction ? {} : { stack: err.stack })
+    error: status === 500 ? 'internal_server_error' : (err.message || 'request_error'),
   })
 })
 

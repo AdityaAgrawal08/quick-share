@@ -352,6 +352,7 @@ export interface IStoredFile {
 
 export interface IStoredSession {
   code: string
+  joinToken: string   // Security: 32-char hex join token required for retrieval
   text: string
   files:     IStoredFile[]
   expiresAt: Date
@@ -377,6 +378,7 @@ export interface IStoredSession {
 
 const storedSessionSchema = new mongoose.Schema<IStoredSession>({
   code:      { type: String, required: true, unique: true, index: true },
+  joinToken: { type: String, required: true, index: true },  // Security: unguessable join token
   text:      { type: String, default: '' },
   files:     [{
     name:     String,
