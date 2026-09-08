@@ -653,7 +653,6 @@ export default function App() {
                     aria-label="Session password"
                   />
                   {joinError && <div className="callout" style={{ borderColor: 'var(--error)', background: 'var(--error-soft)', color: 'var(--error)' }}><Icon name="alert" size={14} /> <span style={{ fontWeight: 650 }}>{joinError}</span></div>}
-                  <p className="field__hint" style={{ textAlign: 'center' }}>Tip: open a shared link like <span style={{ fontFamily: 'var(--font-mono)', fontWeight: 700 }}>{window.location.origin}/123456</span> to auto-fill.</p>
                 </div>
               </Card>
             </div>

@@ -496,6 +496,30 @@ export async function uploadFile(
   })
 }
 
+/** Stream a file directly to GridFS without buffering in memory. */
+export function createUploadStream(
+  filename: string,
+  mimeType: string
+): { stream: ReturnType<GridFSBucket['openUploadStream']>; promise: Promise<ObjectId>; release: () => void } {
+  const b = getBucket()
+  activeUploads++
+  let settled = false
+  const release = () => {
+    if (!settled) {
+      settled = true
+      activeUploads--
+    }
+  }
+  const stream = b.openUploadStream(filename, {
+    metadata: { mimeType },
+  })
+  const promise = new Promise<ObjectId>((resolve, reject) => {
+    stream.on('finish', () => { release(); resolve(stream.id as ObjectId) })
+    stream.on('error', (err) => { release(); reject(err) })
+  })
+  return { stream, promise, release }
+}
+
 export async function deleteFiles(ids: ObjectId[]): Promise<void> {
   const b = getBucket()
   await Promise.all(ids.map((id) =>

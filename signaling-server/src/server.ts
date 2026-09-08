@@ -16,7 +16,7 @@ import { createSession, activeSessions, getSession } from './sessionManager'
 import { handleConnection } from './relay'
 import { connectDB, reconnectDB, isRetryableMongoError, StoredSession, uploadFile, getFileStream, scheduleExpiry, clearExpiryTimer, deleteFiles, deleteSessionAndFiles } from './db'
 
-import logger from './logger'
+import logger, { securityLog } from './logger'
 import { CONFIG } from './config'
 import { detectMemoryProfile } from './rag/memory-profile'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
@@ -316,6 +316,50 @@ const aiQueryLimiter = rateLimit({
   message: { error: 'ai_busy', message: 'Too many AI questions from this address — try again in 15 minutes' },
 })
 
+// Security: Per-session AI query quota (CWE-770)
+// Prevents a single session from consuming excessive LLM resources.
+const AI_SESSION_QUOTA = 50  // max queries per session lifetime
+const aiSessionQuota = new Map<string, { count: number; resetAt: number }>()
+// Periodic cleanup to prevent memory leak
+setInterval(() => {
+  const now = Date.now()
+  for (const [code, q] of aiSessionQuota.entries()) {
+    if (now > q.resetAt) aiSessionQuota.delete(code)
+  }
+}, 60 * 60 * 1000).unref()
+
+function checkAiSessionQuota(code: string): boolean {
+  const now = Date.now()
+  const q = aiSessionQuota.get(code)
+  if (!q || now > q.resetAt) {
+    aiSessionQuota.set(code, { count: 1, resetAt: now + 24 * 60 * 60 * 1000 }) // 24h window
+    return true
+  }
+  if (q.count >= AI_SESSION_QUOTA) return false
+  q.count++
+  return true
+}
+
+// Security: Maximum prompt length in characters (prevents token abuse)
+const AI_MAX_PROMPT_CHARS = 8000
+
+// ── Join Token Validation ─────────────────────────────────────────────────────
+// Security: The 6-digit code is a HUMAN-FRIENDLY IDENTIFIER, never a credential.
+// The joinToken (32-char hex) is the sole authorization credential for stored
+// sessions. Code-only access is rejected — this closes CWE-331 (brute-force).
+
+function validateJoinToken(req: Request, res: Response): string | null {
+  const joinToken = req.query['k'] as string
+  if (!joinToken || !/^[0-9a-f]{32}$/.test(joinToken)) {
+    const code = (req.params['code'] as string) || 'unknown'
+    const ip = req.ip || req.socket.remoteAddress || 'unknown'
+    securityLog.token_invalid({ code, ip })
+    res.status(401).json({ error: 'unauthorized', message: 'Valid join token required (?k=...)' })
+    return null
+  }
+  return joinToken
+}
+
 // ── Code generation ───────────────────────────────────────────────────────────
 
 function generateCode(): string {
@@ -493,10 +537,9 @@ app.patch(
         return
       }
 
-      // Security: Require join token for update (prevents unauthorized modification)
-      // The join token is optional — if provided, it must match; if absent, code-only access is allowed.
-      const joinToken = req.query['k'] as string
-      const hasJoinToken = joinToken && /^[0-9a-f]{32}$/.test(joinToken)
+      // Security: joinToken is MANDATORY — 6-digit code alone is never sufficient
+      const joinToken = validateJoinToken(req, res)
+      if (!joinToken) return
 
       const text         = typeof req.body.text === 'string' ? req.body.text : ''
       const burnOnRead   = req.body.burnOnRead
@@ -523,9 +566,8 @@ app.patch(
         return
       }
 
-      // Security: verify ownership ONCE before the retry loop — re-verifying
-      // inside each attempt was redundant (same request, same credentials).
-      const existing = await StoredSession.findOne(hasJoinToken ? { code, joinToken, expiresAt: { $gt: new Date() } } : { code, expiresAt: { $gt: new Date() } }).select('+password').lean()
+      // Security: verify ownership with joinToken — code alone is never sufficient
+      const existing = await StoredSession.findOne({ code, joinToken, expiresAt: { $gt: new Date() } }).select('+password').lean()
       if (!existing) {
         res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
         return
@@ -555,7 +597,7 @@ app.patch(
           // before this update so we never delete files a previous attempt
           // already swapped in. Password is NOT re-checked — credentials were
           // validated above and cannot change mid-request.
-          const current = await StoredSession.findOne({ code }).lean()
+          const current = await StoredSession.findOne({ code, joinToken }).lean()
           if (!current || (current.expiresAt && current.expiresAt <= new Date())) {
             res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
             return
@@ -579,7 +621,7 @@ app.patch(
           if (password) updateSet.password = await hashPassword(password)
           if (burnOnRead !== undefined) updateSet.burnOnRead = burnOnRead === 'true' || burnOnRead === true
 
-          await StoredSession.updateOne({ code }, { $set: updateSet })
+          await StoredSession.updateOne({ code, joinToken }, { $set: updateSet })
 
           // Delete old GridFS files only after session doc points to new ones
           const oldIds = current.files.map((f) => f.gridfsId)
@@ -629,11 +671,9 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
       return
     }
 
-    // Security: Require join token for retrieval (prevents 6-digit code brute-force)
-    // The join token is optional — if provided, it must match; if absent, code-only access is allowed.
-    // This preserves verbal/QR sharing UX while securing link-sharing.
-    const joinToken = req.query['k'] as string
-    const hasJoinToken = joinToken && /^[0-9a-f]{32}$/.test(joinToken)
+    // Security: joinToken is MANDATORY — 6-digit code alone is never sufficient
+    const joinToken = validateJoinToken(req, res)
+    if (!joinToken) return
 
     // If Mongo isn't configured, only live sessions can be retrieved.
     if (!storedModeEnabled) {
@@ -643,8 +683,8 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
       return
     }
 
-    // Single DB query — check session existence AND join token (if provided)
-    const session = await StoredSession.findOne(hasJoinToken ? { code, joinToken } : { code }).select('+password').lean()
+    // Security: Always require joinToken for stored session retrieval
+    const session = await StoredSession.findOne({ code, joinToken }).select('+password').lean()
 
     if (!session) {
       // Not a stored session — check if it's an active live session
@@ -682,11 +722,12 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
     let burnGraceMs: number | null = null
     if (session.burnOnRead) {
       const marked = await StoredSession.updateOne(
-        { code, burnedAt: null },
+        { code, joinToken, burnedAt: null },
         { $set: { burnedAt: new Date() } }
       )
       if (marked.modifiedCount === 1) {
         burnGraceMs = BURN_GRACE_MS
+        securityLog.burn_triggered({ code })
         logger.info({ code, graceMs: BURN_GRACE_MS }, '[retrieve] burn-on-read triggered')
         setTimeout(() => {
           clearExpiryTimer(code)
@@ -811,11 +852,10 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'Invalid code format' })
       return
     }
-    // Security: Require join token for AI status (prevents code enumeration)
-    // The join token is optional — if provided, it must match; if absent, code-only access is allowed.
-    const joinToken = req.query['k'] as string
-    const hasJoinToken = joinToken && /^[0-9a-f]{32}$/.test(joinToken)
-    const session = await StoredSession.findOne(hasJoinToken ? { code, joinToken } : { code })
+    // Security: joinToken is MANDATORY — 6-digit code alone is never sufficient
+    const joinToken = validateJoinToken(req, res)
+    if (!joinToken) return
+    const session = await StoredSession.findOne({ code, joinToken })
       .select('aiStatus aiMode aiStats expiresAt burnedAt')
       .lean()
     if (!session) {
@@ -854,13 +894,24 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     return
   }
 
-  // Security: Require join token for AI queries (prevents code enumeration)
-  // The join token is optional — if provided, it must match; if absent, code-only access is allowed.
-  const joinToken = req.query['k'] as string
-  const hasJoinToken = joinToken && /^[0-9a-f]{32}$/.test(joinToken)
+  // Security: joinToken is MANDATORY — 6-digit code alone is never sufficient
+  const joinToken = validateJoinToken(req, res)
+  if (!joinToken) return
+
+  // Security: Per-session AI quota (CWE-770)
+  if (!checkAiSessionQuota(code)) {
+    res.status(429).json({ error: 'ai_session_quota', message: 'AI query limit reached for this session — try again later' })
+    return
+  }
+
+  // Security: Prompt length limit (prevents token abuse)
+  if (question.length > AI_MAX_PROMPT_CHARS) {
+    res.status(400).json({ error: 'question too long', message: `Question must be under ${AI_MAX_PROMPT_CHARS} characters` })
+    return
+  }
 
   try {
-    const session = await StoredSession.findOne(hasJoinToken ? { code, joinToken } : { code })
+    const session = await StoredSession.findOne({ code, joinToken })
       .select('aiStatus expiresAt burnedAt +password')
       .lean()
     if (!session) {
