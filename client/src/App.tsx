@@ -85,8 +85,24 @@ async function previewBlobInNewTab(getBlob: () => Promise<Blob>, fallbackName: s
   try {
     const blob = await getBlob()
     const url = URL.createObjectURL(blob)
-    if (win && !win.closed) win.location.href = url + urlSuffix
-    else anchorDownload(url, fallbackName)
+    // Security: For HTML/SVG files, use a sandboxed iframe to prevent XSS
+    const ext = fallbackName.split('.').pop()?.toLowerCase() || ''
+    const isDangerous = ['html', 'htm', 'svg', 'xhtml'].includes(ext)
+    if (isDangerous && win && !win.closed) {
+      // Write a sandboxed iframe that can't execute scripts
+      win.document.write(`<!DOCTYPE html><html><head><title>${fallbackName.replace(/</g, '&lt;')}</title></head><body style="margin:0"><iframe src="${url}" sandbox="allow-same-origin" style="width:100vw;height:100vh;border:none"></iframe></body></html>`)
+      win.document.close()
+    } else if (ext === 'js' && win && !win.closed) {
+      // For JS files, show the source code instead of executing it
+      const text = await blob.text()
+      const escaped = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      win.document.write(`<!DOCTYPE html><html><head><title>${fallbackName.replace(/</g, '&lt;')}</title><style>body{font-family:monospace;padding:1rem;background:#1a1a1a;color:#d4d4d4;white-space:pre-wrap;overflow:auto}</style></head><body>${escaped}</body></html>`)
+      win.document.close()
+    } else if (win && !win.closed) {
+      win.location.href = url + urlSuffix
+    } else {
+      anchorDownload(url, fallbackName)
+    }
     setTimeout(() => URL.revokeObjectURL(url), 60000)
   } catch (err) { win?.close(); throw err }
 }
@@ -99,6 +115,7 @@ interface RecipientConn { peerId: string; rtc: WebRTCManager; channelState: Chan
 export default function App() {
   const [view, setView] = useState<'home' | 'publish' | 'join'>('home')
   const [code, setCode] = useState('')
+  const [joinToken, setJoinToken] = useState('')
   const [inputCode, setInputCode] = useState('')
   const [text, setText] = useState('')
   const [files, setFiles] = useState<File[]>([])
@@ -159,7 +176,9 @@ export default function App() {
   }, [publishedMode, sigState])
   useEffect(() => {
     const path = window.location.pathname.replace(/^\//, '').trim()
-    if (/^\d{6}$/.test(path)) { setInputCode(path); window.history.replaceState(null, '', '/') }
+    const params = new URLSearchParams(window.location.search)
+    const k = params.get('k') || ''
+    if (/^\d{6}$/.test(path)) { setInputCode(path); if (k) setJoinToken(k); window.history.replaceState(null, '', '/') }
   }, [])
   useEffect(() => {
     const checkStatus = async () => {
@@ -194,7 +213,7 @@ export default function App() {
   }
   function copyLink() {
     if (!code) return
-    const url = `${window.location.origin}/${code}`
+    const url = joinToken ? `${window.location.origin}/${code}?k=${joinToken}` : `${window.location.origin}/${code}`
     navigator.clipboard.writeText(url).catch(() => {
       const el = document.createElement('textarea'); el.value = url; document.body.appendChild(el); el.select(); document.execCommand('copy'); document.body.removeChild(el)
     })
@@ -262,7 +281,7 @@ export default function App() {
       }
       const url = isUpdate ? `${API_URL}/publish/${code}` : `${API_URL}/publish`
       const method = isUpdate ? 'PATCH' : 'POST'
-      const data = await new Promise<{ code: string; expiresAt: number; mode: string; error?: string }>((resolve, reject) => {
+      const data = await new Promise<{ code: string; joinToken?: string; expiresAt: number; mode: string; error?: string }>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         xhr.open(method, url); xhr.timeout = 5 * 60 * 1000
         if (privatePassword) xhr.setRequestHeader('x-session-password', privatePassword)
@@ -282,7 +301,7 @@ export default function App() {
         if (data.error.includes('not found') && isUpdate) { setCode(''); setPublishedMode(null) }
         setPublishing(false); return
       }
-      setCode(data.code); setExpiresAt(data.expiresAt); setPublishedMode('stored')
+      setCode(data.code); setJoinToken(data.joinToken || ''); setExpiresAt(data.expiresAt); setPublishedMode('stored')
     } catch (err: unknown) { setPublishError(err instanceof Error ? err.message : 'An unexpected error occurred.') }
     setPublishing(false)
   }
@@ -314,7 +333,8 @@ export default function App() {
     if (inputCode.length !== 6) return
     setJoining(true); setJoinError('')
     try {
-      const res = await fetch(`${API_URL}/retrieve/${inputCode}`, { headers: passwordHeaders(inputPassword) })
+      const joinParam = joinToken ? `?k=${joinToken}` : ''
+      const res = await fetch(`${API_URL}/retrieve/${inputCode}${joinParam}`, { headers: passwordHeaders(inputPassword) })
       if (res.ok) {
         const data: RetrievedPayload = await res.json()
         if (inputPassword && data.text) {
@@ -322,7 +342,8 @@ export default function App() {
           catch { setJoinError('Unable to decrypt the message. Check the password.'); setJoining(false); return }
         }
         setStoredPayload(data); setCode(inputCode); setExpiresAt(data.expiresAt); setView('join')
-        void fetch(`${API_URL}/ai/status/${inputCode}`).then(r => r.json()).then(st => {
+        const aiJoinParam = joinToken ? `?k=${joinToken}` : ''
+        void fetch(`${API_URL}/ai/status/${inputCode}${aiJoinParam}`).then(r => r.json()).then(st => {
           if (typeof st.aiStatus === 'string') setAiStatus(st.aiStatus as 'none' | 'pending' | 'ready' | 'failed')
         }).catch(() => {})
         if (data.burnOnRead && data.files.length > 0) {
@@ -466,7 +487,8 @@ export default function App() {
 
   async function askAiOnce(question: string, cbs?: { onDelta?: (t: string) => void; onSources?: (s: AiSource[]) => void; onDone?: (fullText: string, refused: boolean, cached: boolean) => void }): Promise<AskResult> {
     try {
-      const res = await fetch(`${API_URL}/ai/query/${code}`, {
+      const aiJoinParam = joinToken ? `?k=${joinToken}` : ''
+      const res = await fetch(`${API_URL}/ai/query/${code}${aiJoinParam}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream', ...passwordHeaders(inputPassword) },
         body: JSON.stringify({ question }), signal: AbortSignal.timeout(90_000),
       })
@@ -543,7 +565,7 @@ export default function App() {
     if (state === 'error') return 'Error'
     return state
   }
-  const qrUrl = `${window.location.origin}/${code}`
+  const qrUrl = joinToken ? `${window.location.origin}/${code}?k=${joinToken}` : `${window.location.origin}/${code}`
 
   return (
     <div className="app-shell">
@@ -578,12 +600,7 @@ export default function App() {
             <div className="hero">
               <h1>Share anything, <span>instantly</span></h1>
               <p>End-to-end encrypted cloud drops for up to 10 MB · Unlimited peer-to-peer for anything larger · Ask AI about your files.</p>
-              <div className="hero__badges">
-                <Badge tone="accent" dot>Encrypted</Badge>
-                <Badge>Open · AI-indexed</Badge>
-                <Badge>Private · E2EE</Badge>
-                <Badge tone="live">P2P · WebRTC</Badge>
-              </div>
+              
             </div>
 
             <div className="grid-2">
@@ -599,7 +616,6 @@ export default function App() {
                   <Btn variant="primary" size="lg" block onClick={() => setView('publish')}><Icon name="upload" size={16} /> Start sharing</Btn>
                 </div>
                 <div style={{ display: 'flex', gap: 16, marginTop: 14, flexWrap: 'wrap' }}>
-                  <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: '0.78rem', color: 'var(--text-2)' }}><Icon name="shield" size={12} /> E2EE private</span>
                   <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: '0.78rem', color: 'var(--text-2)' }}><Icon name="sparkles" size={12} /> AI Q&A</span>
                   <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: '0.78rem', color: 'var(--text-2)' }}><Icon name="cloud" size={12} /> Burn-on-read</span>
                 </div>
