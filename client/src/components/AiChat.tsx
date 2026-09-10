@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 
 export interface AiSource { name: string; fileId: string; page: number | null; score: number; snippet: string }
 interface ChatMessage { role: 'user' | 'assistant'; text: string; sources?: AiSource[]; error?: boolean; streaming?: boolean }
-export interface AskResult { answer: string; refused?: boolean; sources?: AiSource[]; error?: string; status?: number }
+export interface AskResult { answer: string; refused?: boolean; sources?: AiSource[]; error?: string; status?: number; groqStatus?: number }
 interface AiChatProps {
   code: string; apiBase: string; aiStatus: 'none' | 'pending' | 'ready' | 'failed'
   onStatusChange?: (status: 'ready' | 'failed') => void
@@ -70,7 +70,7 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
             r.error === 'ai_config' ? 'AI model/key misconfigured on the server.' :
               r.error === 'ai_not_configured' ? 'AI answering needs the operator to configure GROQ_API_KEY.' :
                 r.error === 'ai_session_quota' ? 'AI query limit reached for this session — try again later.' :
-                  r.error === 'ai_error' ? 'The AI service returned an unexpected error. Try again.' :
+                  r.error === 'ai_error' ? `Groq API error${r.groqStatus ? ` (HTTP ${r.groqStatus})` : ''} — try again.` :
                     r.error === 'indexing' ? 'Still indexing this session — one moment.' :
                       r.error === 'expired' || r.error === 'not_found' ? 'This session has expired and was cleaned up.' :
                         r.error === 'burned' ? 'One-time session already consumed.' :

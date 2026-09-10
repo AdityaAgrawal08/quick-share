@@ -496,7 +496,7 @@ export default function App() {
       if (!res.ok) { const data = await res.json(); return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status } }
       if (ct.includes('text/event-stream')) {
         const reader = res.body!.getReader(); const decoder = new TextDecoder()
-        let buf = ''; let full = ''; let refused = false; let cached = false; let err: string | null = null; let sources: AiSource[] | undefined
+        let buf = ''; let full = ''; let refused = false; let cached = false; let err: string | null = null; let groqStatus: number | undefined; let sources: AiSource[] | undefined
         while (true) {
           const { done, value } = await reader.read(); if (done) break
           buf += decoder.decode(value, { stream: true })
@@ -511,10 +511,10 @@ export default function App() {
             if (ev === 'sources') { sources = payload.sources; cbs?.onSources?.(sources ?? []) }
             else if (ev === 'delta') { full += payload.t; cbs?.onDelta?.(payload.t) }
             else if (ev === 'done') { refused = !!payload.refused; cached = !!payload.cached; full = payload.fullText ?? full; cbs?.onDone?.(full, refused, cached) }
-            else if (ev === 'error') { err = String(payload.error) }
+            else if (ev === 'error') { err = String(payload.error); groqStatus = payload.groqStatus }
           }
         }
-        if (err) return { answer: '', error: err }
+        if (err) return { answer: '', error: err, groqStatus }
         return { answer: full, refused, sources, status: res.status }
       }
       const data = await res.json()
