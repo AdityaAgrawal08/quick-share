@@ -67,15 +67,21 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
       if (r.error) {
         const friendly =
           r.error === 'ai_busy' ? 'AI is rate-limited right now — try again in a few minutes.' :
-            r.error === 'indexing' ? 'Still indexing this session — one moment.' :
-              r.error === 'expired' || r.error === 'not_found' ? 'This session has expired and was cleaned up.' :
-                r.error === 'burned' ? 'One-time session already consumed.' :
-                  r.error === 'ai_not_configured' ? 'AI answering needs the operator to configure GROQ_API_KEY.' :
-                    r.error === 'ai_config' ? 'AI model/key misconfigured on the server.' :
-                      r.error === 'private' ? 'Private session — AI features are off.' :
-                        r.error === 'network' ? 'Could not reach the server (it may be waking from sleep). Retrying usually works.' :
-                          r.status === 500 ? 'Server hit an unexpected error answering this question. Try again.' :
-                            'AI request failed. Try again.'
+            r.error === 'ai_config' ? 'AI model/key misconfigured on the server.' :
+              r.error === 'ai_not_configured' ? 'AI answering needs the operator to configure GROQ_API_KEY.' :
+                r.error === 'ai_session_quota' ? 'AI query limit reached for this session — try again later.' :
+                  r.error === 'ai_error' ? 'The AI service returned an unexpected error. Try again.' :
+                    r.error === 'indexing' ? 'Still indexing this session — one moment.' :
+                      r.error === 'expired' || r.error === 'not_found' ? 'This session has expired and was cleaned up.' :
+                        r.error === 'burned' ? 'One-time session already consumed.' :
+                          r.error === 'private' ? 'Private session — AI features are off.' :
+                            r.error === 'network' ? 'Could not reach the server (it may be waking from sleep). Retrying usually works.' :
+                              r.status === 400 ? 'Invalid request — check your question and try again.' :
+                                r.status === 404 ? 'Session not found — it may have expired.' :
+                                  r.status === 429 ? 'Too many requests — wait a moment and try again.' :
+                                    r.status === 503 ? 'Service temporarily unavailable — try again shortly.' :
+                                      r.status === 500 ? 'Server hit an unexpected error answering this question. Try again.' :
+                                        'AI request failed. Try again.'
         setMessages(prev => {
           const next = [...prev]; const last = next[next.length - 1]
           // Streaming placeholder exists — reuse it for the error; otherwise append
