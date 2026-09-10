@@ -1217,8 +1217,9 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
         }
       } catch (llmErr) {
         const msg = llmErr instanceof Error ? llmErr.message : 'ai_error'
+        const groqStatus = msg.startsWith('ai_error:') ? parseInt(msg.split(':')[1]) : undefined
         const code2 = msg === 'ai_busy' ? 'ai_busy' : msg === 'ai_config' ? 'ai_config' : 'ai_error'
-        sseSend('error', { error: code2 })
+        sseSend('error', { error: code2, groqStatus })
         res.end()
         return
       }
@@ -1240,6 +1241,8 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
         res.status(503).json({ error: 'ai_config', message: 'LLM key invalid — contact the operator' })
         return
       }
+      const groqStatus = msg.startsWith('ai_error:') ? parseInt(msg.split(':')[1]) : undefined
+      logger.warn({ groqStatus, code }, '[ai] Groq LLM error')
       throw llmErr
     }
 

@@ -84,7 +84,7 @@ export async function* streamAnswer(question: string, context: string): AsyncGen
     logger.warn({ status: res.status, detail: detail.slice(0, 200) }, '[llm] Groq stream error')
     if (res.status === 429 || res.status === 503) throw new Error('ai_busy')
     if (res.status >= 400 && res.status <= 404) throw new Error('ai_config')
-    throw new Error('ai_error')
+    throw new Error(`ai_error:${res.status}`)
   }
 
   let full = ''
@@ -136,7 +136,7 @@ export async function generateAnswer(
     if (res.status === 429 || res.status === 503) throw new Error('ai_busy')
     // 400 covers model_not_found / bad params; 401/403 cover key issues.
     if (res.status === 400 || res.status === 401 || res.status === 403 || res.status === 404) throw new Error('ai_config')
-    throw new Error('ai_error')
+    throw new Error(`ai_error:${res.status}`)
   }
 
   const json = (await res.json()) as {
