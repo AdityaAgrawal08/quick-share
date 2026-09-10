@@ -1,26 +1,43 @@
-# ⚡ QuickShare
+# QuickShare
 
 [![CI](https://github.com/AdityaAgrawal08/quick-share/actions/workflows/ci.yml/badge.svg)](https://github.com/AdityaAgrawal08/quick-share/actions/workflows/ci.yml)
 
-A fast, modern file & text sharing app: **WebRTC peer-to-peer transfers** for large files, **MongoDB GridFS** persistence (≤10MB) with an end-to-end encrypted **Private** mode, and a built-in **RAG AI agent** — ask questions about any shared session and get grounded, cited answers.
+A modern file and text sharing platform with **WebRTC peer-to-peer transfers**, **MongoDB GridFS persistence**, end-to-end encrypted **Private mode**, and a built-in **RAG AI agent** that answers questions about shared content with grounded, cited responses.
 
 ---
 
-## 🚀 Key Features
+## Features
 
-* **⚡ Peer-to-Peer Sharing (WebRTC):** Direct browser-to-browser transfer with no size cap. The server only relays signaling — it never sees P2P content.
-* **💾 Persistent Sessions (GridFS ≤10MB):** Files + text stored in MongoDB via Express/Multer/GridFS.
-  * **🌐 Open sessions** — readable by code, automatically indexed server-side, **AI-questionable**.
-  * **🔒 Private sessions** — client-side AES-256-GCM encryption (PBKDF2 100k). Server stores ciphertext only; AI features disabled by design.
-* **🤖 RAG AI Agent:** Ask anything about a session's files/text. Pipeline: text extraction (PDF/DOCX/XLSX/code) → chunking → local ONNX embeddings (`bge-small`) → hybrid BM25+vector search → optional cross-encoder rerank → Groq LLM answer with inline citations and strict anti-hallucination refusal.
-* **🔥 Burn-on-Read:** One-time sessions; recipient gets a grace window with files preloaded before self-destruction.
-* **☁️ NAT Traversal:** Metered.ca STUN/TURN fallback (cached + rate-limited server-side).
-* **🔒 Hardened by default:** Password-gated WebSocket joins (both roles), brute-force lockouts, proxy-aware rate limiting, bounded upload memory, timing-safe secret comparison, per-endpoint limiters.
-* **🎨 Premium UI:** React + Vite, dark/light theme, QR pairing, live transfer progress, streaming chat drawer with source chips.
+### Sharing
+
+- **Peer-to-Peer (WebRTC):** Direct browser-to-browser file transfer with no size cap. The server only relays signaling — it never sees P2P content.
+- **Persistent Sessions (GridFS):** Files and text stored in MongoDB (up to 10MB). Open sessions are AI-indexable; Private sessions use client-side AES-256-GCM encryption — the server stores ciphertext only.
+- **Burn-on-Read:** One-time sessions that self-destruct after the recipient's grace window.
+- **NAT Traversal:** Metered.ca STUN/TURN fallback for reliable connectivity behind NATs and firewalls.
+
+### AI Agent
+
+- **RAG Pipeline:** Text extraction (PDF, DOCX, XLSX, code) → chunking → embeddings (ONNX `bge-small`) → hybrid BM25 + vector search → optional cross-encoder rerank → Groq LLM with inline citations and anti-hallucination refusal.
+- **Memory-Aware:** Automatically detects host memory and adapts — from full-content stuffing on tiny instances to vector search with reranking on large ones.
+- **Degraded Mode:** When embedding providers are unavailable, falls back to BM25 keyword search instead of failing.
+
+### Security
+
+- **Authentication:** 6-digit code serves as a human-friendly identifier; a separate 32-char join token grants access to stored sessions. Live WebRTC sessions use password-gated WebSocket joins with server-assigned roles.
+- **Input Sanitization:** User-supplied text is stripped of script tags, event handlers, `javascript:` URIs, `<iframe>`, `<object>`, `<embed>`, and `<meta refresh>` redirects. Filenames are sanitized against path traversal and control characters.
+- **Security Headers:** HSTS, CSP with per-request nonces, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, X-DNS-Prefetch-Control, and Cross-Origin-Resource-Policy — all via `helmet`.
+- **Rate Limiting:** Per-IP and per-endpoint rate limiters with `retryAfter` headers. Upload bandwidth capped at 500 MB/hour globally.
+- **Resource Limits:** WebSocket connections capped per IP (default 20). Request timeout enforced (30s). Memory pressure monitoring with load shedding on expensive endpoints.
+- **Observability:** X-Request-ID tracing, structured security event logging, Prometheus `/metrics` endpoint, CSP violation reporting at `/csp-report`.
+- **Privacy:** `/robots.txt` blocks indexing. `/.well-known/security.txt` provides contact information. `Cache-Control: no-store` on all sensitive endpoints.
+
+### UI
+
+- React + Vite, dark/light theme, QR pairing, live transfer progress, streaming chat drawer with source chips.
 
 ---
 
-## 🛠️ Architecture
+## Architecture
 
 ```mermaid
 graph TD
@@ -38,22 +55,26 @@ graph TD
 ```
 
 Workspaces:
-1. **`client`** — React/Vite SPA (+ `src/lib/rag` shared-safe logic for future P2P-side RAG).
-2. **`signaling-server`** — Express + ws + Mongoose backend (`src/rag/` holds the AI pipeline).
+1. **`client`** — React/Vite SPA
+2. **`signaling-server`** — Express + ws + Mongoose backend (`src/rag/` holds the AI pipeline)
 
 ---
 
-## 📦 Local Setup & Development
+## Local Setup
 
 ### Prerequisites
+
 **Node.js v20+**
 
-### 1. Backend
+### Backend
+
 ```bash
 cd signaling-server
 npm install
 ```
+
 Create `.env` (never committed):
+
 ```env
 PORT=3002
 MONGODB_URI=your_mongodb_atlas_uri
@@ -63,83 +84,91 @@ GROQ_API_KEY=gsk_your_free_groq_key
 GROQ_MODEL=openai/gpt-oss-120b
 NODE_ENV=development
 ```
-> Free Groq key: [console.groq.com/keys](https://console.groq.com/keys) — no credit card. Without it the app works in **retrieval-only mode**: indexing/search fine, final answers disabled.
+
+> Free Groq key: [console.groq.com/keys](https://console.groq.com/keys) — no credit card required. Without it, the app works in **retrieval-only mode**: indexing and search function normally, but final AI answers are disabled.
 
 ```bash
 npm run dev     # ts-node-dev on :3002
 ```
+
 First run downloads ~90MB of ONNX models (embedder), then serves from disk cache.
 
-### 2. Frontend
+### Frontend
+
 ```bash
 cd ../client
 npm install
 ```
+
 Create `.env`:
+
 ```env
 VITE_API_URL=http://localhost:3002
 ```
+
 ```bash
-npm run dev     # pinned to http://localhost:4000 (strictPort)
+npm run dev     # pinned to http://localhost:4000
 ```
+
 > Client port is fixed at 4000 so the origin always matches backend `ALLOWED_ORIGINS`. Change both together if needed.
 
 ---
 
-## 🤖 Using the AI agent
+## Using the AI Agent
 
-1. Publish an **🌐 Open** session (no password) — indexing starts automatically (`aiStatus → ready`, watch logs).
-2. Recipient opens the join link/code → content renders → **"✦ Ask about these files"** drawer appears.
-3. Ask anything: *"Summarise this"*, *"What's the oil change interval?"* → streamed Groq answer with `[file p.X]` source chips.
+1. Publish an **Open** session (no password) — indexing starts automatically.
+2. Recipient opens the join link/code → content renders → **"Ask about these files"** drawer appears.
+3. Ask anything: *"Summarise this"*, *"What's the oil change interval?"* → streamed answer with source citations.
 4. Questions outside the corpus get an honest refusal — no hallucinations.
-5. 🔒 **Private** sessions show "AI features are off." — encryption means the server cannot read them, ever.
+5. **Private** sessions show "AI features are off." — encryption means the server cannot read them.
 
-Rate limits: 10 queries / 15 min / IP. Without `GROQ_API_KEY`, `/ai/query` returns retrieval sources with `ai_not_configured`.
+Rate limits: 10 queries / 15 min / IP, 50 queries / 24h / session, 200 queries / hour globally.
 
-### Retrieval quality gate
+### Retrieval Quality Gate
+
 ```bash
 cd signaling-server && npx tsc --module nodenext --moduleResolution nodenext \
   --target es2022 --skipLibCheck --strict false --outDir .evalbuild \
   scripts/rag-eval.mts src/rag/embedder.ts src/rag/chunker.ts src/rag/types.ts
-node .evalbuild/scripts/rag-eval.mjs   # expect hit@3 ≥ 0.90 · current: 1.00
+node .evalbuild/scripts/rag-eval.mjs   # expect hit@3 >= 0.90
 rm -rf .evalbuild
 ```
 
 ---
 
-## 🧠 Adaptive AI services (memory-aware RAG)
+## Adaptive AI Services
 
-The AI layer **detects the memory of the machine it deploys to** (cgroup limit at boot) and adapts automatically:
+The AI layer detects host memory at boot and adapts automatically:
 
-| Tier | Detected | Behaviour |
+| Tier | Memory | Behavior |
 |---|---|---|
-| **TINY** | <768 MB (Render free = 512) | Local ONNX embedder **excluded** — small/medium corpora answer via full-content stuffing, large ones via BM25 keywords. OCR off. Peak ≤ ~200MB measured. |
-| **STANDARD** | ≤2048 MB | + API-first embeddings, local BGE fallback, image OCR allowed |
-| **LARGE** | >2048 MB | + cross-encoder reranker eligible |
+| **Tiny** | <768 MB | Local ONNX embedder excluded. Small/medium corpora use full-content stuffing; large ones use BM25 keywords. |
+| **Standard** | 768–2048 MB | API-first embeddings, local BGE fallback, image OCR allowed. |
+| **Large** | >2048 MB | Cross-encoder reranker eligible. |
 
-### Never-fail ladder (in order)
+### Provider Fallback
+
 ```text
 1. Direct stuffing      corpus fits the Groq window (~75% of context tokens)
 2. Embedding providers  Cohere → Voyage → local BGE   (circuit breakers,
                         quota cooldowns, health-aware ordering per call)
-3. BM25 keyword mode    every provider down/exhausted ⇒ session still answers
-        └─ flagged degraded:true · qualityTier:'keyword' · UI shows notice
+3. BM25 keyword mode    every provider down → session still answers
 ```
-`aiStatus:'failed'` now means a genuine bug — resource/provider problems degrade instead.
 
-Enumeration questions (*"list all chapters"*) trigger wide-recall: up to 80 blocks plus a structural heading scan (`Chapter N`, `Appendix…`), assembled under the LLM token budget.
+### Provider Keys (all optional)
 
-### Provider keys (all optional)
-`COHERE_API_KEY` · `VOYAGE_API_KEY` → registry order via `RAG_PROVIDER_ORDER` (default `cohere,voyage,local`). Health monitor snapshots breaker states to Mongo every 60s (survives restarts); `/health` exposes `{tier, ceilingMb, providers[], monitored[]}`.
+`COHERE_API_KEY` · `VOYAGE_API_KEY` — registry order via `RAG_PROVIDER_ORDER` (default `cohere,voyage,local`). Health monitor snapshots breaker states to MongoDB every 60 seconds.
 
-### Content analysis & OCR
-Every upload is classified (kind, scanned-page ratio, token estimate, workload tier). Image files (`png/jpg/webp/bmp`) are OCR'd via tesseract.js **only when** `RAG_OCR_ENABLED=true` *and* the host has ≥300MB workload ceiling — TINY hosts get an honest notice instead. Scanned (image-only) PDFs are detected and reported; rasterizing them needs a larger instance.
+### Content Analysis and OCR
+
+Every upload is classified by kind, scanned-page ratio, token estimate, and workload tier. Image files are OCR'd via tesseract.js only when `RAG_OCR_ENABLED=true` and the host has sufficient memory.
 
 ---
 
-## 🚢 Production Deployment
+## Production Deployment
 
-### 1. Frontend (Cloudflare Pages)
+### Frontend (Cloudflare Pages)
+
 | Setting | Value |
 |---|---|
 | Preset | Vite |
@@ -148,74 +177,110 @@ Every upload is classified (kind, scanned-page ratio, token estimate, workload t
 | Output Directory | `dist` |
 | Env var | `VITE_API_URL=https://<your-backend-host>` |
 
-### 2. Backend (Render free tier proven)
+### Backend (Render free tier proven)
+
 | Setting | Value |
 |---|---|
 | Root Directory | `signaling-server` |
 | Build Command | `npm run build` |
 | Start Command | `npm start` |
 
-Environment variables:
-| Var | Purpose |
-|---|---|
-| `MONGODB_URI` | Atlas connection string |
-| `ALLOWED_ORIGINS` | Comma-separated frontend origins |
-| `NODE_ENV` | `production` |
-| `GROQ_API_KEY` | Enables AI answers (**must be set in the hosting dashboard** — `.env` is gitignored) |
-| `GROQ_MODEL` | Default `openai/gpt-oss-120b` |
-| `RAG_RERANK_ENABLED` | Leave unset on 512MB tiers (~400MB RAM). Opt-in on ≥1GB hosts |
-| `RAG_DIRECT_STUFF_CHARS` | Corpora up to this many extracted chars (default `48000`) skip embeddings — full content goes into the Groq prompt; the ONNX model never loads |
-| `RAG_RESUME_ENABLED` | Default on. After a crash/provider failure, indexing resumes from durable per-chunk work units without re-extracting files |
-| `RAG_BREAKER_THRESHOLD` / `RAG_BREAKER_COOLDOWN_MS` | Embedding-provider circuit breaker (default open after 3 failures, probe again after 30s) |
-| `RAG_EMBED_MODEL` / `RAG_EMBED_DTYPE` | Local embedder + ONNX quantization (defaults `Xenova/bge-small-en-v1.5`, `q8`) |
-| `RAG_MAX_CHUNKS` / `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` / `RAG_EMBED_BATCH` | Indexing tuning (defaults `4000` / `600` / `90` / `16`) |
-| `NODE_OPTIONS` | Recommended: `--max-old-space-size=384` — GC before container OOM |
+### Environment Variables
 
-Notes: ONNX weights (~25MB q8) download lazily on first *vector-mode* index only — small sessions use direct stuffing and never trigger it. Boot logs warn if `GROQ_API_KEY` is missing ("retrieval-only mode"). Sessions indexed before an embedder-model change self-heal: the first AI query returns `202 indexing` once while the index transparently rebuilds.
+| Variable | Purpose | Default |
+|---|---|---|
+| `MONGODB_URI` | Atlas connection string | — |
+| `ALLOWED_ORIGINS` | Comma-separated frontend origins | — |
+| `NODE_ENV` | `production` | — |
+| `GROQ_API_KEY` | Enables AI answers | — |
+| `GROQ_MODEL` | LLM model | `openai/gpt-oss-120b` |
+| `RAG_RERANK_ENABLED` | Cross-encoder reranking | unset on 512MB tiers |
+| `RAG_DIRECT_STUFF_CHARS` | Skip embeddings below this char count | `48000` |
+| `RAG_RESUME_ENABLED` | Resume indexing after crash | `true` |
+| `RAG_BREAKER_THRESHOLD` / `RAG_BREAKER_COOLDOWN_MS` | Circuit breaker tuning | `3` / `30000` |
+| `RAG_EMBED_MODEL` / `RAG_EMBED_DTYPE` | Local embedder + quantization | `Xenova/bge-small-en-v1.5` / `q8` |
+| `RAG_MAX_CHUNKS` / `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` / `RAG_EMBED_BATCH` | Indexing tuning | `4000` / `600` / `90` / `16` |
+| `NODE_OPTIONS` | Recommended: `--max-old-space-size=384` | — |
+| `AI_GLOBAL_BUDGET` | Global AI queries per hour | `200` |
+| `SESSION_GLOBAL_LIMIT` | Session creations per hour | `100` |
+| `UPLOAD_GLOBAL_CAP_MB` | Upload bandwidth cap (MB/hour) | `500` |
+| `WS_MAX_PER_IP` | WebSocket connections per IP | `20` |
+| `REQUEST_TIMEOUT_MS` | Request timeout | `30000` |
+| `MEMORY_THRESHOLD_MB` | Memory pressure threshold | `450` |
 
----
-
-## 📜 API quick reference
-
-| Endpoint | Notes |
-|---|---|
-| `POST /publish` | multipart; no password ⇒ open/AI-enabled, password ⇒ private/E2EE |
-| `PATCH /publish/:code` | update (requires old password if private) |
-| `GET /retrieve/:code` | honors burn-on-read & expiry |
-| `GET /file/:fileId/:token` | token-gated stream |
-| `POST /session` · WS join | live P2P (password mandatory) |
-| `GET /ai/status/:code` | `{aiStatus, aiMode, qualityTier, llmConfigured}` |
-| `POST /ai/query/:code` | `{question}` → `{answer, refused, sources[]}` · degraded answers carry `degraded:true, qualityTier:'keyword', notice` |
-| `GET /ice-servers` | cached STUN/TURN |
-| `GET /health`, `GET /stats` | ops visibility (`/stats` needs `STATS_KEY`) |
-
-## 🧯 Troubleshooting
-
-| Symptom | Meaning / Fix |
-|---|---|
-| `AI answering needs the operator to configure GROQ_API_KEY` | Key missing in **hosting dashboard** env (gitignored `.env` doesn't deploy) |
-| `AI is rate-limited…` | Free-tier quota or per-IP limiter — wait/retry |
-| `This session has expired and was cleaned up.` | TTL passed (default 1h, max 10h) — publish again |
-| `Indexing failed` | Genuine bug — check logs. Provider/quota exhaustion **degrades to keyword mode instead** (`aiMode:'bm25'`); re-publish after adding a key to upgrade |
-| Big book answers only some chapters | Enumeration questions now trigger wide recall (80 blocks + heading scan). Still short? The OCR notice in logs means scanned pages were skipped |
-| CORS errors in browser | Client origin must be listed in `ALLOWED_ORIGINS` (dev ports pinned: client 4000, server 3002) |
+> ONNX weights (~25MB) download lazily on first vector-mode index only. Sessions indexed before an embedder-model change self-heal: the first AI query returns `202 indexing` while the index rebuilds.
 
 ---
 
-## 📜 Scripts Reference
+## API Reference
+
+| Endpoint | Description |
+|---|---|
+| `POST /publish` | Upload files/text. No password = open session; password = private/E2EE. |
+| `PATCH /publish/:code?k=<token>` | Update an existing session. Requires join token. |
+| `GET /retrieve/:code?k=<token>` | Retrieve session data. Requires join token. |
+| `GET /file/:fileId/:token` | Download a file by token. |
+| `POST /session` | Create a live P2P session (password mandatory). |
+| `WS /` | WebSocket signaling for live sessions. |
+| `GET /ai/status/:code?k=<token>` | AI indexing status. Requires join token. |
+| `POST /ai/query/:code?k=<token>` | Ask a question about the session. Requires join token. |
+| `GET /ice-servers` | Cached STUN/TURN server list. |
+| `GET /health` | Health check. |
+| `GET /stats` | Server statistics (requires `STATS_KEY`). |
+| `GET /metrics` | Prometheus metrics (request duration, WebSocket connections, AI queries, memory). |
+| `POST /csp-report` | CSP violation reporting endpoint. |
+| `GET /robots.txt` | Disallows all crawling. |
+| `GET /.well-known/security.txt` | Security contact and policy. |
+
+---
+
+## Testing
+
+```bash
+cd signaling-server && npm test
+```
+
+95 tests covering RAG pipeline logic, embedding provider orchestration, circuit breakers, memory profiling, input sanitization, filename sanitization, security logging, session management, and answer caching.
+
+---
+
+## Scripts
 
 ### Backend (`signaling-server`)
-* `npm run dev` — hot-reload dev server
-* `npm run build` — compile TypeScript to `dist/`
-* `npm start` — production runner
+
+| Command | Description |
+|---|---|
+| `npm run dev` | Hot-reload dev server |
+| `npm run build` | Compile TypeScript to `dist/` |
+| `npm start` | Production runner |
+| `npm test` | Unit tests |
 
 ### Frontend (`client`)
-* `npm run dev` — dev server (:4000)
-* `npm run build` — type-check + production bundle to `dist/`
-* `npm run lint` — ESLint
+
+| Command | Description |
+|---|---|
+| `npm run dev` | Dev server on :4000 |
+| `npm run build` | Type-check + production bundle |
+| `npm run lint` | ESLint |
 
 ---
 
-## 📄 License / privacy summary
+## Troubleshooting
 
-Open-source project. Open sessions are stored unencrypted on the server and indexed for AI — do not put secrets in them. Use 🔒 Private mode for anything sensitive: content is encrypted in your browser, unreadable to the server, and excluded from all AI processing.
+| Symptom | Fix |
+|---|---|
+| `AI answering needs the operator to configure GROQ_API_KEY` | Set `GROQ_API_KEY` in your hosting dashboard (`.env` is gitignored and doesn't deploy). |
+| `AI is rate-limited` | Free-tier quota or per-IP limiter — wait and retry. |
+| `This session has expired` | TTL passed (default 1h, max 10h) — publish again. |
+| `Indexing failed` | Check logs. Provider issues degrade to keyword mode instead of failing. Add an API key to upgrade. |
+| Partial answers for large books | Enumeration questions trigger wide recall (80 blocks + heading scan). Scanned PDF pages may be skipped — check OCR logs. |
+| CORS errors | Client origin must be in `ALLOWED_ORIGINS` (dev: client 4000, server 3002). |
+| 401 on retrieve | Stored sessions require `?k=<token>` — the 6-digit code alone no longer authorizes access. |
+| 429 on AI query | Per-session or per-IP AI limit hit — wait and retry. |
+| 503 on upload | Upload bandwidth cap or memory pressure — check server logs. |
+
+---
+
+## License
+
+Open-source project. Open sessions are stored unencrypted on the server and indexed for AI — do not put secrets in them. Use Private mode for anything sensitive: content is encrypted in your browser, unreadable to the server, and excluded from all AI processing.
