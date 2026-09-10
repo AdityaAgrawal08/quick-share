@@ -162,7 +162,9 @@ export function handleConnection(ws: WebSocket, _req: IncomingMessage): void {
       return
     }
 
-    sendTo(ws, { type: 'error', payload: `Unknown type: ${msg.type}` })
+    // Item 9: Reject unknown message types — prevents abuse of the relay
+    logger.warn({ type: msg.type, ip: ext._ip }, 'WebSocket: unknown message type rejected')
+    ws.close(1003, 'Unknown message type')
   })
 
   ws.on('close', () => {
