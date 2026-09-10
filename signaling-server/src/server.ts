@@ -6,7 +6,6 @@ import multer from 'multer'
 import { ObjectId } from 'mongodb'
 import { randomInt, randomBytes } from 'crypto'
 import rateLimit from 'express-rate-limit'
-import helmet from 'helmet'
 import path from 'path'
 import crypto from 'crypto'
 import { promisify } from 'util'
@@ -17,7 +16,7 @@ import { createSession, activeSessions, getSession } from './sessionManager'
 import { handleConnection } from './relay'
 import { connectDB, reconnectDB, isRetryableMongoError, StoredSession, uploadFile, getFileStream, scheduleExpiry, clearExpiryTimer, deleteFiles, deleteSessionAndFiles } from './db'
 
-import logger, { securityLog } from './logger'
+import logger from './logger'
 import { CONFIG } from './config'
 import { detectMemoryProfile } from './rag/memory-profile'
 import { indexSession, recoverPendingIndexes } from './rag/pipeline'
@@ -82,7 +81,16 @@ function requireStoredMode(_req: Request, res: Response, next: NextFunction) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Security: sanitise uploaded filenames before storing in DB or GridFS.
-import { sanitiseFilename, sanitiseTextContent } from './security-utils.js'
+// Takes basename only (strips path), removes null bytes and double-dots.
+function sanitiseFilename(name: string): string {
+  const base = name.replace(/\\/g, '/').split('/').pop() ?? ''
+  const sanitised = base
+    .replace(/\x00/g, '')
+    .replace(/\.\./g, '')
+    .trim()
+    .slice(0, 255)
+  return sanitised || 'file'
+}
 
 // Security: generate a cryptographically random download token (32 hex chars).
 // Stored per-file in the session doc; required in the download URL.
@@ -195,65 +203,26 @@ const app = express()
 app.set('trust proxy', 1)
 app.use(express.json({ limit: '2mb' }))
 
-// Item 1: helmet — adds 15+ security headers automatically (CSP, HSTS preload,
-// X-Content-Type-Options, X-Frame-Options, etc.)
-// Item 2: CSP nonce — per-request nonce for any inline scripts
-// Items 12-14: DNS prefetch, COEP, CORP handled by helmet config
-app.use(helmet({
-  contentSecurityPolicy: false, // We set it manually with nonce
-  crossOriginEmbedderPolicy: false, // Would break external resources
-  crossOriginResourcePolicy: false, // Would break file downloads
-  hsts: { maxAge: 31536000, includeSubDomains: true },
-}))
-
-// Item 12: X-DNS-Prefetch-Control: off
-// Item 13: Cross-Origin-Embedder-Policy: require-corp (only on HTML pages)
-// Item 14: Cross-Origin-Resource-Policy: same-origin (only on API responses)
-// Item 2: Generate per-request nonce for CSP
+// Security: Global Security Headers & CORS
 app.use((req: Request, res: Response, next: NextFunction) => {
-  // Item 7: X-Request-ID tracing
-  const requestId = (req.headers['x-request-id'] as string) || randomBytes(12).toString('hex')
-  req.headers['x-request-id'] = requestId
-  res.setHeader('X-Request-ID', requestId)
-
-  // Item 10: Date header on all responses
-  res.setHeader('Date', new Date().toUTCString())
-
-  // Item 12: DNS prefetch off
-  res.setHeader('X-DNS-Prefetch-Control', 'off')
-
-  // Item 13: COEP on API responses
-  if (req.path.startsWith('/api') || req.path.startsWith('/ai') || req.path.startsWith('/retrieve') || req.path.startsWith('/publish')) {
-    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin')
-  }
-
-  // Item 2: CSP with nonce
-  const nonce = randomBytes(16).toString('base64')
-  res.setHeader('Content-Security-Policy', [
-    "default-src 'self'",
-    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
-    `style-src 'self' 'unsafe-inline'`,
-    `img-src 'self' data: blob:`,
-    `font-src 'self'`,
-    `connect-src 'self' ws: wss:`,
-    `frame-ancestors 'none'`,
-    `base-uri 'self'`,
-    `form-action 'self'`,
-    `upgrade-insecure-requests`,
-  ].join('; '))
-
-  // CORS (existing logic preserved)
   const origin = req.headers.origin as string | undefined
+  // Origin-dependent responses must not be cached across origins.
   res.setHeader('Vary', 'Origin')
   const isAllowed =
     !CONFIG.ALLOWED_ORIGINS.length ||
     CONFIG.ALLOWED_ORIGINS.includes('*') ||
     (origin !== undefined && CONFIG.ALLOWED_ORIGINS.includes(origin))
+  // Basic security headers
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'DENY')
+  res.setHeader('X-XSS-Protection', '1; mode=block')
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
 
   if (origin && isAllowed) {
     res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-session-password, x-request-id')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-session-password')
     res.setHeader('Access-Control-Allow-Credentials', 'true')
   }
 
@@ -277,19 +246,13 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 const WINDOW_MS = 15 * 60 * 1000 // 15 minutes
 
-// Item 4: Retry-After header helper — tells clients when to retry
-function rateLimitMessage(msg: string): { error: string; retryAfter: string } {
-  const retrySec = Math.ceil(WINDOW_MS / 1000)
-  return { error: msg, retryAfter: `${retrySec}s` }
-}
-
 // Stricter limits on creation endpoints (publish, session)
 const publishLimiter = rateLimit({
   windowMs: WINDOW_MS,
   limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  message: rateLimitMessage('Too many publish requests'),
+  message: { error: 'Too many publish requests — try again in 15 minutes' },
 })
 
 const patchLimiter = rateLimit({
@@ -297,7 +260,7 @@ const patchLimiter = rateLimit({
   limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  message: rateLimitMessage('Too many update requests'),
+  message: { error: 'Too many update requests — try again in 15 minutes' },
 })
 
 const sessionLimiter = rateLimit({
@@ -305,7 +268,7 @@ const sessionLimiter = rateLimit({
   limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  message: rateLimitMessage('Too many session requests'),
+  message: { error: 'Too many session requests — try again in 15 minutes' },
 })
 
 // Stricter limits for password attempts
@@ -314,7 +277,7 @@ const passwordLimiter = rateLimit({
   limit: 10, // 10 attempts per 15 minutes
   standardHeaders: true,
   legacyHeaders: false,
-  message: rateLimitMessage('Too many failed password attempts'),
+  message: { error: 'Too many failed password attempts — try again later' },
   skipSuccessfulRequests: true, // Only count 4xx/5xx
 })
 
@@ -333,7 +296,7 @@ const fileLimiter = rateLimit({
   limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
-  message: rateLimitMessage('Too many file download requests'),
+  message: { error: 'Too many file download requests — try again in 15 minutes' },
 })
 
 // ICE endpoint proxies an external Metered API call — protect the key/budget
@@ -350,180 +313,13 @@ const aiQueryLimiter = rateLimit({
   limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  message: rateLimitMessage('ai_busy'),
+  message: { error: 'ai_busy', message: 'Too many AI questions from this address — try again in 15 minutes' },
 })
-
-// ── DDoS & Abuse Protection ───────────────────────────────────────────────────
-
-// Security: Global AI query budget (CWE-770)
-// Prevents distributed abuse from burning through LLM API quotas.
-// This is a HARD cap across ALL IPs — per-IP limits above are softer.
-const AI_GLOBAL_BUDGET = parseInt(process.env.AI_GLOBAL_BUDGET ?? '200', 10) // queries per hour
-const aiGlobalBudget = { count: 0, windowStart: Date.now() }
-setInterval(() => {
-  const now = Date.now()
-  if (now - aiGlobalBudget.windowStart > 60 * 60 * 1000) {
-    if (aiGlobalBudget.count > AI_GLOBAL_BUDGET * 0.8) {
-      logger.warn({ count: aiGlobalBudget.count, budget: AI_GLOBAL_BUDGET }, '[security] AI global budget high')
-    }
-    aiGlobalBudget.count = 0
-    aiGlobalBudget.windowStart = now
-  }
-}, 60 * 1000).unref()
-
-function checkAiGlobalBudget(): boolean {
-  const now = Date.now()
-  if (now - aiGlobalBudget.windowStart > 60 * 60 * 1000) {
-    aiGlobalBudget.count = 0
-    aiGlobalBudget.windowStart = now
-  }
-  if (aiGlobalBudget.count >= AI_GLOBAL_BUDGET) return false
-  aiGlobalBudget.count++
-  return true
-}
-
-// Security: Global session creation rate limit (CWE-770)
-// Prevents session spam that could exhaust MongoDB storage or memory.
-const SESSION_GLOBAL_LIMIT = parseInt(process.env.SESSION_GLOBAL_LIMIT ?? '100', 10) // sessions per hour
-const sessionGlobalBudget = { count: 0, windowStart: Date.now() }
-setInterval(() => {
-  const now = Date.now()
-  if (now - sessionGlobalBudget.windowStart > 60 * 60 * 1000) {
-    sessionGlobalBudget.count = 0
-    sessionGlobalBudget.windowStart = now
-  }
-}, 60 * 1000).unref()
-
-function checkSessionGlobalBudget(): boolean {
-  const now = Date.now()
-  if (now - sessionGlobalBudget.windowStart > 60 * 60 * 1000) {
-    sessionGlobalBudget.count = 0
-    sessionGlobalBudget.windowStart = now
-  }
-  if (sessionGlobalBudget.count >= SESSION_GLOBAL_LIMIT) return false
-  sessionGlobalBudget.count++
-  return true
-}
-
-// Security: Request timeout enforcement (CWE-400)
-// Prevents slowloris and long-lived connections from exhausting the server.
-const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS ?? '30000', 10) // 30s default
-app.use((req: Request, res: Response, next: NextFunction) => {
-  req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-    if (!res.headersSent) {
-      res.status(408).json({ error: 'Request timeout' })
-    }
-    req.destroy()
-  })
-  next()
-})
-
-// Security: Global upload bandwidth cap (CWE-400)
-// Tracks bytes uploaded per hour across all requests.
-const UPLOAD_GLOBAL_CAP_BYTES = parseInt(process.env.UPLOAD_GLOBAL_CAP_MB ?? '500', 10) * 1024 * 1024 // 500MB/hour
-const uploadBandwidth = { bytes: 0, windowStart: Date.now() }
-setInterval(() => {
-  const now = Date.now()
-  if (now - uploadBandwidth.windowStart > 60 * 60 * 1000) {
-    if (uploadBandwidth.bytes > UPLOAD_GLOBAL_CAP_BYTES * 0.8) {
-      logger.warn({ bytes: uploadBandwidth.bytes, cap: UPLOAD_GLOBAL_CAP_BYTES }, '[security] upload bandwidth high')
-    }
-    uploadBandwidth.bytes = 0
-    uploadBandwidth.windowStart = now
-  }
-}, 60 * 1000).unref()
-
-function trackUploadBytes(n: number): boolean {
-  const now = Date.now()
-  if (now - uploadBandwidth.windowStart > 60 * 60 * 1000) {
-    uploadBandwidth.bytes = 0
-    uploadBandwidth.windowStart = now
-  }
-  if (uploadBandwidth.bytes + n > UPLOAD_GLOBAL_CAP_BYTES) return false
-  uploadBandwidth.bytes += n
-  return true
-}
-
-// Security: WebSocket connection limit per IP (CWE-770)
-// Prevents a single IP from opening hundreds of WebSocket connections.
-const WS_MAX_PER_IP = parseInt(process.env.WS_MAX_PER_IP ?? '20', 10)
-const wsConnectionsByIp = new Map<string, number>()
-setInterval(() => {
-  // Decay: halve counts every minute to allow gradual recovery
-  for (const [ip, count] of wsConnectionsByIp.entries()) {
-    const newCount = Math.floor(count / 2)
-    if (newCount <= 0) wsConnectionsByIp.delete(ip)
-    else wsConnectionsByIp.set(ip, newCount)
-  }
-}, 60 * 1000).unref()
-
-function canOpenWs(ip: string): boolean {
-  const current = wsConnectionsByIp.get(ip) ?? 0
-  if (current >= WS_MAX_PER_IP) return false
-  wsConnectionsByIp.set(ip, current + 1)
-  return true
-}
-
-function releaseWs(ip: string): void {
-  const current = wsConnectionsByIp.get(ip) ?? 0
-  if (current <= 1) wsConnectionsByIp.delete(ip)
-  else wsConnectionsByIp.set(ip, current - 1)
-}
-
-// Security: Per-session AI query quota (CWE-770)
-// Prevents a single session from consuming excessive LLM resources.
-const AI_SESSION_QUOTA = 50  // max queries per session lifetime
-const aiSessionQuota = new Map<string, { count: number; resetAt: number }>()
-// Periodic cleanup to prevent memory leak
-setInterval(() => {
-  const now = Date.now()
-  for (const [code, q] of aiSessionQuota.entries()) {
-    if (now > q.resetAt) aiSessionQuota.delete(code)
-  }
-}, 60 * 60 * 1000).unref()
-
-function checkAiSessionQuota(code: string): boolean {
-  const now = Date.now()
-  const q = aiSessionQuota.get(code)
-  if (!q || now > q.resetAt) {
-    aiSessionQuota.set(code, { count: 1, resetAt: now + 24 * 60 * 60 * 1000 }) // 24h window
-    return true
-  }
-  if (q.count >= AI_SESSION_QUOTA) return false
-  q.count++
-  return true
-}
-
-// Security: Maximum prompt length in characters (prevents token abuse)
-const AI_MAX_PROMPT_CHARS = 8000
-
-// ── Join Token Validation ─────────────────────────────────────────────────────
-// Security: The 6-digit code is a HUMAN-FRIENDLY IDENTIFIER, never a credential.
-// The joinToken (32-char hex) is the sole authorization credential for stored
-// sessions. Code-only access is rejected — this closes CWE-331 (brute-force).
-
-function validateJoinToken(req: Request, res: Response): string | null {
-  const joinToken = req.query['k'] as string
-  if (!joinToken || !/^[0-9a-f]{32}$/.test(joinToken)) {
-    const code = (req.params['code'] as string) || 'unknown'
-    const ip = req.ip || req.socket.remoteAddress || 'unknown'
-    securityLog.token_invalid({ code, ip })
-    res.status(401).json({ error: 'unauthorized', message: 'Valid join token required (?k=...)' })
-    return null
-  }
-  return joinToken
-}
 
 // ── Code generation ───────────────────────────────────────────────────────────
 
 function generateCode(): string {
   return randomInt(0, 1_000_000).toString().padStart(6, '0')
-}
-
-// Security: Generate an unguessable 32-char hex join token for each session.
-// The 6-digit code is for display/QR; the join token is the actual secret.
-function generateJoinToken(): string {
-  return randomBytes(16).toString('hex')
 }
 
 async function generateUniqueStoredCode(): Promise<string> {
@@ -562,9 +358,9 @@ app.post(
   upload.array('files'),
   async (req: Request, res: Response) => {
     try {
-      // Security: Basic text sanitisation (Item 5: event handlers, JS URIs)
+      // Security: Basic text sanitisation (remove script tags etc)
       let text = typeof req.body.text === 'string' ? req.body.text : ''
-      text = sanitiseTextContent(text)
+      text = text.replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, '').trim()
       
       const password = typeof req.body.password === 'string' ? req.body.password.trim() : ''
       const burnOnRead = req.body.burnOnRead === 'true' || req.body.burnOnRead === true
@@ -596,20 +392,6 @@ app.post(
         return
       }
 
-      // Security: Global session creation budget (CWE-770)
-      if (!checkSessionGlobalBudget()) {
-        securityLog.upload_rejected({ ip: req.ip || 'unknown', reason: 'session_global_quota' })
-        res.status(429).json({ error: 'Server at capacity — try again later' })
-        return
-      }
-
-      // Security: Global upload bandwidth cap (CWE-400)
-      if (!trackUploadBytes(totalBytes)) {
-        securityLog.upload_rejected({ ip: req.ip || 'unknown', reason: 'upload_bandwidth_cap' })
-        res.status(429).json({ error: 'Upload limit reached — try again later' })
-        return
-      }
-
       // Security: sanitise filenames before storing
       const sanitisedFiles = uploadedFiles.map((f) => ({
         ...f,
@@ -636,13 +418,12 @@ app.post(
           for (let attempt = 0; attempt < 5; attempt++) {
             try {
               const code      = await generateUniqueStoredCode()
-              const joinToken = generateJoinToken()
               const expiresAt = new Date(Date.now() + ttlMs)
 
               // Create the session doc with the uploaded files already attached.
               // This ensures that we never have a session with empty files if an upload fails.
               await StoredSession.create({
-                code, joinToken, text, files: storedFiles, expiresAt, burnOnRead,
+                code, text, files: storedFiles, expiresAt, burnOnRead,
                 ...(hashedPassword ? { password: hashedPassword } : {}),
                 aiStatus: isPrivate ? 'none' : 'pending',
               })
@@ -650,7 +431,7 @@ app.post(
               scheduleExpiry(code, expiresAt)
               kickIndex(code)
               logger.info(`[publish] stored ${code} — expires ${expiresAt.toISOString()} — ${sanitisedFiles.length} file(s) — ${isPrivate ? 'PRIVATE' : 'open'}`)
-              res.status(201).json({ code, joinToken, mode: 'stored', private: isPrivate, expiresAt: expiresAt.getTime(), ttlMs })
+              res.status(201).json({ code, mode: 'stored', private: isPrivate, expiresAt: expiresAt.getTime(), ttlMs })
               return
             } catch (err) {
               if (isE11000(err) && attempt < 4) {
@@ -684,6 +465,7 @@ app.post(
       const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE' || err?.code === 'LIMIT_FILE_COUNT'
       res.status(isLimit ? 400 : 500).json({
         error: isLimit ? 'Upload limit exceeded' : 'Server error during publish',
+        details: err?.message
       })
     }
   }
@@ -704,10 +486,6 @@ app.patch(
         res.status(400).json({ error: 'Invalid code format' })
         return
       }
-
-      // Security: joinToken is MANDATORY — 6-digit code alone is never sufficient
-      const joinToken = validateJoinToken(req, res)
-      if (!joinToken) return
 
       const text         = typeof req.body.text === 'string' ? req.body.text : ''
       const burnOnRead   = req.body.burnOnRead
@@ -734,8 +512,9 @@ app.patch(
         return
       }
 
-      // Security: verify ownership with joinToken — code alone is never sufficient
-      const existing = await StoredSession.findOne({ code, joinToken, expiresAt: { $gt: new Date() } }).select('+password').lean()
+      // Security: verify ownership ONCE before the retry loop — re-verifying
+      // inside each attempt was redundant (same request, same credentials).
+      const existing = await StoredSession.findOne({ code, expiresAt: { $gt: new Date() } }).select('+password').lean()
       if (!existing) {
         res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
         return
@@ -765,7 +544,7 @@ app.patch(
           // before this update so we never delete files a previous attempt
           // already swapped in. Password is NOT re-checked — credentials were
           // validated above and cannot change mid-request.
-          const current = await StoredSession.findOne({ code, joinToken }).lean()
+          const current = await StoredSession.findOne({ code }).lean()
           if (!current || (current.expiresAt && current.expiresAt <= new Date())) {
             res.status(404).json({ error: 'Session not found or expired — publish again to create a new one' })
             return
@@ -789,7 +568,7 @@ app.patch(
           if (password) updateSet.password = await hashPassword(password)
           if (burnOnRead !== undefined) updateSet.burnOnRead = burnOnRead === 'true' || burnOnRead === true
 
-          await StoredSession.updateOne({ code, joinToken }, { $set: updateSet })
+          await StoredSession.updateOne({ code }, { $set: updateSet })
 
           // Delete old GridFS files only after session doc points to new ones
           const oldIds = current.files.map((f) => f.gridfsId)
@@ -824,6 +603,7 @@ app.patch(
       const isLimit = err?.message?.includes('exceed') || err?.code === 'LIMIT_FILE_SIZE' || err?.code === 'LIMIT_FILE_COUNT'
       res.status(isLimit ? 400 : 500).json({
         error: isLimit ? 'Upload limit exceeded' : 'Server error during update',
+        details: err?.message
       })
     }
   }
@@ -839,10 +619,6 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
       return
     }
 
-    // Security: joinToken is MANDATORY — 6-digit code alone is never sufficient
-    const joinToken = validateJoinToken(req, res)
-    if (!joinToken) return
-
     // If Mongo isn't configured, only live sessions can be retrieved.
     if (!storedModeEnabled) {
       const liveSession = getSession(code)
@@ -851,8 +627,8 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
       return
     }
 
-    // Security: Always require joinToken for stored session retrieval
-    const session = await StoredSession.findOne({ code, joinToken }).select('+password').lean()
+    // Single DB query — check session existence
+    const session = await StoredSession.findOne({ code }).select('+password').lean()
 
     if (!session) {
       // Not a stored session — check if it's an active live session
@@ -890,12 +666,11 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
     let burnGraceMs: number | null = null
     if (session.burnOnRead) {
       const marked = await StoredSession.updateOne(
-        { code, joinToken, burnedAt: null },
+        { code, burnedAt: null },
         { $set: { burnedAt: new Date() } }
       )
       if (marked.modifiedCount === 1) {
         burnGraceMs = BURN_GRACE_MS
-        securityLog.burn_triggered({ code })
         logger.info({ code, graceMs: BURN_GRACE_MS }, '[retrieve] burn-on-read triggered')
         setTimeout(() => {
           clearExpiryTimer(code)
@@ -924,8 +699,7 @@ app.get('/retrieve/:code', retrieveLimiter, passwordLimiter, async (req: Request
     })
   } catch (err: any) {
     logger.error({ err }, '[retrieve] error')
-    // Security: Don't expose internal error details (CWE-200)
-    res.status(500).json({ error: 'Failed to retrieve session' })
+    res.status(500).json({ error: `Failed to retrieve session: ${err?.message || 'Unknown error'}` })
   }
 })
 
@@ -1020,10 +794,7 @@ app.get('/ai/status/:code', async (req: Request, res: Response) => {
       res.status(400).json({ error: 'Invalid code format' })
       return
     }
-    // Security: joinToken is MANDATORY — 6-digit code alone is never sufficient
-    const joinToken = validateJoinToken(req, res)
-    if (!joinToken) return
-    const session = await StoredSession.findOne({ code, joinToken })
+    const session = await StoredSession.findOne({ code })
       .select('aiStatus aiMode aiStats expiresAt burnedAt')
       .lean()
     if (!session) {
@@ -1062,32 +833,8 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     return
   }
 
-  // Security: joinToken is MANDATORY — 6-digit code alone is never sufficient
-  const joinToken = validateJoinToken(req, res)
-  if (!joinToken) return
-
-  // Security: Per-session AI quota (CWE-770)
-  if (!checkAiSessionQuota(code)) {
-    securityLog.ai_quota_exceeded({ code, ip: req.ip || 'unknown' })
-    res.status(429).json({ error: 'ai_session_quota', message: 'AI query limit reached for this session — try again later' })
-    recordAiQuery('quota')
-    return
-  }
-
-  // Security: Global AI budget (CWE-770)
-  if (!checkAiGlobalBudget()) {
-    res.status(429).json({ error: 'ai_busy', message: 'AI system at capacity — try again shortly' })
-    return
-  }
-
-  // Security: Prompt length limit (prevents token abuse)
-  if (question.length > AI_MAX_PROMPT_CHARS) {
-    res.status(400).json({ error: 'question too long', message: `Question must be under ${AI_MAX_PROMPT_CHARS} characters` })
-    return
-  }
-
   try {
-    const session = await StoredSession.findOne({ code, joinToken })
+    const session = await StoredSession.findOne({ code })
       .select('aiStatus expiresAt burnedAt +password')
       .lean()
     if (!session) {
@@ -1208,7 +955,6 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
           if (t.startsWith('__FULL__')) {
             const fin = JSON.parse(t.slice(8)) as { text: string; refused: boolean }
             putAnswer(code, question, { answer: fin.text, refused: fin.refused, sources })
-            recordAiQuery('success')
             sseSend('done', { refused: fin.refused, cached: false, fullText: fin.text })
           } else {
             full += t
@@ -1217,7 +963,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
         }
       } catch (llmErr) {
         const msg = llmErr instanceof Error ? llmErr.message : 'ai_error'
-        const groqStatus = msg.startsWith('ai_error:') ? parseInt(msg.split(':')[1]) : undefined
+        const groqStatus = msg.startsWith('ai_error:') ? parseInt(msg.slice(9)) : undefined
         const code2 = msg === 'ai_busy' ? 'ai_busy' : msg === 'ai_config' ? 'ai_config' : 'ai_error'
         sseSend('error', { error: code2, groqStatus })
         res.end()
@@ -1241,13 +987,13 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
         res.status(503).json({ error: 'ai_config', message: 'LLM key invalid — contact the operator' })
         return
       }
-      const groqStatus = msg.startsWith('ai_error:') ? parseInt(msg.split(':')[1]) : undefined
+      const groqStatus = msg.startsWith('ai_error:') ? parseInt(msg.slice(9)) : undefined
       logger.warn({ groqStatus, code }, '[ai] Groq LLM error')
-      throw llmErr
+      res.status(502).json({ error: 'ai_error', groqStatus, message: groqStatus ? `Groq API error (HTTP ${groqStatus})` : 'AI service error' })
+      return
     }
 
     putAnswer(code, question, { answer: answer.text, refused: answer.refused, sources })
-    recordAiQuery('success')
     res.json({
       answer: answer.text,
       refused: answer.refused,
@@ -1335,13 +1081,6 @@ app.post('/session', sessionLimiter, async (req: Request, res: Response) => {
     return
   }
 
-  // Security: Global session creation budget (CWE-770)
-  if (!checkSessionGlobalBudget()) {
-    securityLog.upload_rejected({ ip: req.ip || 'unknown', reason: 'session_global_quota' })
-    res.status(429).json({ error: 'Server at capacity — try again later' })
-    return
-  }
-
   try {
     const hashedPassword = await hashPassword(password)
     const code = createSession(effectiveTtl, hashedPassword)
@@ -1404,89 +1143,17 @@ app.get('/health', async (_req: Request, res: Response) => {
     }
   }
 
-  // Security: Minimize health endpoint information disclosure (CWE-209)
-  // Only return essential status information; internal details are available via /stats (protected)
   res.json({
     status:             mongoPing === -2 ? 'degraded' : 'ok',
+    version:            '1.1.0',
     storedModeEnabled:  storedModeEnabled && !isStorageFull,
+    isStorageFull,
+    mongoLatency:       mongoPing,
+    gridfsStatus,
     activeLiveSessions: activeSessions(),
+    uptime:             Math.floor(process.uptime()),
+    ...(ragHealth ? { rag: ragHealth } : {}),
   })
-})
-
-// ── Item 15: Prometheus /metrics endpoint ─────────────────────────────────────
-// Free observability — request counts, latencies, error rates, memory.
-import { Registry, Counter, Histogram, Gauge, collectDefaultMetrics } from 'prom-client'
-
-const metricsRegistry = new Registry()
-collectDefaultMetrics({ register: metricsRegistry, prefix: 'quickshare_' })
-
-const httpRequestDuration = new Histogram({
-  name: 'quickshare_http_request_duration_seconds',
-  help: 'Duration of HTTP requests in seconds',
-  labelNames: ['method', 'route', 'status_code'],
-  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10],
-  registers: [metricsRegistry],
-})
-
-const httpRequestTotal = new Counter({
-  name: 'quickshare_http_requests_total',
-  help: 'Total number of HTTP requests',
-  labelNames: ['method', 'route', 'status_code'],
-  registers: [metricsRegistry],
-})
-
-const wsConnections = new Gauge({
-  name: 'quickshare_websocket_connections',
-  help: 'Current number of WebSocket connections',
-  registers: [metricsRegistry],
-})
-
-const aiQueriesTotal = new Counter({
-  name: 'quickshare_ai_queries_total',
-  help: 'Total AI queries',
-  labelNames: ['status'],
-  registers: [metricsRegistry],
-})
-
-const memoryRss = new Gauge({
-  name: 'quickshare_memory_rss_bytes',
-  help: 'Process RSS memory in bytes',
-  registers: [metricsRegistry],
-})
-
-// Middleware: track request duration and count
-app.use((req: Request, res: Response, next: NextFunction) => {
-  if (req.path === '/metrics' || req.path === '/health') return next()
-  const start = process.hrtime.bigint()
-  res.on('finish', () => {
-    const durationSec = Number(process.hrtime.bigint() - start) / 1e9
-    const route = req.route?.path || req.path
-    const labels = { method: req.method, route, status_code: res.statusCode }
-    httpRequestDuration.observe(labels, durationSec)
-    httpRequestTotal.inc(labels)
-  })
-  next()
-})
-
-// Update gauges periodically
-setInterval(() => {
-  memoryRss.set(process.memoryUsage().rss)
-  wsConnections.set(wss.clients.size)
-}, 10_000).unref()
-
-// Expose for AI query counting
-export function recordAiQuery(status: 'success' | 'error' | 'quota'): void {
-  aiQueriesTotal.inc({ status })
-}
-
-// Metrics endpoint (Prometheus text format)
-app.get('/metrics', async (_req: Request, res: Response) => {
-  try {
-    res.setHeader('Content-Type', metricsRegistry.contentType)
-    res.send(await metricsRegistry.metrics())
-  } catch {
-    res.status(500).send('Error collecting metrics')
-  }
 })
 
 // ── GET /stats — Phase 10: Monitoring ──────────────────────────────────────────
@@ -1540,24 +1207,10 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy()
     return
   }
-
-  // Security: WebSocket connection limit per IP (CWE-770)
-  const ip = req.socket.remoteAddress || 'unknown'
-  if (!canOpenWs(ip)) {
-    logger.warn({ ip }, '[security] WebSocket connection limit exceeded')
-    socket.write('HTTP/1.1 429 Too Many Connections\r\nConnection: close\r\n\r\n')
-    socket.destroy()
-    return
-  }
-
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
 })
 
-wss.on('connection', (ws, req) => {
-  const ip = req.socket.remoteAddress || 'unknown'
-  ws.on('close', () => releaseWs(ip))
-  handleConnection(ws, req)
-})
+wss.on('connection', handleConnection)
 wss.on('error', (err) => logger.error({ err }, '[wss] error'))
 
 // ── WebSocket Heartbeat ───────────────────────────────────────────────────────
@@ -1576,101 +1229,17 @@ const heartbeatInterval = setInterval(() => {
 }, HEARTBEAT_INTERVAL_MS)
 if (heartbeatInterval.unref) heartbeatInterval.unref()
 
-// ── Item 8: Memory pressure monitoring & load shedding ───────────────────────
-// Checks RSS every 30s. When memory exceeds threshold, sheds load by returning
-// 503 on expensive endpoints (publish, AI) to prevent OOM kills.
-const MEMORY_THRESHOLD_MB = parseInt(process.env.MEMORY_THRESHOLD_MB ?? '450', 10)
-let memoryPressureActive = false
-setInterval(() => {
-  const rssMb = Math.round(process.memoryUsage().rss / 1024 / 1024)
-  if (rssMb > MEMORY_THRESHOLD_MB && !memoryPressureActive) {
-    memoryPressureActive = true
-    logger.warn({ rssMb, threshold: MEMORY_THRESHOLD_MB }, '[security] memory pressure activated — shedding load')
-  } else if (rssMb < MEMORY_THRESHOLD_MB * 0.8 && memoryPressureActive) {
-    memoryPressureActive = false
-    logger.info({ rssMb }, '[security] memory pressure relieved')
-  }
-}, 30_000).unref()
-
-// Middleware: reject expensive requests when under memory pressure
-app.use((req: Request, res: Response, next: NextFunction) => {
-  if (!memoryPressureActive) return next()
-  const isExpensive = req.method === 'POST' && (
-    req.path === '/publish' || req.path.startsWith('/publish/') ||
-    req.path.startsWith('/ai/') || req.path === '/session'
-  )
-  if (isExpensive) {
-    res.status(503).json({ error: 'Server under memory pressure — try again later' })
-    return
-  }
-  next()
-})
-
-// ── Item 18: robots.txt ──────────────────────────────────────────────────────
-app.get('/robots.txt', (_req: Request, res: Response) => {
-  res.setHeader('Content-Type', 'text/plain')
-  res.setHeader('Cache-Control', 'public, max-age=86400')
-  res.send('User-agent: *\nDisallow: /\n')
-})
-
-// ── Item 19: security.txt ────────────────────────────────────────────────────
-app.get('/.well-known/security.txt', (_req: Request, res: Response) => {
-  res.setHeader('Content-Type', 'text/plain')
-  res.send([
-    'Contact: https://github.com/anomalyco/opencode/issues',
-    'Preferred-Languages: en',
-    'Policy: https://github.com/anomalyco/opencode/blob/main/SECURITY.md',
-    'Expires: ' + new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
-  ].join('\n'))
-})
-
-// ── Item 20: CSP violation report endpoint ────────────────────────────────────
-app.post('/csp-report', express.json({ type: 'application/csp-report' }), (req: Request, res: Response) => {
-  const report = req.body?.['csp-report']
-  if (report) {
-    logger.warn({
-      event: 'csp.violation',
-      directive: report['violated-directive'],
-      blocked: report['blocked-uri'],
-      source: report['source-file'],
-      line: report['line-number'],
-    }, 'CSP violation reported')
-  }
-  res.sendStatus(204)
-})
-
-// ── Item 11: Cache-Control: no-store on sensitive endpoints ───────────────────
-// Prevents browsers/proxies from caching session data, AI responses, or files.
-app.use('/retrieve', (_req: Request, res: Response, next: NextFunction) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
-  res.setHeader('Pragma', 'no-cache')
-  next()
-})
-app.use('/ai', (_req: Request, res: Response, next: NextFunction) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
-  res.setHeader('Pragma', 'no-cache')
-  next()
-})
-app.use('/file', (_req: Request, res: Response, next: NextFunction) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
-  res.setHeader('Pragma', 'no-cache')
-  next()
-})
-app.use('/publish', (_req: Request, res: Response, next: NextFunction) => {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
-  res.setHeader('Pragma', 'no-cache')
-  next()
-})
-
 // ── Error Handling ───────────────────────────────────────────────────────────
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   logger.error({ err }, 'Unhandled error')
   
   const status = err.status || 500
+  const isProduction = process.env.NODE_ENV === 'production'
   
-  // Security: Don't expose internal error details (CWE-200)
   res.status(status).json({
-    error: status === 500 ? 'internal_server_error' : (err.message || 'request_error'),
+    error: status === 500 ? 'internal_server_error' : err.message,
+    message: status === 500 ? 'Something went wrong on our end. Please try again later.' : err.message,
+    ...(isProduction ? {} : { stack: err.stack })
   })
 })
 

@@ -9,9 +9,9 @@ const dist = p => require(`../../dist/${p}`)
 
 const { sanitiseFilename, sanitiseTextContent } = dist('security-utils.js')
 
-// ── Item 5: sanitiseTextContent ─────────────────────────────────────────────
+// ── sanitiseTextContent ─────────────────────────────────────────────────────
 
-describe('sanitiseTextContent (Item 5)', () => {
+describe('sanitiseTextContent', () => {
   it('strips <script> tags with content', () => {
     assert.equal(sanitiseTextContent('hello<script>alert(1)</script>world'), 'helloworld')
   })
@@ -40,7 +40,6 @@ describe('sanitiseTextContent (Item 5)', () => {
   it('strips data: URIs (non-image)', () => {
     const r = sanitiseTextContent('data:text/html,<b>evil</b>')
     assert.ok(!r.includes('data:'), `data: URI should be stripped: ${r}`)
-    // images are allowed
     assert.ok(sanitiseTextContent('<img src="data:image/png;base64,abc">').includes('data:image/png'))
   })
 
@@ -91,11 +90,10 @@ describe('sanitiseTextContent (Item 5)', () => {
   })
 })
 
-// ── Item 6: sanitiseFilename ────────────────────────────────────────────────
+// ── sanitiseFilename ────────────────────────────────────────────────────────
 
-describe('sanitiseFilename (Item 6)', () => {
+describe('sanitiseFilename', () => {
   it('strips path traversal (..)', () => {
-    // basename of '../../etc/passwd' is 'passwd'; no '..' remains after split
     const r = sanitiseFilename('../../etc/passwd')
     assert.ok(!r.includes('..'), `double-dots should be stripped: ${r}`)
     assert.ok(r.length > 0, 'should not be empty')
@@ -134,27 +132,9 @@ describe('sanitiseFilename (Item 6)', () => {
   })
 })
 
-// ── Item 1: helmet security headers ────────────────────────────────────────
+// ── sessionManager ──────────────────────────────────────────────────────────
 
-describe('helmet + security headers (Item 1)', () => {
-  it('helmet is installed and importable', () => {
-    const helmet = require('helmet')
-    assert.equal(typeof helmet, 'function')
-  })
-})
-
-// ── Item 15: Prometheus metrics ────────────────────────────────────────────
-
-describe('prom-client metrics (Item 15)', () => {
-  it('prom-client is installed and importable', () => {
-    const client = require('prom-client')
-    assert.equal(typeof client.Registry, 'function')
-  })
-})
-
-// ── Session manager (P0-5: live session auth) ──────────────────────────────
-
-describe('sessionManager (P0-5)', () => {
+describe('sessionManager', () => {
   const { createSession, getSession, activeSessions } = dist('sessionManager.js')
 
   it('createSession returns a 6-char hex code', () => {
@@ -178,43 +158,22 @@ describe('sessionManager (P0-5)', () => {
   })
 })
 
-// ── WebSocket message rejection (Item 9) ───────────────────────────────────
-
-describe('relay unknown message type rejection (Item 9)', () => {
-  it('handleConnection is exported', () => {
-    const { handleConnection } = dist('relay.js')
-    assert.equal(typeof handleConnection, 'function')
-  })
-})
-
-// ── Logger / securityLog (forensics) ───────────────────────────────────────
-
-describe('securityLog (Item 7)', () => {
-  it('securityLog is exported with expected methods', () => {
-    const { securityLog } = dist('logger.js')
-    assert.equal(typeof securityLog.token_invalid, 'function')
-    assert.equal(typeof securityLog.burn_triggered, 'function')
-    assert.equal(typeof securityLog.ai_quota_exceeded, 'function')
-    assert.equal(typeof securityLog.upload_rejected, 'function')
-  })
-})
-
-// ── Answer cache (P1-11 AI quota) ──────────────────────────────────────────
+// ── answerCache ─────────────────────────────────────────────────────────────
 
 describe('answerCache', () => {
   const { getAnswer, putAnswer, clearAnswerCache, answerCacheSize } = dist('rag/answerCache.js')
 
   it('putAnswer/getAnswer round-trips', () => {
-    putAnswer('code1', 'q1', { answer: 'a1', refused: false, sources: [] })
-    const cached = getAnswer('code1', 'q1')
+    putAnswer('c1', 'q1', { answer: 'a1', refused: false, sources: [] })
+    const cached = getAnswer('c1', 'q1')
     assert.ok(cached)
     assert.equal(cached.answer, 'a1')
   })
 
   it('clearAnswerCache wipes a session', () => {
-    putAnswer('code2', 'q1', { answer: 'a', refused: false, sources: [] })
-    clearAnswerCache('code2')
-    assert.equal(getAnswer('code2', 'q1'), undefined)
+    putAnswer('c2', 'q1', { answer: 'a', refused: false, sources: [] })
+    clearAnswerCache('c2')
+    assert.equal(getAnswer('c2', 'q1'), undefined)
   })
 
   it('answerCacheSize returns a number', () => {

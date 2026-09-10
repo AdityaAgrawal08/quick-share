@@ -1,5 +1,4 @@
 // Security utility functions — extracted for testability.
-// Item 5: sanitiseTextContent, Item 6: sanitiseFilename
 
 // Takes basename only (strips path), removes null bytes, double-dots, and
 // control characters. Enforces max length.
@@ -15,27 +14,19 @@ export function sanitiseFilename(name: string): string {
   return sanitised || 'file'
 }
 
-// Security: sanitise user-supplied text content (Item 5)
+// Sanitise user-supplied text content.
 // Removes script tags, event handlers, javascript: URIs, and data: URIs
 // that could execute code when the text is rendered in the UI.
 export function sanitiseTextContent(text: string): string {
   return text
-    // Script tags (including multiline)
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gim, '')
     .replace(/<script\b[^>]*\/?>/gim, '')
-    // Event handlers on any element
     .replace(/\bon\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    // javascript: URIs
     .replace(/javascript\s*:/gi, '')
-    // data: URIs (except images in img src)
     .replace(/data\s*:(?!image\/)/gi, '')
-    // VBScript (legacy IE)
     .replace(/vbscript\s*:/gi, '')
-    // <base> tag hijacking
     .replace(/<base\b[^>]*>/gim, '')
-    // <meta> refresh redirect
     .replace(/<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>/gim, '')
-    // <iframe> and <object> and <embed>
     .replace(/<(iframe|object|embed|applet)\b[^>]*>[\s\S]*?<\/\1>/gim, '')
     .replace(/<(iframe|object|embed|applet)\b[^>]*\/?>/gim, '')
     .trim()

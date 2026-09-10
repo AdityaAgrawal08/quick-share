@@ -493,7 +493,7 @@ export default function App() {
         body: JSON.stringify({ question }), signal: AbortSignal.timeout(90_000),
       })
       const ct = res.headers.get('content-type') ?? ''
-      if (!res.ok) { const data = await res.json(); return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status } }
+      if (!res.ok) { const data = await res.json(); return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status, groqStatus: data.groqStatus } }
       if (ct.includes('text/event-stream')) {
         const reader = res.body!.getReader(); const decoder = new TextDecoder()
         let buf = ''; let full = ''; let refused = false; let cached = false; let err: string | null = null; let groqStatus: number | undefined; let sources: AiSource[] | undefined
@@ -518,14 +518,14 @@ export default function App() {
         return { answer: full, refused, sources, status: res.status }
       }
       const data = await res.json()
-      if (!res.ok) return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status }
+      if (!res.ok) return { answer: '', error: String(data.error ?? 'ai_error'), status: res.status, groqStatus: data.groqStatus }
       return { answer: data.answer, refused: data.refused, sources: data.sources }
     } catch { return { answer: '', error: 'network' } }
   }
   async function askAi(question: string, cbs?: { onDelta?: (t: string) => void; onSources?: (s: AiSource[]) => void; onDone?: (fullText: string, refused: boolean, cached: boolean) => void }): Promise<AskResult> {
     let r = await askAiOnce(question, cbs)
     if ((r.error === 'network' || (r.status !== undefined && r.status >= 500)) && !cbs?.onDelta) { await new Promise(res => setTimeout(res, 900)); r = await askAiOnce(question, cbs) }
-    return { answer: r.answer, refused: r.refused, sources: r.sources, error: r.error }
+    return { answer: r.answer, refused: r.refused, sources: r.sources, error: r.error, groqStatus: r.groqStatus }
   }
 
   function reset() {
