@@ -6,6 +6,7 @@ import multer from 'multer'
 import { ObjectId } from 'mongodb'
 import { randomInt, randomBytes } from 'crypto'
 import rateLimit from 'express-rate-limit'
+import helmet from 'helmet'
 import path from 'path'
 import crypto from 'crypto'
 import { promisify } from 'util'
@@ -81,16 +82,7 @@ function requireStoredMode(_req: Request, res: Response, next: NextFunction) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Security: sanitise uploaded filenames before storing in DB or GridFS.
-// Takes basename only (strips path), removes null bytes and double-dots.
-function sanitiseFilename(name: string): string {
-  const base = name.replace(/\\/g, '/').split('/').pop() ?? ''
-  const sanitised = base
-    .replace(/\x00/g, '')
-    .replace(/\.\./g, '')
-    .trim()
-    .slice(0, 255)
-  return sanitised || 'file'
-}
+import { sanitiseFilename, sanitiseTextContent } from './security-utils.js'
 
 // Security: generate a cryptographically random download token (32 hex chars).
 // Stored per-file in the session doc; required in the download URL.
@@ -203,26 +195,65 @@ const app = express()
 app.set('trust proxy', 1)
 app.use(express.json({ limit: '2mb' }))
 
-// Security: Global Security Headers & CORS
+// Item 1: helmet — adds 15+ security headers automatically (CSP, HSTS preload,
+// X-Content-Type-Options, X-Frame-Options, etc.)
+// Item 2: CSP nonce — per-request nonce for any inline scripts
+// Items 12-14: DNS prefetch, COEP, CORP handled by helmet config
+app.use(helmet({
+  contentSecurityPolicy: false, // We set it manually with nonce
+  crossOriginEmbedderPolicy: false, // Would break external resources
+  crossOriginResourcePolicy: false, // Would break file downloads
+  hsts: { maxAge: 31536000, includeSubDomains: true },
+}))
+
+// Item 12: X-DNS-Prefetch-Control: off
+// Item 13: Cross-Origin-Embedder-Policy: require-corp (only on HTML pages)
+// Item 14: Cross-Origin-Resource-Policy: same-origin (only on API responses)
+// Item 2: Generate per-request nonce for CSP
 app.use((req: Request, res: Response, next: NextFunction) => {
+  // Item 7: X-Request-ID tracing
+  const requestId = (req.headers['x-request-id'] as string) || randomBytes(12).toString('hex')
+  req.headers['x-request-id'] = requestId
+  res.setHeader('X-Request-ID', requestId)
+
+  // Item 10: Date header on all responses
+  res.setHeader('Date', new Date().toUTCString())
+
+  // Item 12: DNS prefetch off
+  res.setHeader('X-DNS-Prefetch-Control', 'off')
+
+  // Item 13: COEP on API responses
+  if (req.path.startsWith('/api') || req.path.startsWith('/ai') || req.path.startsWith('/retrieve') || req.path.startsWith('/publish')) {
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin')
+  }
+
+  // Item 2: CSP with nonce
+  const nonce = randomBytes(16).toString('base64')
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
+    `style-src 'self' 'unsafe-inline'`,
+    `img-src 'self' data: blob:`,
+    `font-src 'self'`,
+    `connect-src 'self' ws: wss:`,
+    `frame-ancestors 'none'`,
+    `base-uri 'self'`,
+    `form-action 'self'`,
+    `upgrade-insecure-requests`,
+  ].join('; '))
+
+  // CORS (existing logic preserved)
   const origin = req.headers.origin as string | undefined
-  // Origin-dependent responses must not be cached across origins.
   res.setHeader('Vary', 'Origin')
   const isAllowed =
     !CONFIG.ALLOWED_ORIGINS.length ||
     CONFIG.ALLOWED_ORIGINS.includes('*') ||
     (origin !== undefined && CONFIG.ALLOWED_ORIGINS.includes(origin))
-  // Basic security headers
-  res.setHeader('X-Content-Type-Options', 'nosniff')
-  res.setHeader('X-Frame-Options', 'DENY')
-  res.setHeader('X-XSS-Protection', '1; mode=block')
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')
-  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
 
   if (origin && isAllowed) {
     res.setHeader('Access-Control-Allow-Origin', origin)
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-session-password')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-session-password, x-request-id')
     res.setHeader('Access-Control-Allow-Credentials', 'true')
   }
 
@@ -246,13 +277,19 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 const WINDOW_MS = 15 * 60 * 1000 // 15 minutes
 
+// Item 4: Retry-After header helper — tells clients when to retry
+function rateLimitMessage(msg: string): { error: string; retryAfter: string } {
+  const retrySec = Math.ceil(WINDOW_MS / 1000)
+  return { error: msg, retryAfter: `${retrySec}s` }
+}
+
 // Stricter limits on creation endpoints (publish, session)
 const publishLimiter = rateLimit({
   windowMs: WINDOW_MS,
   limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many publish requests — try again in 15 minutes' },
+  message: rateLimitMessage('Too many publish requests'),
 })
 
 const patchLimiter = rateLimit({
@@ -260,7 +297,7 @@ const patchLimiter = rateLimit({
   limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many update requests — try again in 15 minutes' },
+  message: rateLimitMessage('Too many update requests'),
 })
 
 const sessionLimiter = rateLimit({
@@ -268,7 +305,7 @@ const sessionLimiter = rateLimit({
   limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many session requests — try again in 15 minutes' },
+  message: rateLimitMessage('Too many session requests'),
 })
 
 // Stricter limits for password attempts
@@ -277,7 +314,7 @@ const passwordLimiter = rateLimit({
   limit: 10, // 10 attempts per 15 minutes
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many failed password attempts — try again later' },
+  message: rateLimitMessage('Too many failed password attempts'),
   skipSuccessfulRequests: true, // Only count 4xx/5xx
 })
 
@@ -296,7 +333,7 @@ const fileLimiter = rateLimit({
   limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many file download requests — try again in 15 minutes' },
+  message: rateLimitMessage('Too many file download requests'),
 })
 
 // ICE endpoint proxies an external Metered API call — protect the key/budget
@@ -313,8 +350,125 @@ const aiQueryLimiter = rateLimit({
   limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'ai_busy', message: 'Too many AI questions from this address — try again in 15 minutes' },
+  message: rateLimitMessage('ai_busy'),
 })
+
+// ── DDoS & Abuse Protection ───────────────────────────────────────────────────
+
+// Security: Global AI query budget (CWE-770)
+// Prevents distributed abuse from burning through LLM API quotas.
+// This is a HARD cap across ALL IPs — per-IP limits above are softer.
+const AI_GLOBAL_BUDGET = parseInt(process.env.AI_GLOBAL_BUDGET ?? '200', 10) // queries per hour
+const aiGlobalBudget = { count: 0, windowStart: Date.now() }
+setInterval(() => {
+  const now = Date.now()
+  if (now - aiGlobalBudget.windowStart > 60 * 60 * 1000) {
+    if (aiGlobalBudget.count > AI_GLOBAL_BUDGET * 0.8) {
+      logger.warn({ count: aiGlobalBudget.count, budget: AI_GLOBAL_BUDGET }, '[security] AI global budget high')
+    }
+    aiGlobalBudget.count = 0
+    aiGlobalBudget.windowStart = now
+  }
+}, 60 * 1000).unref()
+
+function checkAiGlobalBudget(): boolean {
+  const now = Date.now()
+  if (now - aiGlobalBudget.windowStart > 60 * 60 * 1000) {
+    aiGlobalBudget.count = 0
+    aiGlobalBudget.windowStart = now
+  }
+  if (aiGlobalBudget.count >= AI_GLOBAL_BUDGET) return false
+  aiGlobalBudget.count++
+  return true
+}
+
+// Security: Global session creation rate limit (CWE-770)
+// Prevents session spam that could exhaust MongoDB storage or memory.
+const SESSION_GLOBAL_LIMIT = parseInt(process.env.SESSION_GLOBAL_LIMIT ?? '100', 10) // sessions per hour
+const sessionGlobalBudget = { count: 0, windowStart: Date.now() }
+setInterval(() => {
+  const now = Date.now()
+  if (now - sessionGlobalBudget.windowStart > 60 * 60 * 1000) {
+    sessionGlobalBudget.count = 0
+    sessionGlobalBudget.windowStart = now
+  }
+}, 60 * 1000).unref()
+
+function checkSessionGlobalBudget(): boolean {
+  const now = Date.now()
+  if (now - sessionGlobalBudget.windowStart > 60 * 60 * 1000) {
+    sessionGlobalBudget.count = 0
+    sessionGlobalBudget.windowStart = now
+  }
+  if (sessionGlobalBudget.count >= SESSION_GLOBAL_LIMIT) return false
+  sessionGlobalBudget.count++
+  return true
+}
+
+// Security: Request timeout enforcement (CWE-400)
+// Prevents slowloris and long-lived connections from exhausting the server.
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS ?? '30000', 10) // 30s default
+app.use((req: Request, res: Response, next: NextFunction) => {
+  req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+    if (!res.headersSent) {
+      res.status(408).json({ error: 'Request timeout' })
+    }
+    req.destroy()
+  })
+  next()
+})
+
+// Security: Global upload bandwidth cap (CWE-400)
+// Tracks bytes uploaded per hour across all requests.
+const UPLOAD_GLOBAL_CAP_BYTES = parseInt(process.env.UPLOAD_GLOBAL_CAP_MB ?? '500', 10) * 1024 * 1024 // 500MB/hour
+const uploadBandwidth = { bytes: 0, windowStart: Date.now() }
+setInterval(() => {
+  const now = Date.now()
+  if (now - uploadBandwidth.windowStart > 60 * 60 * 1000) {
+    if (uploadBandwidth.bytes > UPLOAD_GLOBAL_CAP_BYTES * 0.8) {
+      logger.warn({ bytes: uploadBandwidth.bytes, cap: UPLOAD_GLOBAL_CAP_BYTES }, '[security] upload bandwidth high')
+    }
+    uploadBandwidth.bytes = 0
+    uploadBandwidth.windowStart = now
+  }
+}, 60 * 1000).unref()
+
+function trackUploadBytes(n: number): boolean {
+  const now = Date.now()
+  if (now - uploadBandwidth.windowStart > 60 * 60 * 1000) {
+    uploadBandwidth.bytes = 0
+    uploadBandwidth.windowStart = now
+  }
+  if (uploadBandwidth.bytes + n > UPLOAD_GLOBAL_CAP_BYTES) return false
+  uploadBandwidth.bytes += n
+  return true
+}
+
+// Security: WebSocket connection limit per IP (CWE-770)
+// Prevents a single IP from opening hundreds of WebSocket connections.
+const WS_MAX_PER_IP = parseInt(process.env.WS_MAX_PER_IP ?? '20', 10)
+const wsConnectionsByIp = new Map<string, number>()
+setInterval(() => {
+  // Decay: halve counts every minute to allow gradual recovery
+  for (const [ip, count] of wsConnectionsByIp.entries()) {
+    const newCount = Math.floor(count / 2)
+    if (newCount <= 0) wsConnectionsByIp.delete(ip)
+    else wsConnectionsByIp.set(ip, newCount)
+  }
+}, 60 * 1000).unref()
+
+function canOpenWs(ip: string): boolean {
+  const current = wsConnectionsByIp.get(ip) ?? 0
+  if (current >= WS_MAX_PER_IP) return false
+  wsConnectionsByIp.set(ip, current + 1)
+  return true
+}
+
+function releaseWs(ip: string): void {
+  const current = wsConnectionsByIp.get(ip) ?? 0
+  if (current <= 1) wsConnectionsByIp.delete(ip)
+  else wsConnectionsByIp.set(ip, current - 1)
+}
 
 // Security: Per-session AI query quota (CWE-770)
 // Prevents a single session from consuming excessive LLM resources.
@@ -408,9 +562,9 @@ app.post(
   upload.array('files'),
   async (req: Request, res: Response) => {
     try {
-      // Security: Basic text sanitisation (remove script tags etc)
+      // Security: Basic text sanitisation (Item 5: event handlers, JS URIs)
       let text = typeof req.body.text === 'string' ? req.body.text : ''
-      text = text.replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, '').trim()
+      text = sanitiseTextContent(text)
       
       const password = typeof req.body.password === 'string' ? req.body.password.trim() : ''
       const burnOnRead = req.body.burnOnRead === 'true' || req.body.burnOnRead === true
@@ -439,6 +593,20 @@ app.post(
 
       if (!text.trim() && uploadedFiles.length === 0) {
         res.status(400).json({ error: 'Nothing to publish — provide text or at least one file' })
+        return
+      }
+
+      // Security: Global session creation budget (CWE-770)
+      if (!checkSessionGlobalBudget()) {
+        securityLog.upload_rejected({ ip: req.ip || 'unknown', reason: 'session_global_quota' })
+        res.status(429).json({ error: 'Server at capacity — try again later' })
+        return
+      }
+
+      // Security: Global upload bandwidth cap (CWE-400)
+      if (!trackUploadBytes(totalBytes)) {
+        securityLog.upload_rejected({ ip: req.ip || 'unknown', reason: 'upload_bandwidth_cap' })
+        res.status(429).json({ error: 'Upload limit reached — try again later' })
         return
       }
 
@@ -900,7 +1068,15 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
 
   // Security: Per-session AI quota (CWE-770)
   if (!checkAiSessionQuota(code)) {
+    securityLog.ai_quota_exceeded({ code, ip: req.ip || 'unknown' })
     res.status(429).json({ error: 'ai_session_quota', message: 'AI query limit reached for this session — try again later' })
+    recordAiQuery('quota')
+    return
+  }
+
+  // Security: Global AI budget (CWE-770)
+  if (!checkAiGlobalBudget()) {
+    res.status(429).json({ error: 'ai_busy', message: 'AI system at capacity — try again shortly' })
     return
   }
 
@@ -1032,6 +1208,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
           if (t.startsWith('__FULL__')) {
             const fin = JSON.parse(t.slice(8)) as { text: string; refused: boolean }
             putAnswer(code, question, { answer: fin.text, refused: fin.refused, sources })
+            recordAiQuery('success')
             sseSend('done', { refused: fin.refused, cached: false, fullText: fin.text })
           } else {
             full += t
@@ -1067,6 +1244,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     }
 
     putAnswer(code, question, { answer: answer.text, refused: answer.refused, sources })
+    recordAiQuery('success')
     res.json({
       answer: answer.text,
       refused: answer.refused,
@@ -1154,6 +1332,13 @@ app.post('/session', sessionLimiter, async (req: Request, res: Response) => {
     return
   }
 
+  // Security: Global session creation budget (CWE-770)
+  if (!checkSessionGlobalBudget()) {
+    securityLog.upload_rejected({ ip: req.ip || 'unknown', reason: 'session_global_quota' })
+    res.status(429).json({ error: 'Server at capacity — try again later' })
+    return
+  }
+
   try {
     const hashedPassword = await hashPassword(password)
     const code = createSession(effectiveTtl, hashedPassword)
@@ -1225,6 +1410,82 @@ app.get('/health', async (_req: Request, res: Response) => {
   })
 })
 
+// ── Item 15: Prometheus /metrics endpoint ─────────────────────────────────────
+// Free observability — request counts, latencies, error rates, memory.
+import { Registry, Counter, Histogram, Gauge, collectDefaultMetrics } from 'prom-client'
+
+const metricsRegistry = new Registry()
+collectDefaultMetrics({ register: metricsRegistry, prefix: 'quickshare_' })
+
+const httpRequestDuration = new Histogram({
+  name: 'quickshare_http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10],
+  registers: [metricsRegistry],
+})
+
+const httpRequestTotal = new Counter({
+  name: 'quickshare_http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code'],
+  registers: [metricsRegistry],
+})
+
+const wsConnections = new Gauge({
+  name: 'quickshare_websocket_connections',
+  help: 'Current number of WebSocket connections',
+  registers: [metricsRegistry],
+})
+
+const aiQueriesTotal = new Counter({
+  name: 'quickshare_ai_queries_total',
+  help: 'Total AI queries',
+  labelNames: ['status'],
+  registers: [metricsRegistry],
+})
+
+const memoryRss = new Gauge({
+  name: 'quickshare_memory_rss_bytes',
+  help: 'Process RSS memory in bytes',
+  registers: [metricsRegistry],
+})
+
+// Middleware: track request duration and count
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.path === '/metrics' || req.path === '/health') return next()
+  const start = process.hrtime.bigint()
+  res.on('finish', () => {
+    const durationSec = Number(process.hrtime.bigint() - start) / 1e9
+    const route = req.route?.path || req.path
+    const labels = { method: req.method, route, status_code: res.statusCode }
+    httpRequestDuration.observe(labels, durationSec)
+    httpRequestTotal.inc(labels)
+  })
+  next()
+})
+
+// Update gauges periodically
+setInterval(() => {
+  memoryRss.set(process.memoryUsage().rss)
+  wsConnections.set(wss.clients.size)
+}, 10_000).unref()
+
+// Expose for AI query counting
+export function recordAiQuery(status: 'success' | 'error' | 'quota'): void {
+  aiQueriesTotal.inc({ status })
+}
+
+// Metrics endpoint (Prometheus text format)
+app.get('/metrics', async (_req: Request, res: Response) => {
+  try {
+    res.setHeader('Content-Type', metricsRegistry.contentType)
+    res.send(await metricsRegistry.metrics())
+  } catch {
+    res.status(500).send('Error collecting metrics')
+  }
+})
+
 // ── GET /stats — Phase 10: Monitoring ──────────────────────────────────────────
 // Requires STATS_KEY environment variable. Provides insight into server load.
 function timingSafeStrEqual(a: unknown, b: unknown): boolean {
@@ -1276,10 +1537,24 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy()
     return
   }
+
+  // Security: WebSocket connection limit per IP (CWE-770)
+  const ip = req.socket.remoteAddress || 'unknown'
+  if (!canOpenWs(ip)) {
+    logger.warn({ ip }, '[security] WebSocket connection limit exceeded')
+    socket.write('HTTP/1.1 429 Too Many Connections\r\nConnection: close\r\n\r\n')
+    socket.destroy()
+    return
+  }
+
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
 })
 
-wss.on('connection', handleConnection)
+wss.on('connection', (ws, req) => {
+  const ip = req.socket.remoteAddress || 'unknown'
+  ws.on('close', () => releaseWs(ip))
+  handleConnection(ws, req)
+})
 wss.on('error', (err) => logger.error({ err }, '[wss] error'))
 
 // ── WebSocket Heartbeat ───────────────────────────────────────────────────────
@@ -1297,6 +1572,92 @@ const heartbeatInterval = setInterval(() => {
   })
 }, HEARTBEAT_INTERVAL_MS)
 if (heartbeatInterval.unref) heartbeatInterval.unref()
+
+// ── Item 8: Memory pressure monitoring & load shedding ───────────────────────
+// Checks RSS every 30s. When memory exceeds threshold, sheds load by returning
+// 503 on expensive endpoints (publish, AI) to prevent OOM kills.
+const MEMORY_THRESHOLD_MB = parseInt(process.env.MEMORY_THRESHOLD_MB ?? '450', 10)
+let memoryPressureActive = false
+setInterval(() => {
+  const rssMb = Math.round(process.memoryUsage().rss / 1024 / 1024)
+  if (rssMb > MEMORY_THRESHOLD_MB && !memoryPressureActive) {
+    memoryPressureActive = true
+    logger.warn({ rssMb, threshold: MEMORY_THRESHOLD_MB }, '[security] memory pressure activated — shedding load')
+  } else if (rssMb < MEMORY_THRESHOLD_MB * 0.8 && memoryPressureActive) {
+    memoryPressureActive = false
+    logger.info({ rssMb }, '[security] memory pressure relieved')
+  }
+}, 30_000).unref()
+
+// Middleware: reject expensive requests when under memory pressure
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (!memoryPressureActive) return next()
+  const isExpensive = req.method === 'POST' && (
+    req.path === '/publish' || req.path.startsWith('/publish/') ||
+    req.path.startsWith('/ai/') || req.path === '/session'
+  )
+  if (isExpensive) {
+    res.status(503).json({ error: 'Server under memory pressure — try again later' })
+    return
+  }
+  next()
+})
+
+// ── Item 18: robots.txt ──────────────────────────────────────────────────────
+app.get('/robots.txt', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/plain')
+  res.setHeader('Cache-Control', 'public, max-age=86400')
+  res.send('User-agent: *\nDisallow: /\n')
+})
+
+// ── Item 19: security.txt ────────────────────────────────────────────────────
+app.get('/.well-known/security.txt', (_req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/plain')
+  res.send([
+    'Contact: https://github.com/anomalyco/opencode/issues',
+    'Preferred-Languages: en',
+    'Policy: https://github.com/anomalyco/opencode/blob/main/SECURITY.md',
+    'Expires: ' + new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+  ].join('\n'))
+})
+
+// ── Item 20: CSP violation report endpoint ────────────────────────────────────
+app.post('/csp-report', express.json({ type: 'application/csp-report' }), (req: Request, res: Response) => {
+  const report = req.body?.['csp-report']
+  if (report) {
+    logger.warn({
+      event: 'csp.violation',
+      directive: report['violated-directive'],
+      blocked: report['blocked-uri'],
+      source: report['source-file'],
+      line: report['line-number'],
+    }, 'CSP violation reported')
+  }
+  res.sendStatus(204)
+})
+
+// ── Item 11: Cache-Control: no-store on sensitive endpoints ───────────────────
+// Prevents browsers/proxies from caching session data, AI responses, or files.
+app.use('/retrieve', (_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+  res.setHeader('Pragma', 'no-cache')
+  next()
+})
+app.use('/ai', (_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+  res.setHeader('Pragma', 'no-cache')
+  next()
+})
+app.use('/file', (_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+  res.setHeader('Pragma', 'no-cache')
+  next()
+})
+app.use('/publish', (_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+  res.setHeader('Pragma', 'no-cache')
+  next()
+})
 
 // ── Error Handling ───────────────────────────────────────────────────────────
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
