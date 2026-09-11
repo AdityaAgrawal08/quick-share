@@ -115,8 +115,16 @@ interface RecipientConn { peerId: string; rtc: WebRTCManager; channelState: Chan
 export default function App() {
   const [view, setView] = useState<'home' | 'publish' | 'join'>('home')
   const [code, setCode] = useState('')
-  const [joinToken, setJoinToken] = useState('')
-  const [inputCode, setInputCode] = useState('')
+  const [inputCode, setInputCode] = useState(() => {
+    const path = window.location.pathname.replace(/^\//, '').trim()
+    if (/^\d{6}$/.test(path)) { window.history.replaceState(null, '', '/'); return path }
+    return ''
+  })
+  const [joinToken, setJoinToken] = useState(() => {
+    const path = window.location.pathname.replace(/^\//, '').trim()
+    if (/^\d{6}$/.test(path)) return new URLSearchParams(window.location.search).get('k') || ''
+    return ''
+  })
   const [text, setText] = useState('')
   const [files, setFiles] = useState<File[]>([])
   const [ttlSeconds, setTtlSeconds] = useState(3600)
@@ -162,9 +170,9 @@ export default function App() {
   const passwordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
-    if (!expiresAt) { setCountdown(''); return }
+    if (!expiresAt) return
     const tick = () => setCountdown(formatCountdown(expiresAt - Date.now()))
-    tick(); const id = setInterval(tick, 1000); return () => clearInterval(id)
+    tick(); const id = setInterval(tick, 1000); return () => { clearInterval(id); setCountdown('') }
   }, [expiresAt])
   useEffect(() => { document.documentElement.setAttribute('data-theme', theme); localStorage.setItem('qs_theme', theme) }, [theme])
   useEffect(() => {
@@ -174,12 +182,6 @@ export default function App() {
     window.addEventListener('beforeunload', handleBeforeUnload)
     return () => window.removeEventListener('beforeunload', handleBeforeUnload)
   }, [publishedMode, sigState])
-  useEffect(() => {
-    const path = window.location.pathname.replace(/^\//, '').trim()
-    const params = new URLSearchParams(window.location.search)
-    const k = params.get('k') || ''
-    if (/^\d{6}$/.test(path)) { setInputCode(path); if (k) setJoinToken(k); window.history.replaceState(null, '', '/') }
-  }, [])
   useEffect(() => {
     const checkStatus = async () => {
       try {
@@ -302,6 +304,13 @@ export default function App() {
         setPublishing(false); return
       }
       setCode(data.code); setJoinToken(data.joinToken || ''); setExpiresAt(data.expiresAt); setPublishedMode('stored')
+      const isPriv = isPrivate && privatePassword.length > 0
+      setAiStatus(isPriv ? 'none' : 'pending')
+      if (!isPriv) {
+        void fetch(`${API_URL}/ai/status/${data.code}`).then(r => r.json()).then(st => {
+          if (typeof st.aiStatus === 'string') setAiStatus(st.aiStatus as 'none' | 'pending' | 'ready' | 'failed')
+        }).catch(() => {})
+      }
     } catch (err: unknown) { setPublishError(err instanceof Error ? err.message : 'An unexpected error occurred.') }
     setPublishing(false)
   }
@@ -342,6 +351,7 @@ export default function App() {
           catch { setJoinError('Unable to decrypt the message. Check the password.'); setJoining(false); return }
         }
         setStoredPayload(data); setCode(inputCode); setExpiresAt(data.expiresAt); setView('join')
+        setAiStatus(inputPassword ? 'none' : 'pending')
         const aiJoinParam = joinToken ? `?k=${joinToken}` : ''
         void fetch(`${API_URL}/ai/status/${inputCode}${aiJoinParam}`).then(r => r.json()).then(st => {
           if (typeof st.aiStatus === 'string') setAiStatus(st.aiStatus as 'none' | 'pending' | 'ready' | 'failed')
@@ -500,18 +510,21 @@ export default function App() {
         while (true) {
           const { done, value } = await reader.read(); if (done) break
           buf += decoder.decode(value, { stream: true })
-          let nl: number
-          while ((nl = buf.indexOf('\n\n')) !== -1) {
-            const frame = buf.slice(0, nl); buf = buf.slice(nl + 2)
-            const evLine = frame.split('\n').find(l => l.startsWith('event:'))
-            const dataLine = frame.split('\n').find(l => l.startsWith('data:'))
+          let match: RegExpMatchArray | null
+          while ((match = buf.match(/\r?\n\r?\n/)) !== null && match.index !== undefined) {
+            const frame = buf.slice(0, match.index)
+            buf = buf.slice(match.index + match[0].length)
+            const evLine = frame.split(/\r?\n/).find(l => l.startsWith('event:'))
+            const dataLine = frame.split(/\r?\n/).find(l => l.startsWith('data:'))
             if (!dataLine) continue
             const ev = evLine?.slice(6).trim() ?? 'message'
-            const payload = JSON.parse(dataLine.slice(5).trim())
-            if (ev === 'sources') { sources = payload.sources; cbs?.onSources?.(sources ?? []) }
-            else if (ev === 'delta') { full += payload.t; cbs?.onDelta?.(payload.t) }
-            else if (ev === 'done') { refused = !!payload.refused; cached = !!payload.cached; full = payload.fullText ?? full; cbs?.onDone?.(full, refused, cached) }
-            else if (ev === 'error') { err = String(payload.error); groqStatus = payload.groqStatus }
+            try {
+              const payload = JSON.parse(dataLine.slice(5).trim())
+              if (ev === 'sources') { sources = payload.sources; cbs?.onSources?.(sources ?? []) }
+              else if (ev === 'delta') { full += payload.t; cbs?.onDelta?.(payload.t) }
+              else if (ev === 'done') { refused = !!payload.refused; cached = !!payload.cached; full = payload.fullText ?? full; cbs?.onDone?.(full, refused, cached) }
+              else if (ev === 'error') { err = String(payload.error); groqStatus = payload.groqStatus }
+            } catch { /* ignore partial/malformed chunk */ }
           }
         }
         if (err) return { answer: '', error: err, groqStatus }
@@ -856,6 +869,27 @@ export default function App() {
                 )}
               </Card>
             )}
+
+            {publishedMode === 'stored' && !isPrivate && (
+              <AiChat
+                key={code}
+                code={code}
+                apiBase={API_URL}
+                aiStatus={aiStatus}
+                onStatusChange={setAiStatus}
+                onAsk={askAi}
+                onOpenSource={(src) => {
+                  const f = files.find(file => file.name === src.name)
+                  if (f) {
+                    const url = URL.createObjectURL(f)
+                    const suffix = src.page != null && /pdf/i.test(f.type) ? `#page=${src.page}` : ''
+                    window.open(url + suffix, '_blank')
+                  } else {
+                    toast(src.snippet || src.name, 'info')
+                  }
+                }}
+              />
+            )}
           </div>
         )}
 
@@ -930,6 +964,7 @@ export default function App() {
 
             {storedPayload && (
               <AiChat
+                key={code}
                 code={code}
                 apiBase={API_URL}
                 aiStatus={aiStatus}

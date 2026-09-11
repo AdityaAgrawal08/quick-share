@@ -24,14 +24,11 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
-  const [polling, setPolling] = useState(aiStatus === 'pending')
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  useEffect(() => { setMessages([]); setExpanded(new Set()) }, [code])
   useEffect(() => { scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' }) }, [messages, busy])
-  useEffect(() => { setPolling(aiStatus === 'pending') }, [aiStatus])
 
   useEffect(() => {
     if (aiStatus !== 'pending') return
@@ -40,7 +37,7 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
       try {
         const res = await fetch(`${apiBase.replace(/\/$/, '')}/ai/status/${code}`)
         const data = await res.json()
-        if (!stop && (data.aiStatus === 'ready' || data.aiStatus === 'failed')) { setPolling(false); onStatusChange?.(data.aiStatus) }
+        if (!stop && (data.aiStatus === 'ready' || data.aiStatus === 'failed')) onStatusChange?.(data.aiStatus)
       } catch { /* keep polling */ }
     }
     const iv = setInterval(tick, 4000); tick()
@@ -148,7 +145,7 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
       </div>
     )
   }
-  if (aiStatus === 'pending' || polling) {
+  if (aiStatus === 'pending') {
     return (
       <div className="card card--pad" style={{ display: 'flex', alignItems: 'center', gap: 10, justifyContent: 'center' }}>
         <span style={{ width: 16, height: 16, border: '2px solid var(--border-strong)', borderTopColor: 'var(--accent)', borderRadius: 999, display: 'inline-block', animation: 'spin 0.9s linear infinite' }} />

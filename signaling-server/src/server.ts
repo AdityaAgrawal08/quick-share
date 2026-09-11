@@ -418,12 +418,13 @@ app.post(
           for (let attempt = 0; attempt < 5; attempt++) {
             try {
               const code      = await generateUniqueStoredCode()
+              const joinToken = randomBytes(16).toString('hex')
               const expiresAt = new Date(Date.now() + ttlMs)
 
               // Create the session doc with the uploaded files already attached.
               // This ensures that we never have a session with empty files if an upload fails.
               await StoredSession.create({
-                code, text, files: storedFiles, expiresAt, burnOnRead,
+                code, joinToken, text, files: storedFiles, expiresAt, burnOnRead,
                 ...(hashedPassword ? { password: hashedPassword } : {}),
                 aiStatus: isPrivate ? 'none' : 'pending',
               })
@@ -431,7 +432,7 @@ app.post(
               scheduleExpiry(code, expiresAt)
               kickIndex(code)
               logger.info(`[publish] stored ${code} — expires ${expiresAt.toISOString()} — ${sanitisedFiles.length} file(s) — ${isPrivate ? 'PRIVATE' : 'open'}`)
-              res.status(201).json({ code, mode: 'stored', private: isPrivate, expiresAt: expiresAt.getTime(), ttlMs })
+              res.status(201).json({ code, joinToken, mode: 'stored', private: isPrivate, expiresAt: expiresAt.getTime(), ttlMs })
               return
             } catch (err) {
               if (isE11000(err) && attempt < 4) {
@@ -561,7 +562,7 @@ app.patch(
 
           const expiresAt = new Date(Date.now() + ttlMs)
           const password = typeof req.body.password === 'string' && req.body.password.trim() ? req.body.password : null
-          const updateSet: any = { text, files: storedFiles, expiresAt }
+          const updateSet: any = { text, files: storedFiles, expiresAt, aiStatus: password ? 'none' : 'pending' }
           // New content = readable again. Without this, a burn-on-read
           // session that was updated after its first read stayed 410 forever.
           updateSet.burnedAt = null
@@ -884,6 +885,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
       res.setHeader('Content-Type', 'text/event-stream')
       res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Connection', 'keep-alive')
+      res.setHeader('X-Accel-Buffering', 'no')
       res.flushHeaders()
     }
     const sseSend = (event: string, data: unknown) => {
