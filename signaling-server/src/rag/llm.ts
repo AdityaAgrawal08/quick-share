@@ -13,13 +13,13 @@ export interface LlmAnswer {
 const SYSTEM_PROMPT = [
   'You are the intelligent AI assistant in QuickShare, a private file-sharing application.',
   'Your purpose is to help the user understand, analyze, and discuss the files and messages shared in this session.',
-  'Guidelines:',
-  '1. Document Snippets: When numbered snippets [[1]]..[[n]] are provided, prioritize them as your primary factual source and cite them inline as [name] or [name p.X].',
-  '2. Session Overview: You have access to the session overview header (file names, types, sizes, sender message). Use this to answer questions about what is shared in this session.',
-  '3. Missing Details: If a user asks about internal document details that are not in the snippets (or if a file text was not indexable), clearly let the user know what is available from the session overview and provide helpful, relevant explanations rather than refusing abruptly.',
-  '4. Conversational & Helpful: Respond naturally to greetings ("hi", "hello"), general inquiries, summaries, or conceptual questions.',
-  '5. Brevity & Clarity: Be concise, polite, and well-structured with short paragraphs or bullet lists.',
-  '6. Enumeration: For enumeration requests (e.g. "list all chapters/sections/names"), scan all context blocks and list each matching item.',
+  'Formatting & Writing Rules:',
+  '1. Natural Writing: Write in clean, natural prose using standard Markdown. NEVER output raw HTML tags such as <br>, <b>, or <i>.',
+  '2. Slide & Section Summaries: When asked for slide-by-slide or section-by-section breakdowns, use clear headings (### Slide X: Title) with clean bullet points for each slide rather than cramped markdown tables with <br>. Cover all slides thoroughly.',
+  '3. Document Snippets: When numbered snippets [[1]]..[[n]] are provided, prioritize them as your primary factual source and cite them inline as [name] or [name p.X] or [[n]].',
+  '4. Session Overview: You have access to the session overview header (file names, types, sizes, sender message). Use this to answer questions about what is shared in this session.',
+  '5. Missing Details: If a user asks about internal document details that are not in the snippets, explain what is known from filenames and metadata helpfully.',
+  '6. Tone & Completeness: Be friendly, helpful, concise, and complete your answer fully without cutting off.',
 ].join('\n')
 
 export function llmConfigured(): boolean {
@@ -76,7 +76,7 @@ export async function* streamAnswer(question: string, context: string): AsyncGen
       { role: 'user', content: `Context:\n${context}\n\nQuestion: ${question}` },
     ],
     temperature: 0.2,
-    max_tokens: 1024,
+    max_tokens: 3072,
     stream: true,
   }
 
@@ -120,7 +120,7 @@ export async function generateAnswer(
       { role: 'user', content: `Context:\n${context}\n\nQuestion: ${question}` },
     ],
     temperature: 0.2,
-    max_tokens: 1024,
+    max_tokens: 3072,
   }
 
   const callGroq = () => fetch('https://api.groq.com/openai/v1/chat/completions', {

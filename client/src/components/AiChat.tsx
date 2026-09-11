@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { MarkdownView } from './MarkdownView'
 
 export interface AiSource { name: string; fileId: string; page: number | null; score: number; snippet: string }
 interface ChatMessage { role: 'user' | 'assistant'; text: string; sources?: AiSource[]; error?: boolean; streaming?: boolean }
@@ -192,7 +193,7 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
             key={i}
             style={{
               alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
-              maxWidth: '88%',
+              maxWidth: m.role === 'user' ? '88%' : '94%',
               padding: '10px 13px',
               borderRadius: 16,
               borderBottomRightRadius: m.role === 'user' ? 6 : 16,
@@ -200,11 +201,25 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
               background: m.role === 'user' ? 'var(--accent)' : m.error ? 'var(--error-soft)' : 'var(--surface-2)',
               color: m.role === 'user' ? 'var(--accent-fg)' : m.error ? 'var(--error)' : 'var(--text)',
               border: m.role === 'user' ? '1px solid var(--accent)' : `1px solid ${m.error ? 'var(--error)' : 'var(--border)'}`,
-              whiteSpace: 'pre-wrap', fontSize: '0.88rem', lineHeight: 1.55,
+              whiteSpace: m.role === 'user' ? 'pre-wrap' : 'normal',
+              overflowWrap: 'break-word',
+              wordBreak: 'break-word',
+              fontSize: '0.88rem',
+              lineHeight: 1.55,
               boxShadow: 'var(--shadow-sm)',
             }}
           >
-            {m.streaming && !m.text ? <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}><span style={{ width: 4, height: 4, borderRadius: 999, background: 'var(--text-2)', animation: 'pulse 1s infinite' }} /><span style={{ width: 4, height: 4, borderRadius: 999, background: 'var(--text-2)', animation: 'pulse 1s 0.2s infinite' }} /><span style={{ width: 4, height: 4, borderRadius: 999, background: 'var(--text-2)', animation: 'pulse 1s 0.4s infinite' }} /></span> : m.text}
+            {m.streaming && !m.text ? (
+              <span style={{ display: 'inline-flex', gap: 4, alignItems: 'center' }}>
+                <span style={{ width: 4, height: 4, borderRadius: 999, background: 'var(--text-2)', animation: 'pulse 1s infinite' }} />
+                <span style={{ width: 4, height: 4, borderRadius: 999, background: 'var(--text-2)', animation: 'pulse 1s 0.2s infinite' }} />
+                <span style={{ width: 4, height: 4, borderRadius: 999, background: 'var(--text-2)', animation: 'pulse 1s 0.4s infinite' }} />
+              </span>
+            ) : m.role === 'assistant' && !m.error ? (
+              <MarkdownView content={m.text} />
+            ) : (
+              m.text
+            )}
             {m.sources && m.sources.length > 0 && (() => {
               const MAX = 8
               const isExpanded = expanded.has(i)
