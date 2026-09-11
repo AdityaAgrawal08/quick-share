@@ -67,17 +67,17 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
             r.error === 'ai_config' ? 'AI model/key misconfigured on the server.' :
               r.error === 'ai_not_configured' ? 'AI answering needs the operator to configure GROQ_API_KEY.' :
                 r.error === 'ai_session_quota' ? 'AI query limit reached for this session — try again later.' :
-                  r.error === 'ai_error' ? `Groq API error${r.groqStatus ? ` (HTTP ${r.groqStatus})` : ''} — try again.` :
-                    r.error === 'indexing' ? 'Still indexing this session — one moment.' :
-                      r.error === 'expired' || r.error === 'not_found' ? 'This session has expired and was cleaned up.' :
-                        r.error === 'burned' ? 'One-time session already consumed.' :
-                          r.error === 'private' ? 'Private session — AI features are off.' :
-                            r.error === 'network' ? 'Could not reach the server (it may be waking from sleep). Retrying usually works.' :
-                              r.status === 400 ? 'Invalid request — check your question and try again.' :
-                                r.status === 404 ? 'Session not found — it may have expired.' :
-                                  r.status === 429 ? 'Too many requests — wait a moment and try again.' :
-                                    r.status === 503 ? 'Service temporarily unavailable — try again shortly.' :
-                                      r.status === 500 ? 'Server hit an unexpected error answering this question. Try again.' :
+                  r.error === 'ai_error' ? (r.groqStatus ? `Groq API error (HTTP ${r.groqStatus}) — try again.` : 'The AI service encountered an error. Try again.') :
+                    r.error === 'server_error' || r.status === 500 ? 'Server hit an unexpected error answering this question. Try again.' :
+                      r.error === 'indexing' ? 'Still indexing this session — one moment.' :
+                        r.error === 'expired' || r.error === 'not_found' ? 'This session has expired and was cleaned up.' :
+                          r.error === 'burned' ? 'One-time session already consumed.' :
+                            r.error === 'private' ? 'Private session — AI features are off.' :
+                              r.error === 'network' ? 'Could not reach the server (it may be waking from sleep). Retrying usually works.' :
+                                r.status === 400 ? 'Invalid request — check your question and try again.' :
+                                  r.status === 404 ? 'Session not found — it may have expired.' :
+                                    r.status === 429 ? 'Too many requests — wait a moment and try again.' :
+                                      r.status === 503 ? 'Service temporarily unavailable — try again shortly.' :
                                         'AI request failed. Try again.'
         setMessages(prev => {
           const next = [...prev]; const last = next[next.length - 1]

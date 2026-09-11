@@ -911,41 +911,65 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     try {
       retrieval = await retrieve(code, question)
     } catch (err) {
-      // Never-fail ladder at query time: a vector session whose embedding
-      // provider died between questions still answers — keyword mode.
-      const modeDoc = await StoredSession.findOne({ code }).select('aiMode').lean()
-      if (
-        (err instanceof EmbeddingUnavailableError ||
-         err instanceof GenerationMismatchError) &&
-        modeDoc?.aiMode === 'vector'
-      ) {
-        try {
-          const { retrieveBm25Only } = await import('./rag/retriever.js')
-          const fb = await retrieveBm25Only(code, question)
-          logger.warn({ code }, '[ai] query degraded to BM25 (embedding provider unavailable)')
-          res.status(200).json({
-            sources: fb.sources,
-            degraded: true,
-            qualityTier: 'keyword',
-            notice: 'Answered with keyword search — full AI indexing is temporarily unavailable.',
-          })
-        } catch {
+      if (err instanceof Error && err.message === 'no_chunks') {
+        retrieval = { sources: [], context: '' }
+      } else {
+        // Never-fail ladder at query time: a vector session whose embedding
+        // provider died between questions still answers — keyword mode.
+        const modeDoc = await StoredSession.findOne({ code }).select('aiMode').lean()
+        if (
+          (err instanceof EmbeddingUnavailableError ||
+           err instanceof GenerationMismatchError) &&
+          modeDoc?.aiMode === 'vector'
+        ) {
+          try {
+            const { retrieveBm25Only } = await import('./rag/retriever.js')
+            const fb = await retrieveBm25Only(code, question)
+            logger.warn({ code }, '[ai] query degraded to BM25 (embedding provider unavailable)')
+            res.status(200).json({
+              sources: fb.sources,
+              degraded: true,
+              qualityTier: 'keyword',
+              notice: 'Answered with keyword search — full AI indexing is temporarily unavailable.',
+            })
+          } catch {
+            void indexSession(code)
+            res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
+          }
+          return
+        }
+        if (err instanceof GenerationMismatchError) {
+          // Stored vectors come from a different embedding generation — never
+          // mix vector spaces (Invariant 4). Re-index transparently; the client
+          // already handles the 202 'indexing' polling loop.
           void indexSession(code)
           res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
+          return
         }
-        return
+        throw err
       }
-      if (err instanceof GenerationMismatchError) {
-        // Stored vectors come from a different embedding generation — never
-        // mix vector spaces (Invariant 4). Re-index transparently; the client
-        // already handles the 202 'indexing' polling loop.
-        void indexSession(code)
-        res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
-        return
-      }
-      throw err
     }
     const { sources, context } = retrieval
+
+    // If session has no readable chunks or empty context, answer directly without wasting Groq quota
+    if (sources.length === 0 && !context.trim()) {
+      const fallbackAnswer = 'I could not find any readable content in the shared files.'
+      if (wantsStream) {
+        sseHeaders()
+        sseSend('sources', { sources: [] })
+        sseSend('delta', { t: fallbackAnswer })
+        sseSend('done', { refused: true, cached: false, fullText: fallbackAnswer })
+        res.end()
+        return
+      }
+      res.json({
+        answer: fallbackAnswer,
+        refused: true,
+        sources: [],
+        cached: false,
+      })
+      return
+    }
 
     // ---- Streaming mode ----
     if (wantsStream) {
@@ -965,7 +989,10 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
         }
       } catch (llmErr) {
         const msg = llmErr instanceof Error ? llmErr.message : 'ai_error'
-        const groqStatus = msg.startsWith('ai_error:') ? parseInt(msg.slice(9)) : undefined
+        const parts = msg.split(':')
+        const groqStatus = (parts[0] === 'ai_error' && parts[1] && !isNaN(parseInt(parts[1], 10)))
+          ? parseInt(parts[1], 10)
+          : undefined
         const code2 = msg === 'ai_busy' ? 'ai_busy' : msg === 'ai_config' ? 'ai_config' : 'ai_error'
         sseSend('error', { error: code2, groqStatus })
         res.end()
@@ -989,7 +1016,10 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
         res.status(503).json({ error: 'ai_config', message: 'LLM key invalid — contact the operator' })
         return
       }
-      const groqStatus = msg.startsWith('ai_error:') ? parseInt(msg.slice(9)) : undefined
+      const parts = msg.split(':')
+      const groqStatus = (parts[0] === 'ai_error' && parts[1] && !isNaN(parseInt(parts[1], 10)))
+        ? parseInt(parts[1], 10)
+        : undefined
       logger.warn({ groqStatus, code }, '[ai] Groq LLM error')
       res.status(502).json({ error: 'ai_error', groqStatus, message: groqStatus ? `Groq API error (HTTP ${groqStatus})` : 'AI service error' })
       return
@@ -1004,7 +1034,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     })
   } catch (err) {
     logger.error({ err, code }, '[ai] query error')
-    res.status(500).json({ error: 'ai_error' })
+    res.status(500).json({ error: 'server_error', message: 'Internal server error processing question' })
   }
 });
 

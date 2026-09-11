@@ -1,5 +1,6 @@
 import mongoose from 'mongoose'
 import { GridFSBucket, ObjectId } from 'mongodb'
+import { randomBytes } from 'crypto'
 import logger from './logger'
 import { Readable } from 'stream'
 
@@ -378,7 +379,7 @@ export interface IStoredSession {
 
 const storedSessionSchema = new mongoose.Schema<IStoredSession>({
   code:      { type: String, required: true, unique: true, index: true },
-  joinToken: { type: String, required: true, index: true },  // Security: unguessable join token
+  joinToken: { type: String, required: true, index: true, default: () => randomBytes(16).toString('hex') },  // Security: unguessable join token
   text:      { type: String, default: '' },
   files:     [{
     name:     String,

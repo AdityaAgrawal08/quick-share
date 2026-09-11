@@ -47,9 +47,19 @@ async function* upstreamDeltas(res: Response): AsyncGenerator<string> {
       if (payload === '[DONE]') return
       try {
         const j = JSON.parse(payload)
+        if (j.error) {
+          const errMsg = typeof j.error === 'string' ? j.error : (j.error.message || 'Groq stream error')
+          if (j.error.code === 'rate_limit_exceeded' || /rate limit/i.test(errMsg)) {
+            throw new Error('ai_busy')
+          }
+          throw new Error(`ai_error:${errMsg}`)
+        }
         const t = j.choices?.[0]?.delta?.content
         if (t) yield t
-      } catch { /* partial line — keep buffering */ }
+      } catch (e) {
+        if (e instanceof Error && (e.message.startsWith('ai_') || e.message === 'ai_busy')) throw e
+        /* partial line — keep buffering */
+      }
     }
   }
 }

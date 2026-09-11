@@ -120,7 +120,9 @@ export async function ensureSessionIndex(code: string, expectedGen: string): Pro
   })
     .select('fileId name page idx text embedding gen')
     .lean()
-  if (!Array.isArray(docs) || docs.length === 0) throw new Error('no_chunks')
+  if (!Array.isArray(docs) || docs.length === 0) {
+    return putSessionIndex(code, [], [])
+  }
   // Vector-space consistency (doc §35/Invariant 4): refuse to query across
   // embedding generations. A mismatch triggers one transparent reindex via
   // the /ai/query handler instead of silently comparing incommensurable
@@ -144,7 +146,9 @@ async function retrieveDirect(code: string): Promise<RetrievalResult> {
     .select('fileId name page idx text')
     .sort({ idx: 1 })
     .lean()
-  if (!Array.isArray(docs) || docs.length === 0) throw new Error('no_chunks')
+  if (!Array.isArray(docs) || docs.length === 0) {
+    return { sources: [], context: '' }
+  }
 
   let budget = CONFIG.DIRECT_STUFF_MAX_CHARS + DIRECT_BUDGET_MARGIN_CHARS
   // Per-source overhead (citation prefix + separator) must be reserved or the
@@ -306,7 +310,9 @@ async function ensureBm25Index(code: string): Promise<Bm25Index> {
  */
 export async function retrieveBm25Only(code: string, question: string): Promise<RetrievalResult> {
   const idx = await ensureBm25Index(code)
-  if (idx.chunks.length === 0) throw new Error('no_chunks')
+  if (idx.chunks.length === 0) {
+    return { sources: [], context: '', qualityTier: 'keyword' }
+  }
 
   const enumerative = isEnumerativeQuery(question)
   const maxHits = enumerative ? ENUM_HITS_BM25 : 10
@@ -377,6 +383,9 @@ export async function retrieve(code: string, question: string): Promise<Retrieva
   // (doc §54 Option 1). Legacy corpora default to the active generation.
   const expectedGen = session?.aiStats?.gen ?? ACTIVE_GENERATION_ID
   const idx = await ensureSessionIndex(code, expectedGen)
+  if (idx.chunks.length === 0) {
+    return { sources: [], context: '' }
+  }
 
   // Enumeration questions widen every leg (review: aggregation gap).
   const enumQ = isEnumerativeQuery(question)
