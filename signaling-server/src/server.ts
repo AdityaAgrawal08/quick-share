@@ -836,7 +836,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
 
   try {
     const session = await StoredSession.findOne({ code })
-      .select('aiStatus expiresAt burnedAt +password')
+      .select('aiStatus expiresAt burnedAt +password files text')
       .lean()
     if (!session) {
       res.status(404).json({ error: 'not_found' })
@@ -951,25 +951,20 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     }
     const { sources, context } = retrieval
 
-    // If session has no readable chunks or empty context, answer directly without wasting Groq quota
-    if (sources.length === 0 && !context.trim()) {
-      const fallbackAnswer = 'I could not find any readable content in the shared files.'
-      if (wantsStream) {
-        sseHeaders()
-        sseSend('sources', { sources: [] })
-        sseSend('delta', { t: fallbackAnswer })
-        sseSend('done', { refused: true, cached: false, fullText: fallbackAnswer })
-        res.end()
-        return
-      }
-      res.json({
-        answer: fallbackAnswer,
-        refused: true,
-        sources: [],
-        cached: false,
-      })
-      return
-    }
+    const fileList = (session.files ?? []).map(f => {
+      const sizeKb = Math.round((f.size ?? 0) / 1024)
+      return `- "${f.name}" (${f.mimeType || 'unknown format'}, ~${sizeKb} KB)`
+    }).join('\n')
+
+    const sessionOverview = [
+      'Session Details:',
+      fileList ? `Files shared in this session:\n${fileList}` : 'No files attached in this session.',
+      session.text?.trim() ? `Accompanying message from sender: "${session.text.trim()}"` : null,
+    ].filter(Boolean).join('\n\n')
+
+    const promptContext = context.trim()
+      ? `${sessionOverview}\n\nDocument content snippets:\n${context}`
+      : `${sessionOverview}\n\n(Note: No specific internal text snippets were indexed for this query. Use the session details above, filenames, or general knowledge to answer helpfully).`
 
     // ---- Streaming mode ----
     if (wantsStream) {
@@ -977,7 +972,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
       sseSend('sources', { sources })
       try {
         let full = ''
-        for await (const t of streamAnswer(question, context)) {
+        for await (const t of streamAnswer(question, promptContext)) {
           if (t.startsWith('__FULL__')) {
             const fin = JSON.parse(t.slice(8)) as { text: string; refused: boolean }
             putAnswer(code, question, { answer: fin.text, refused: fin.refused, sources })
@@ -1005,7 +1000,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     // ---- Legacy JSON mode ----
     let answer: { text: string; refused: boolean }
     try {
-      answer = await generateAnswer(question, context)
+      answer = await generateAnswer(question, promptContext)
     } catch (llmErr) {
       const msg = llmErr instanceof Error ? llmErr.message : 'ai_error'
       if (msg === 'ai_busy') {

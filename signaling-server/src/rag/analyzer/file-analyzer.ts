@@ -42,7 +42,7 @@ export function analyzeFile(input: AnalyzerInput): FileAnalysis {
   const ext = extOf(input.name)
   let kind: FileAnalysis['kind'] = 'unknown'
   if (ext === 'pdf' || input.mimeType === 'application/pdf') kind = 'pdf'
-  else if (['docx'].includes(ext) || input.mimeType.includes('wordprocessingml')) kind = 'docx'
+  else if (['docx', 'pptx', 'ppt'].includes(ext) || input.mimeType.includes('wordprocessingml') || input.mimeType.includes('presentationml')) kind = 'docx'
   else if (['xlsx', 'xls', 'xlsm'].includes(ext) || input.mimeType.includes('spreadsheetml')) kind = 'xlsx'
   else if (input.mimeType.startsWith('image/') || ['png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(ext)) kind = 'image'
   else kind = 'text'

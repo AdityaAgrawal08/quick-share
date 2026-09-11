@@ -34,7 +34,7 @@ function extOf(name: string): string {
 export function isSupportedForExtraction(name: string, mimeType: string): boolean {
   const ext = extOf(name)
   if (ext === 'pdf' || mimeType === 'application/pdf') return true
-  if (['docx'].includes(ext) || mimeType.includes('wordprocessingml')) return true
+  if (['docx', 'pptx'].includes(ext) || mimeType.includes('wordprocessingml') || mimeType.includes('presentationml')) return true
   if (['xlsx', 'xls', 'xlsm'].includes(ext) || mimeType.includes('spreadsheetml') || mimeType === 'application/vnd.ms-excel') return true
   if (TEXT_EXTENSIONS.has(ext)) return true
   if (mimeType.startsWith('text/')) return true
@@ -94,6 +94,38 @@ async function extractDocx(buffer: Buffer): Promise<ExtractedDoc> {
   return { pages: [{ page: null, text }] }
 }
 
+async function extractPptx(buffer: Buffer): Promise<ExtractedDoc> {
+  try {
+    // @ts-ignore adm-zip lacks types in devDependencies
+    const AdmZipModule = await import('adm-zip')
+    const AdmZip = (AdmZipModule as any).default || AdmZipModule
+    const zip = new AdmZip(buffer)
+    const entries = zip.getEntries() as { entryName: string; getData: () => Buffer }[]
+    const slideEntries = entries
+      .filter(e => /^ppt\/slides\/slide\d+\.xml$/i.test(e.entryName))
+      .sort((a, b) => {
+        const numA = parseInt(a.entryName.match(/slide(\d+)\.xml/i)?.[1] ?? '0', 10)
+        const numB = parseInt(b.entryName.match(/slide(\d+)\.xml/i)?.[1] ?? '0', 10)
+        return numA - numB
+      })
+
+    const pages: ExtractedPage[] = []
+    for (let i = 0; i < slideEntries.length; i++) {
+      const xml = slideEntries[i].getData().toString('utf8')
+      const matches = xml.match(/<a:t(?:\s+[^>]*)?>([\s\S]*?)<\/a:t>/g) ?? []
+      const texts = matches.map(m => m.replace(/<[^>]+>/g, '').trim()).filter(Boolean)
+      const slideText = texts.join(' ')
+      if (slideText) {
+        pages.push({ page: i + 1, text: slideText })
+      }
+    }
+    return { pages }
+  } catch (err) {
+    logger.warn({ err }, '[rag] PPTX extraction failed')
+    return { pages: [] }
+  }
+}
+
 function sheetToText(sheet: import('exceljs').Worksheet): string {
   const rows: string[] = []
   sheet.eachRow({ includeEmpty: false }, (row) => {
@@ -140,6 +172,7 @@ export async function extractFileText(name: string, mimeType: string, buffer: Bu
   try {
     if (ext === 'pdf' || mimeType === 'application/pdf') return await extractPdf(buffer)
     if (ext === 'docx' || mimeType.includes('wordprocessingml')) return await extractDocx(buffer)
+    if (ext === 'pptx' || mimeType.includes('presentationml')) return await extractPptx(buffer)
     if (['xlsx', 'xls', 'xlsm'].includes(ext) || mimeType.includes('spreadsheetml')) return await extractXlsx(buffer)
     if (TEXT_EXTENSIONS.has(ext) || mimeType.startsWith('text/')) return extractPlainText(buffer)
     if (mimeType.startsWith('image/') || IMAGE_EXTENSIONS.has(ext)) return await extractImageOcr(buffer)
