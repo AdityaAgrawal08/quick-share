@@ -626,7 +626,7 @@ export default function App() {
                   <Badge tone="accent">New</Badge>
                 </div>
                 <div className="cluster" style={{ marginTop: 16 }}>
-                  <Btn variant="primary" size="lg" block onClick={() => setView('publish')}><Icon name="upload" size={16} /> Start sharing</Btn>
+                  <Btn variant="primary" size="lg" block onClick={() => setView('publish')} data-testid="start-sharing"><Icon name="upload" size={16} /> Start sharing</Btn>
                 </div>
                 <div style={{ display: 'flex', gap: 16, marginTop: 14, flexWrap: 'wrap' }}>
                   <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: '0.78rem', color: 'var(--text-2)' }}><Icon name="sparkles" size={12} /> AI Q&A</span>
@@ -651,8 +651,9 @@ export default function App() {
                       onKeyDown={e => e.key === 'Enter' && handleJoin()}
                       style={{ flex: 1, textAlign: 'center', letterSpacing: '0.18em', fontWeight: 800, fontSize: '1.15rem' }}
                       aria-label="Session code"
+                      data-testid="join-code-input"
                     />
-                    <Btn variant="primary" onClick={handleJoin} disabled={inputCode.length !== 6 || joining} style={{ minWidth: 92 }}>
+                    <Btn variant="primary" onClick={handleJoin} disabled={inputCode.length !== 6 || joining} style={{ minWidth: 92 }} data-testid="join-submit">
                       {joining ? <Spinner size={16} /> : 'Join'}
                     </Btn>
                   </div>
@@ -664,8 +665,9 @@ export default function App() {
                     onKeyDown={e => e.key === 'Enter' && handleJoin()}
                     icon={<Icon name="lock" size={14} />}
                     aria-label="Session password"
+                    data-testid="join-password-input"
                   />
-                  {joinError && <div className="callout" style={{ borderColor: 'var(--error)', background: 'var(--error-soft)', color: 'var(--error)' }}><Icon name="alert" size={14} /> <span style={{ fontWeight: 650 }}>{joinError}</span></div>}
+                  {joinError && <div className="callout" style={{ borderColor: 'var(--error)', background: 'var(--error-soft)', color: 'var(--error)' }} data-testid="join-error"><Icon name="alert" size={14} /> <span style={{ fontWeight: 650 }}>{joinError}</span></div>}
                 </div>
               </Card>
             </div>
@@ -696,7 +698,7 @@ export default function App() {
 
             <Card>
               <Field label="Message" hint="Links, notes, markdown — optional if you’re sending files.">
-                <TextArea placeholder="Paste links, text snippets, or markdown…" value={text} onChange={e => setText(e.target.value)} rows={4} />
+                <TextArea placeholder="Paste links, text snippets, or markdown…" value={text} onChange={e => setText(e.target.value)} rows={4} data-testid="publish-message-input" />
               </Field>
               <div style={{ height: 14 }} />
               <Field label="Files">
@@ -787,10 +789,11 @@ export default function App() {
               block
               onClick={() => mode === 'stored' ? handleStoredPublish() : handleLivePublish()}
               disabled={!hasPayload || publishing || (mode === 'live' && !password) || (mode === 'stored' && isPrivate && !password)}
+              data-testid="publish-launch"
             >
               {publishing ? <><Spinner size={16} /> Publishing…</> : <><Icon name="zap" size={16} /> Launch session · {formatTTL(ttlSeconds)}</>}
             </Btn>
-            {publishError && <div className="callout" style={{ borderColor: 'var(--error)', background: 'var(--error-soft)', color: 'var(--error)' }}><Icon name="alert" size={14} /> {publishError}</div>}
+            {publishError && <div className="callout" style={{ borderColor: 'var(--error)', background: 'var(--error-soft)', color: 'var(--error)' }} data-testid="publish-error"><Icon name="alert" size={14} /> {publishError}</div>}
           </div>
         )}
 
@@ -803,7 +806,7 @@ export default function App() {
                 <Badge>{publishedMode === 'stored' ? 'Cloud' : 'Live P2P'}</Badge>
                 {countdown && <Badge tone="accent"><Icon name="clock" size={12} /> {countdown}</Badge>}
               </div>
-              <div className="code-display">{code}</div>
+              <div className="code-display" data-testid="session-code">{code}</div>
               <div style={{ color: 'var(--text-2)', fontSize: '0.84rem', marginTop: 2, fontFamily: 'var(--font-mono)' }}>{qrUrl}</div>
 
               {(password || (publishedMode === 'stored' && isPrivate)) && (
@@ -826,7 +829,7 @@ export default function App() {
               </div>
 
               <div style={{ marginTop: 18 }}>
-                <div className="qr-wrap"><QRCodeSVG value={qrUrl} size={148} level="H" /></div>
+                <div className="qr-wrap" data-testid="session-qr"><QRCodeSVG value={qrUrl} size={148} level="H" /></div>
                 <div style={{ color: 'var(--text-2)', fontSize: '0.78rem', marginTop: 8 }}>Scan to join from another device</div>
               </div>
 
