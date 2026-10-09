@@ -60,3 +60,75 @@ jobs:
       - name: Cleanup build artifacts
         if: always()
         run: rm -rf signaling-server/.evalbuild
+
+  e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            signaling-server/package-lock.json
+            client/package-lock.json
+
+      # ── Chrome for Selenium ─────────────────────────────────────────────
+      - name: Setup Chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@latest
+
+      # ── Backend: install + build ────────────────────────────────────────
+      - name: Backend — install & build
+        working-directory: signaling-server
+        run: |
+          npm ci
+          npx tsc
+
+      # ── Frontend: install + build (API URL is baked in at build time) ──
+      - name: Frontend — install & build
+        working-directory: client
+        run: |
+          npm ci
+          npm run build
+        env:
+          VITE_API_URL: http://localhost:3002
+
+      # ── Start server + client preview in the background ─────────────────
+      - name: Start signaling server & client preview
+        run: |
+          (cd signaling-server && PORT=3002 ALLOWED_ORIGINS=http://localhost:4000 nohup node dist/server.js > /tmp/signaling-server.log 2>&1 &)
+          (cd client && VITE_API_URL=http://localhost:3002 nohup npx vite preview --port 4000 > /tmp/client-preview.log 2>&1 &)
+
+      # ── Wait until both are accepting requests (curl loop) ──────────────
+      - name: Wait for services
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3002/health > /dev/null && curl -sf http://localhost:4000/ > /dev/null; then
+              echo "Signaling server and client preview are up."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Services did not become ready within 60s."
+          echo "── signaling-server.log ──"
+          tail -n 50 /tmp/signaling-server.log || true
+          echo "── client-preview.log ──"
+          tail -n 50 /tmp/client-preview.log || true
+          exit 1
+
+      # ── Selenium E2E suite ──────────────────────────────────────────────
+      - name: E2E tests (Selenium)
+        run: npm run test:e2e --prefix client
+        env:
+          CHROME_BIN: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+      - name: Upload e2e screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: client/e2e/screenshots
+          if-no-files-found: ignore
