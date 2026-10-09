@@ -749,7 +749,7 @@ export default function App() {
                   ) : (
                     <>
                       <div className="callout"><Icon name="shield" size={16} /> <span>Encrypted locally with AES-256-GCM. Server stores ciphertext only — AI stays off.</span></div>
-                      <TextInput type="password" placeholder="Set a strong private password" value={password} onChange={e => setPassword(e.target.value)} icon={<Icon name="lock" size={14} />} />
+                      <TextInput type="password" placeholder="Set a strong private password" value={password} onChange={e => setPassword(e.target.value)} icon={<Icon name="lock" size={14} />} data-testid="publish-password-input" />
                     </>
                   )}
                   <label className={`toggle ${burnOnRead ? 'toggle--on' : ''}`} onClick={() => setBurnOnRead(v => !v)}>
@@ -761,7 +761,7 @@ export default function App() {
               ) : (
                 <div className="stack stack--sm">
                   <div className="callout"><Icon name="zap" size={16} /> <span>Live P2P requires a password to protect signaling. Keep this tab open — transfer is direct between browsers.</span></div>
-                  <TextInput type="password" placeholder="Set session password (required)" value={password} onChange={e => setPassword(e.target.value)} icon={<Icon name="lock" size={14} />} />
+                  <TextInput type="password" placeholder="Set session password (required)" value={password} onChange={e => setPassword(e.target.value)} icon={<Icon name="lock" size={14} />} data-testid="publish-password-input" />
                 </div>
               )}
 

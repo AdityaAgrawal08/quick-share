@@ -57,6 +57,23 @@ export async function waitForTestId(driver, id, timeout = 10000) {
   )
 }
 
+/**
+ * Wait until the element's text matches `pattern` (polls — guards against
+ * reading React state a commit before the text paints) and return the text.
+ */
+export async function waitForTestIdText(driver, id, pattern, timeout = 15000) {
+  const el = await waitForTestId(driver, id, timeout)
+  const deadline = Date.now() + timeout
+  for (;;) {
+    const text = ((await el.getText()) ?? '').trim()
+    if (pattern.test(text)) return text
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out after ${timeout}ms waiting for [data-testid="${id}"] text to match ${pattern}; last text: "${text}"`)
+    }
+    await new Promise((r) => setTimeout(r, 250))
+  }
+}
+
 /** Save a PNG screenshot to e2e/screenshots/ and return its path. */
 export async function screenshot(driver, name = 'screenshot') {
   mkdirSync(SCREENSHOTS_DIR, { recursive: true })

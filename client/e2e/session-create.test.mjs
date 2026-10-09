@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { BASE_URL, buildDriver, waitForTestId, screenshot } from './driver.mjs'
+import { By } from 'selenium-webdriver'
+import { BASE_URL, buildDriver, waitForTestId, waitForTestIdText, screenshot } from './driver.mjs'
 
 test('session create: publishes and shows a 6-digit code with QR', async (t) => {
   const driver = buildDriver()
@@ -18,11 +19,17 @@ test('session create: publishes and shows a 6-digit code with QR', async (t) => 
     const messageInput = await waitForTestId(driver, 'publish-message-input')
     await messageInput.sendKeys(message)
 
+    // Live-P2P mode (e.g. no MongoDB) requires a password to publish; stored
+    // open mode has no password field. Fill it only when present.
+    const pwFields = await driver.findElements(By.css('[data-testid="publish-password-input"]'))
+    if (pwFields.length > 0) {
+      await pwFields[0].sendKeys('selenium-test-password')
+    }
+
     const launchBtn = await waitForTestId(driver, 'publish-launch')
     await launchBtn.click()
 
-    const codeEl = await waitForTestId(driver, 'session-code', 30000)
-    const code = (await codeEl.getText()).trim()
+    const code = await waitForTestIdText(driver, 'session-code', /^\d{6}$/, 30000)
     assert.match(code, /^\d{6}$/, `session code should be 6 digits, got "${code}"`)
 
     await waitForTestId(driver, 'session-qr', 10000)

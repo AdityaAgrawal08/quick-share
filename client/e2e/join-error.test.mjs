@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { BASE_URL, buildDriver, waitForTestId, screenshot } from './driver.mjs'
+import { BASE_URL, buildDriver, waitForTestId, waitForTestIdText, screenshot } from './driver.mjs'
 
 test('join error: invalid code shows a non-empty error', async (t) => {
   const driver = buildDriver()
@@ -17,8 +17,7 @@ test('join error: invalid code shows a non-empty error', async (t) => {
     const submitBtn = await waitForTestId(driver, 'join-submit')
     await submitBtn.click()
 
-    const errorEl = await waitForTestId(driver, 'join-error', 30000)
-    const text = (await errorEl.getText()).trim()
+    const text = await waitForTestIdText(driver, 'join-error', /\S/, 30000)
     assert.ok(text.length > 0, 'join-error should contain non-empty text')
   } catch (err) {
     await screenshot(driver, 'join-error-failure').catch(() => {})
