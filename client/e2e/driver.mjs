@@ -11,7 +11,7 @@
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Builder, By, until } from 'selenium-webdriver'
+import { Builder, By, until, error } from 'selenium-webdriver'
 import chrome from 'selenium-webdriver/chrome.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -62,10 +62,23 @@ export async function waitForTestId(driver, id, timeout = 10000) {
  * reading React state a commit before the text paints) and return the text.
  */
 export async function waitForTestIdText(driver, id, pattern, timeout = 15000) {
-  const el = await waitForTestId(driver, id, timeout)
+  let el = await waitForTestId(driver, id, timeout)
   const deadline = Date.now() + timeout
   for (;;) {
-    const text = ((await el.getText()) ?? '').trim()
+    let text
+    try {
+      text = ((await el.getText()) ?? '').trim()
+    } catch (err) {
+      if (!(err instanceof error.StaleElementReferenceError)) throw err
+      // React re-rendered (e.g. a list/status swap) between locate and read —
+      // re-locate the node and retry instead of failing the test.
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out after ${timeout}ms waiting for [data-testid="${id}"] (element repeatedly went stale)`)
+      }
+      el = await waitForTestId(driver, id, Math.max(1, deadline - Date.now()))
+      await new Promise((r) => setTimeout(r, 250))
+      continue
+    }
     if (pattern.test(text)) return text
     if (Date.now() > deadline) {
       throw new Error(`Timed out after ${timeout}ms waiting for [data-testid="${id}"] text to match ${pattern}; last text: "${text}"`)

@@ -230,7 +230,7 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
     await indexSession(code)
 
     let s = await StoredSession.findOne({ code }).lean()
-    assert.equal(s.aiStatus, 'failed', 'job pauses as failed')
+    assert.equal(s.aiStatus, 'pending', 'transient pause stays pending (M1)')
     const partialDone = await RagChunk.countDocuments({ code, st: 'completed' })
     assert.ok(partialDone > 0, 'completed batches stayed durable')
     assert.equal(await RagChunk.countDocuments({ code, st: 'pending' }) + partialDone,
@@ -240,7 +240,7 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
     provider.log.length = 0
     __setProvidersForTests([provider], { threshold: 3, cooldownMs: 200 })
     const kept = await RagChunk.find({ code, st: 'completed' }).sort({ idx: 1 })
-    await recoverPendingIndexes() // picks failed sessions too
+    await recoverPendingIndexes() // picks pending (paused) sessions
     await new Promise(r => setTimeout(r, 50))
     await indexSession(code) // deterministic completion
 
@@ -326,7 +326,7 @@ describe('RAG adaptive pipeline (integration)', { concurrency: false }, () => {
       `expected ≤${maxAttempts} embed attempts, got ${alwaysBroken.calls}`,
     )
     let s = await StoredSession.findOne({ code }).lean()
-    assert.equal(s.aiStatus, 'failed', 'job pauses as failed when circuit opens')
+    assert.equal(s.aiStatus, 'pending', 'transient pause stays pending when circuit opens (M1)')
 
     __setProvidersForTests([makeProvider('healed')], { threshold: 2, cooldownMs: 150 })
     await indexSession(code)

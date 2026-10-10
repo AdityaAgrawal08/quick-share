@@ -34,15 +34,28 @@ export function AiChat({ code, apiBase, aiStatus, onStatusChange, onOpenSource, 
   useEffect(() => {
     if (aiStatus !== 'pending') return
     let stop = false
-    const tick = async () => {
-      try {
-        const res = await fetch(`${apiBase.replace(/\/$/, '')}/ai/status/${code}`)
-        const data = await res.json()
-        if (!stop && (data.aiStatus === 'ready' || data.aiStatus === 'failed')) onStatusChange?.(data.aiStatus)
-      } catch { /* keep polling */ }
+    let inFlight = false
+    let iv: ReturnType<typeof setInterval> | null = null
+    const finish = (status: 'ready' | 'failed') => {
+      stop = true
+      if (iv) { clearInterval(iv); iv = null }
+      onStatusChange?.(status)
     }
-    const iv = setInterval(tick, 4000); tick()
-    return () => { stop = true; clearInterval(iv) }
+    const tick = async () => {
+      if (stop || inFlight) return
+      inFlight = true
+      try {
+        const res = await fetch(`${apiBase.replace(/\/$/, '')}/ai/status/${code}`, {
+          signal: AbortSignal.timeout(10_000),
+        })
+        // Session gone (expired/cleaned up) — stop polling instead of retrying forever.
+        if (res.status === 404 || res.status === 410) { finish('failed'); return }
+        const data = await res.json()
+        if (!stop && (data.aiStatus === 'ready' || data.aiStatus === 'failed')) finish(data.aiStatus)
+      } catch { /* timeout or transient error — keep polling */ } finally { inFlight = false }
+    }
+    iv = setInterval(tick, 4000); void tick()
+    return () => { stop = true; if (iv) clearInterval(iv) }
   }, [aiStatus, code, apiBase, onStatusChange])
 
   async function send() {

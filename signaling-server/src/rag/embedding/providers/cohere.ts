@@ -26,9 +26,13 @@ export class CohereProvider implements EmbeddingProvider {
   }
 
   private async pace(): Promise<void> {
-    const wait = CONFIG.PROVIDER_MIN_INTERVAL_MS - (Date.now() - this.lastCallAt)
+    const now = Date.now()
+    const wait = CONFIG.PROVIDER_MIN_INTERVAL_MS - (now - this.lastCallAt)
+    // Reserve this caller's slot SYNCHRONOUSLY before any await: with the old
+    // check-then-set, concurrent callers all read the same stale timestamp and
+    // passed the pacing gate together.
+    this.lastCallAt = now + Math.max(0, wait)
     if (wait > 0) await new Promise(r => setTimeout(r, wait))
-    this.lastCallAt = Date.now()
   }
 
   async embed(texts: string[], opts: EmbedOptions = {}): Promise<number[][]> {

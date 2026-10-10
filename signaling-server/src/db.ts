@@ -3,6 +3,7 @@ import { GridFSBucket, ObjectId } from 'mongodb'
 import { randomBytes } from 'crypto'
 import logger from './logger'
 import { Readable } from 'stream'
+import { clearAnswerCache } from './rag/answerCache'
 
 import { CONFIG } from './config'
 
@@ -129,6 +130,18 @@ export function clearExpiryTimer(code: string): void {
 // forever and the GridFS files leak.
 export async function deleteSessionAndFiles(code: string): Promise<void> {
   try {
+    // Step 0: drop in-memory search/answer caches for this code. The retriever
+    // imports this module, so its import is resolved lazily here to avoid a
+    // load-time cycle (retriever → db). dropSessionIndex already clears the
+    // answer cache; clearAnswerCache is called directly as a fallback.
+    try {
+      const { dropSessionIndex } = await import('./rag/retriever.js')
+      dropSessionIndex(code)
+    } catch (err) {
+      logger.warn({ err, code }, '[db] failed to drop in-memory RAG index cache')
+      clearAnswerCache(code)
+    }
+
     const session = await StoredSession.findOne({ code }).lean()
     if (!session) {
       logger.info({ code }, '[db] session not found — nothing to delete')
@@ -374,6 +387,13 @@ export interface IStoredSession {
     gen?: string          // embedding generation that produced the vectors
     fingerprint?: string  // corpus fingerprint enabling resume-without-re-extraction
     directChars?: number  // total chars when mode='direct'
+    // Recovery bookkeeping (M1/M11): transient pauses keep aiStatus='pending'
+    // with a pausedAt marker; deterministic failures consume recoveryAttempts
+    // and are dead-lettered after the cap.
+    pausedAt?: Date | null
+    lastAttemptAt?: Date | null
+    recoveryAttempts?: number
+    deadLetteredAt?: Date | null
   }
 }
 
@@ -400,6 +420,10 @@ const storedSessionSchema = new mongoose.Schema<IStoredSession>({
     gen:         { type: String, default: null },
     fingerprint: { type: String, default: null },
     directChars: { type: Number, default: null },
+    pausedAt:        { type: Date, default: null },
+    lastAttemptAt:   { type: Date, default: null },
+    recoveryAttempts: { type: Number, default: 0 },
+    deadLetteredAt:  { type: Date, default: null },
   },
   // Deletion design (do NOT add a MongoDB TTL index here):
   //   1. scheduleExpiry() Node timer deletes GridFS files, then the doc.
@@ -487,6 +511,14 @@ export async function uploadFile(
       release()
       reject(err)
     })
+    // Ensure the promise settles (and activeUploads is released) when the
+    // upload stream is destroyed/aborted without a 'finish' or 'error' event —
+    // otherwise callers hang forever and orphan scans stay disabled.
+    uploadStream.on('close', () => {
+      if (settled) return
+      release()
+      reject(new Error('GridFS upload stream closed before finishing'))
+    })
     // pipe() does not forward source errors to the destination — handle them
     // explicitly or a failed read would leave the promise pending forever.
     readable.on('error', (err) => {
@@ -553,10 +585,16 @@ export async function readGridFile(id: ObjectId): Promise<Buffer> {
     return { stream: b.openDownloadStream(id) }
   })()
   const chunks: Buffer[] = []
+  let ended = false
   await new Promise<void>((resolve, reject) => {
     stream.on('data', (c: Buffer) => chunks.push(c))
-    stream.on('end', () => resolve())
-    stream.on('error', reject)
+    stream.on('end', () => { ended = true; resolve() })
+    stream.on('error', (err) => { ended = true; reject(err) })
+    // A destroyed download stream emits 'close' without 'end' — settle the
+    // promise instead of hanging forever.
+    stream.on('close', () => {
+      if (!ended) reject(new Error('GridFS download stream closed before end'))
+    })
   })
   return Buffer.concat(chunks)
 }

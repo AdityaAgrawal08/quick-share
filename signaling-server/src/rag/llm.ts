@@ -31,42 +31,49 @@ export interface StreamEvents {
 }
 
 // Groq upstream SSE line parser: `data: {"choices":[{"delta":{"content":".."}}]}`
-async function* upstreamDeltas(res: Response): AsyncGenerator<string> {
+async function* upstreamDeltas(res: Response, signal?: AbortSignal): AsyncGenerator<string> {
   const reader = res.body!.getReader()
   const decoder = new TextDecoder()
   let buf = ''
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    let nl: number
-    while ((nl = buf.indexOf('\n')) !== -1) {
-      const line = buf.slice(0, nl).trim()
-      buf = buf.slice(nl + 1)
-      if (!line.startsWith('data:')) continue
-      const payload = line.slice(5).trim()
-      if (payload === '[DONE]') return
-      try {
-        const j = JSON.parse(payload)
-        if (j.error) {
-          const errMsg = typeof j.error === 'string' ? j.error : (j.error.message || 'Groq stream error')
-          if (j.error.code === 'rate_limit_exceeded' || /rate limit/i.test(errMsg)) {
-            throw new Error('ai_busy')
+  try {
+    while (true) {
+      if (signal?.aborted) return
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let nl: number
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim()
+        buf = buf.slice(nl + 1)
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        if (payload === '[DONE]') return
+        try {
+          const j = JSON.parse(payload)
+          if (j.error) {
+            const errMsg = typeof j.error === 'string' ? j.error : (j.error.message || 'Groq stream error')
+            if (j.error.code === 'rate_limit_exceeded' || /rate limit/i.test(errMsg)) {
+              throw new Error('ai_busy')
+            }
+            throw new Error(`ai_error:${errMsg}`)
           }
-          throw new Error(`ai_error:${errMsg}`)
+          const t = j.choices?.[0]?.delta?.content
+          if (t) yield t
+        } catch (e) {
+          if (e instanceof Error && (e.message.startsWith('ai_') || e.message === 'ai_busy')) throw e
+          /* partial line — keep buffering */
         }
-        const t = j.choices?.[0]?.delta?.content
-        if (t) yield t
-      } catch (e) {
-        if (e instanceof Error && (e.message.startsWith('ai_') || e.message === 'ai_busy')) throw e
-        /* partial line — keep buffering */
       }
     }
+  } finally {
+    // Release the upstream connection when the consumer stops early (client
+    // abort, parser error) — otherwise the reader/body socket leaks.
+    await reader.cancel().catch(() => {})
   }
 }
 
 /** Streaming variant of generateAnswer. Yields deltas; final yield carries the full text. */
-export async function* streamAnswer(question: string, context: string): AsyncGenerator<string> {
+export async function* streamAnswer(question: string, context: string, signal?: AbortSignal): AsyncGenerator<string> {
   if (!CONFIG.GROQ_API_KEY) throw new Error('llm_not_configured')
 
   const body = {
@@ -80,6 +87,11 @@ export async function* streamAnswer(question: string, context: string): AsyncGen
     stream: true,
   }
 
+  // Caller abort (client disconnected) composes with the 60s upstream timeout.
+  const requestSignal = signal
+    ? AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+    : AbortSignal.timeout(60_000)
+
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -87,7 +99,7 @@ export async function* streamAnswer(question: string, context: string): AsyncGen
       Authorization: `Bearer ${CONFIG.GROQ_API_KEY}`,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(60_000),
+    signal: requestSignal,
   })
 
   if (!res.ok || !res.body) {
@@ -99,7 +111,7 @@ export async function* streamAnswer(question: string, context: string): AsyncGen
   }
 
   let full = ''
-  for await (const t of upstreamDeltas(res)) {
+  for await (const t of upstreamDeltas(res, requestSignal)) {
     full += t
     yield t
   }

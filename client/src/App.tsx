@@ -159,6 +159,7 @@ export default function App() {
   const rtcMapRef = useRef<Map<string, WebRTCManager>>(new Map())
   const rtcRef = useRef<WebRTCManager | null>(null)
   const receiverRef = useRef<TransferReceiver | null>(null)
+  const publishingRef = useRef(false)
   const recipientCountRef = useRef(0)
   const p2pEverLiveRef = useRef(false)
   const iceServersRef = useRef<RTCIceServer[]>([])
@@ -257,12 +258,17 @@ export default function App() {
   }
 
   async function handleStoredPublish() {
+    // Ref guard: blocks a second invocation before React has re-rendered the
+    // disabled button (state read via closure could still be `false`).
+    if (publishingRef.current) return
     if (!hasPayload) return
     if (!storedEnabled) { setPublishError('Stored mode requires MongoDB. Set MONGODB_URI and restart the server.'); return }
+    publishingRef.current = true
     setPublishing(true); setPublishError('')
+    const finishPublish = () => { publishingRef.current = false; setPublishing(false) }
     const isUpdate = publishedMode === 'stored' && code !== ''
     const privatePassword = isPrivate && publishedMode !== 'live' ? password.trim() : ''
-    if (isPrivate && !privatePassword) return
+    if (isPrivate && !privatePassword) { finishPublish(); return }
     try {
       const form = new FormData()
       let finalText = text
@@ -301,7 +307,7 @@ export default function App() {
       if (data.error) {
         setPublishError(data.error.includes('not found') ? 'Session not found.' : data.error)
         if (data.error.includes('not found') && isUpdate) { setCode(''); setPublishedMode(null) }
-        setPublishing(false); return
+        finishPublish(); return
       }
       setCode(data.code); setJoinToken(data.joinToken || ''); setExpiresAt(data.expiresAt); setPublishedMode('stored')
       const isPriv = isPrivate && privatePassword.length > 0
@@ -312,19 +318,22 @@ export default function App() {
         }).catch(() => {})
       }
     } catch (err: unknown) { setPublishError(err instanceof Error ? err.message : 'An unexpected error occurred.') }
-    setPublishing(false)
+    finishPublish()
   }
 
   async function handleLivePublish() {
+    if (publishingRef.current) return
+    publishingRef.current = true
     setPublishing(true); setPublishError('')
+    const finishPublish = () => { publishingRef.current = false; setPublishing(false) }
     await fetchIceServers()
     try {
       const res = await fetch(`${API_URL}/session`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ttlMs: LIVE_TTL_MS, password }) })
       const data = await res.json()
-      if (!res.ok) { setPublishError(data.error || 'Could not complete publish.'); setPublishing(false); return }
+      if (!res.ok) { setPublishError(data.error || 'Could not complete publish.'); finishPublish(); return }
       setCode(data.code); setPublishedMode('live'); setExpiresAt(data.expiresAt); startSignaling(data.code, 'publisher')
     } catch { setPublishError('Could not connect to server. Please try again.') }
-    setPublishing(false)
+    finishPublish()
   }
 
   async function handleSendTo(peerId: string, providedRtc?: WebRTCManager) {
@@ -473,6 +482,9 @@ export default function App() {
       } else {
         await fetchIceServers()
         if (rtcRef.current) rtcRef.current.close()
+        // Tear down any previous receiver first: its 30s inactivity timer would
+        // otherwise leak into the new session and abort it spuriously.
+        receiverRef.current?.abort('Recipient session replaced')
         const receiver = new TransferReceiver(p => setRecvProgress(p), result => { setReceived(result); setRecvProgress(null) }, reason => { setJoinError(reason); setRecvProgress(null) })
         receiverRef.current = receiver
         const rtc = new WebRTCManager({

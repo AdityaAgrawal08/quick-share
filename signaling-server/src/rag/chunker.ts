@@ -102,7 +102,9 @@ export function chunkPages(
 
     // Context prefix helps retrieval ("in which file/page did X appear?").
     const prefix = p.page != null ? `[${fileName} · p.${p.page}]` : `[${fileName}]`
-    const budget = targetChars - prefix.length - 1
+    // Long file names must never push the body budget to ≤0 (M#7) — a
+    // negative budget produced windows of the prefix alone.
+    const budget = Math.max(64, targetChars - prefix.length - 1)
 
     const windows = withOverlap(packUnits(paragraphs, budget), overlapChars)
     for (const w of windows) {
