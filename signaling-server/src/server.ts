@@ -25,6 +25,7 @@ import { GenerationMismatchError, EmbeddingUnavailableError } from './rag/embedd
 import { startHealthMonitor } from './rag/embedding/health-monitor'
 import { getAnswer, putAnswer } from './rag/answerCache'
 import { generateAnswer, llmConfigured, streamAnswer } from './rag/llm'
+import { sanitiseFilename, sanitiseTextContent } from './security-utils'
 
 // Security: Global rejection handler
 process.on('unhandledRejection', (reason, promise) => {
@@ -80,17 +81,8 @@ function requireStoredMode(_req: Request, res: Response, next: NextFunction) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Security: sanitise uploaded filenames before storing in DB or GridFS.
-// Takes basename only (strips path), removes null bytes and double-dots.
-function sanitiseFilename(name: string): string {
-  const base = name.replace(/\\/g, '/').split('/').pop() ?? ''
-  const sanitised = base
-    .replace(/\x00/g, '')
-    .replace(/\.\./g, '')
-    .trim()
-    .slice(0, 255)
-  return sanitised || 'file'
-}
+// Security: sanitiseFilename / sanitiseTextContent live in ./security-utils
+// (unit-tested there) — imported so the server never drifts to a weaker copy.
 
 // Security: generate a cryptographically random download token (32 hex chars).
 // Stored per-file in the session doc; required in the download URL.
@@ -183,7 +175,14 @@ function gate(_req: Request, res: Response, next: NextFunction): void {
     releaser = rel
     res.once('finish', releaseOnce)
     res.once('close', releaseOnce)
-    next()
+    try {
+      next()
+    } catch (err) {
+      // A sync throw downstream must not escape as an unhandled rejection or
+      // leak the slot — release it and forward to the error handler.
+      releaseOnce()
+      next(err)
+    }
   })
 }
 
@@ -201,9 +200,10 @@ const upload  = multer({
 
 const app = express()
 app.set('trust proxy', 1)
-app.use(express.json({ limit: '2mb' }))
 
-// Security: Global Security Headers & CORS
+// Security: Global Security Headers & CORS.
+// Must run BEFORE the JSON body parser so disallowed-origin requests are
+// rejected without buffering their bodies first.
 app.use((req: Request, res: Response, next: NextFunction) => {
   const origin = req.headers.origin as string | undefined
   // Origin-dependent responses must not be cached across origins.
@@ -241,6 +241,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
   next()
 })
+
+app.use(express.json({ limit: '2mb' }))
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 
@@ -358,9 +360,8 @@ app.post(
   upload.array('files'),
   async (req: Request, res: Response) => {
     try {
-      // Security: Basic text sanitisation (remove script tags etc)
-      let text = typeof req.body.text === 'string' ? req.body.text : ''
-      text = text.replace(/<script\b[^>]*>([\s\S]*?)<\/script>/gim, '').trim()
+      // Security: sanitise user text (script tags, handlers, dangerous URIs)
+      const text = typeof req.body.text === 'string' ? sanitiseTextContent(req.body.text) : ''
       
       const password = typeof req.body.password === 'string' ? req.body.password.trim() : ''
       const burnOnRead = req.body.burnOnRead === 'true' || req.body.burnOnRead === true
@@ -762,8 +763,16 @@ app.get('/file/:fileId/:token', fileLimiter, async (req: Request, res: Response)
 
     stream.on('error', (err) => {
       logger.error({ err }, '[file] stream error')
-      if (!res.headersSent) res.status(500).end()
+      if (!res.headersSent) {
+        res.status(500).end()
+      } else {
+        // Source failed mid-stream — destroy the response or the client
+        // hangs forever waiting for a body that will never finish.
+        res.destroy()
+      }
     })
+    // Client disconnected — stop the GridFS read instead of leaking it.
+    res.on('close', () => stream.destroy())
 
     stream.pipe(res)
   } catch (err) {
@@ -911,43 +920,66 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     try {
       retrieval = await retrieve(code, question)
     } catch (err) {
-      if (err instanceof Error && err.message === 'no_chunks') {
-        retrieval = { sources: [], context: '' }
-      } else {
-        // Never-fail ladder at query time: a vector session whose embedding
-        // provider died between questions still answers — keyword mode.
-        const modeDoc = await StoredSession.findOne({ code }).select('aiMode').lean()
-        if (
-          (err instanceof EmbeddingUnavailableError ||
-           err instanceof GenerationMismatchError) &&
-          modeDoc?.aiMode === 'vector'
-        ) {
-          try {
-            const { retrieveBm25Only } = await import('./rag/retriever.js')
-            const fb = await retrieveBm25Only(code, question)
-            logger.warn({ code }, '[ai] query degraded to BM25 (embedding provider unavailable)')
-            res.status(200).json({
-              sources: fb.sources,
-              degraded: true,
-              qualityTier: 'keyword',
-              notice: 'Answered with keyword search — full AI indexing is temporarily unavailable.',
-            })
-          } catch {
-            void indexSession(code)
-            res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
-          }
-          return
-        }
-        if (err instanceof GenerationMismatchError) {
-          // Stored vectors come from a different embedding generation — never
-          // mix vector spaces (Invariant 4). Re-index transparently; the client
-          // already handles the 202 'indexing' polling loop.
+      // Never-fail ladder at query time: a vector session whose embedding
+      // provider died between questions still answers — keyword mode.
+      const modeDoc = await StoredSession.findOne({ code }).select('aiMode').lean()
+      if (
+        (err instanceof EmbeddingUnavailableError ||
+         err instanceof GenerationMismatchError) &&
+        modeDoc?.aiMode === 'vector'
+      ) {
+        let fb: Awaited<ReturnType<typeof retrieve>>
+        try {
+          const { retrieveBm25Only } = await import('./rag/retriever.js')
+          fb = await retrieveBm25Only(code, question)
+        } catch {
           void indexSession(code)
           res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
           return
         }
-        throw err
+        logger.warn({ code }, '[ai] query degraded to BM25 (embedding provider unavailable)')
+        // Degraded retrieval must still produce a real answer — a 200 without
+        // `answer` makes the client render an empty bubble.
+        let degradedAnswer: { text: string; refused: boolean }
+        try {
+          degradedAnswer = await generateAnswer(question, fb.context)
+        } catch (llmErr) {
+          const msg = llmErr instanceof Error ? llmErr.message : 'ai_error'
+          if (msg === 'ai_busy') {
+            res.status(429).json({ error: 'ai_busy', message: 'AI quota reached — try again shortly' })
+            return
+          }
+          if (msg === 'ai_config') {
+            res.status(503).json({ error: 'ai_config', message: 'LLM key invalid — contact the operator' })
+            return
+          }
+          const parts = msg.split(':')
+          const groqStatus = (parts[0] === 'ai_error' && parts[1] && !isNaN(parseInt(parts[1], 10)))
+            ? parseInt(parts[1], 10)
+            : undefined
+          logger.warn({ groqStatus, code }, '[ai] Groq LLM error (degraded)')
+          res.status(502).json({ error: 'ai_error', groqStatus, message: groqStatus ? `Groq API error (HTTP ${groqStatus})` : 'AI service error' })
+          return
+        }
+        res.status(200).json({
+          answer: degradedAnswer.text,
+          refused: degradedAnswer.refused,
+          sources: fb.sources,
+          degraded: true,
+          qualityTier: 'keyword',
+          notice: 'Answered with keyword search — full AI indexing is temporarily unavailable.',
+        })
+        return
       }
+      if (err instanceof GenerationMismatchError) {
+        // Stored vectors come from a different embedding generation — never
+        // mix vector spaces (Invariant 4). Re-index transparently; the client
+        // already handles the 202 'indexing' polling loop.
+        void indexSession(code)
+        res.status(202).json({ error: 'indexing', aiStatus: 'pending' })
+        return
+      }
+      throw err
     }
     const { sources, context } = retrieval
 
@@ -970,9 +1002,21 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
     if (wantsStream) {
       sseHeaders()
       sseSend('sources', { sources })
+      // Client disconnect must abort the upstream Groq request and stop the
+      // loop, or the fetch/reader keeps running after the socket is gone.
+      // `res` 'close' is the disconnect signal (req 'close' fires when the
+      // request body completes, not when the client leaves).
+      const abortCtrl = new AbortController()
+      let clientClosed = false
+      const onClose = () => {
+        clientClosed = true
+        abortCtrl.abort()
+      }
+      res.on('close', onClose)
       try {
         let full = ''
-        for await (const t of streamAnswer(question, promptContext)) {
+        for await (const t of streamAnswer(question, promptContext, abortCtrl.signal)) {
+          if (clientClosed) break
           if (t.startsWith('__FULL__')) {
             const fin = JSON.parse(t.slice(8)) as { text: string; refused: boolean }
             putAnswer(code, question, { answer: fin.text, refused: fin.refused, sources })
@@ -983,6 +1027,7 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
           }
         }
       } catch (llmErr) {
+        if (clientClosed) return
         const msg = llmErr instanceof Error ? llmErr.message : 'ai_error'
         const parts = msg.split(':')
         const groqStatus = (parts[0] === 'ai_error' && parts[1] && !isNaN(parseInt(parts[1], 10)))
@@ -990,10 +1035,10 @@ app.post('/ai/query/:code', aiQueryLimiter, async (req: Request, res: Response) 
           : undefined
         const code2 = msg === 'ai_busy' ? 'ai_busy' : msg === 'ai_config' ? 'ai_config' : 'ai_error'
         sseSend('error', { error: code2, groqStatus })
-        res.end()
-        return
+      } finally {
+        res.off('close', onClose)
       }
-      res.end()
+      if (!clientClosed) res.end()
       return
     }
 
@@ -1119,12 +1164,69 @@ app.post('/session', sessionLimiter, async (req: Request, res: Response) => {
 })
 
 // ── GET /health ───────────────────────────────────────────────────────────────
+// Unauthenticated and unthrottled by design — therefore it must NEVER write to
+// Mongo or run db.stats() per request. Provider state is served from the
+// orchestrator's in-memory breakers; the durable ProviderState view (written by
+// the 60s health monitor) and the storage-size probe are cached with a TTL, so
+// sustained anonymous traffic costs at most one DB read per TTL.
+
+const HEALTH_DB_CACHE_TTL_MS = 60_000
+
+type MonitoredProvider = {
+  providerId: string
+  generationId: string
+  state: string
+  discontinued: boolean
+}
+
+let monitoredProvidersCache: { at: number; rows: MonitoredProvider[] } | null = null
+
+/** Read-only view of the health monitor's durable snapshot (no upserts). */
+async function getMonitoredProvidersCached(): Promise<MonitoredProvider[]> {
+  const now = Date.now()
+  if (monitoredProvidersCache && now - monitoredProvidersCache.at < HEALTH_DB_CACHE_TTL_MS) {
+    return monitoredProvidersCache.rows
+  }
+  try {
+    const { ProviderState, DISCONTINUE_AFTER_CHECKS } = await import('./rag/embedding/health-monitor.js')
+    const docs = await ProviderState.find({}).lean()
+    const rows = docs.map(d => ({
+      providerId: d.providerId,
+      generationId: d.generationId ?? '',
+      state: d.state,
+      discontinued: d.consecutiveUnhealthyChecks >= DISCONTINUE_AFTER_CHECKS,
+    }))
+    monitoredProvidersCache = { at: now, rows }
+    return rows
+  } catch (err) {
+    logger.warn({ err }, '[health] provider snapshot unavailable')
+    return monitoredProvidersCache?.rows ?? []
+  }
+}
+
+let storageFullCache: { at: number; full: boolean } | null = null
+
+/** Storage-size probe, cached so /health stays off the DB hot path. */
+async function getStorageFullCached(): Promise<boolean> {
+  const now = Date.now()
+  if (storageFullCache && now - storageFullCache.at < HEALTH_DB_CACHE_TTL_MS) {
+    return storageFullCache.full
+  }
+  if (!mongoose.connection.db) return storageFullCache?.full ?? false
+  try {
+    const stats = await mongoose.connection.db.stats()
+    storageFullCache = { at: now, full: !!stats && stats.dataSize > MAX_DATA_SIZE_BYTES }
+  } catch {
+    // Keep the last known value — publish responses remain the hard gate.
+    if (!storageFullCache) storageFullCache = { at: now, full: false }
+  }
+  return storageFullCache.full
+}
 
 app.get('/health', async (_req: Request, res: Response) => {
   let mongoPing = -1
   let gridfsStatus = 'unknown'
-  let isStorageFull = false
-  
+
   if (storedModeEnabled) {
     try {
       const start = Date.now()
@@ -1132,16 +1234,14 @@ app.get('/health', async (_req: Request, res: Response) => {
         await mongoose.connection.db.admin().ping()
         mongoPing = Date.now() - start
         gridfsStatus = 'connected'
-        const stats = await mongoose.connection.db.stats()
-        if (stats && stats.dataSize > MAX_DATA_SIZE_BYTES) {
-          isStorageFull = true
-        }
       }
     } catch (err) {
       mongoPing = -2
       gridfsStatus = 'failed'
     }
   }
+
+  const isStorageFull = storedModeEnabled ? await getStorageFullCached() : false
 
   // Adaptive RAG posture (no secrets): tier, ceiling, provider breaker
   // states, active generation — operators see WHY indexing behaves a way.
@@ -1150,8 +1250,7 @@ app.get('/health', async (_req: Request, res: Response) => {
   if (storedModeEnabled && CONFIG.RAG_ENABLED) {
     try {
       const { providerHealth } = await import('./rag/embedding/orchestrator.js')
-      const { runHealthCheck } = await import('./rag/embedding/health-monitor.js')
-      const monitored = await runHealthCheck().catch(() => [])
+      const monitored = await getMonitoredProvidersCached()
       ragHealth = {
         tier: memProfile.tier,
         limitMb: memProfile.limitMb,
@@ -1221,7 +1320,9 @@ const server = http.createServer(app)
 
 // Origin check happens in an explicit upgrade handler — `verifyClient` is a
 // deprecated ws API and is scheduled for removal.
-const wss = new WebSocketServer({ noServer: true })
+// maxPayload matches relay.ts's own 64KB post-buffer limit: reject oversized
+// frames at the ws layer instead of buffering them (100 MiB default).
+const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 })
 
 server.on('upgrade', (req, socket, head) => {
   const origin = req.headers.origin ?? ''

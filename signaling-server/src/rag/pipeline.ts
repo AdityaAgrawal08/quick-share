@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { CONFIG } from '../config'
 import { detectMemoryProfile } from './memory-profile'
 import logger from '../logger'
@@ -32,6 +33,18 @@ import { dropSessionIndex } from './retriever'
 
 const EMBED_BATCH = Number(process.env.RAG_EMBED_BATCH ?? 16) // small batches keep ORT activation memory low on 512MB hosts
 const MONGO_INSERT_BATCH = Number(process.env.RAG_MONGO_INSERT_BATCH ?? 100)
+
+// Deterministic-failure recovery policy (M11): a corpus that keeps failing
+// for non-transient reasons must not be re-kicked forever every recovery
+// cycle. After MAX attempts it is dead-lettered (stays 'failed', no automatic
+// retries) with exponential backoff between attempts.
+const MAX_RECOVERY_ATTEMPTS = Number(process.env.RAG_MAX_RECOVERY_ATTEMPTS ?? 5)
+const RECOVERY_BACKOFF_BASE_MS = 60_000
+const RECOVERY_BACKOFF_CAP_MS = 60 * 60 * 1000
+
+function recoveryBackoffMs(attempts: number): number {
+  return Math.min(RECOVERY_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), RECOVERY_BACKOFF_CAP_MS)
+}
 
 // RSS budget guard (doc Invariant 8): pause the JOB instead of letting the
 // process be OOM-killed. A pause leaves durable pending units behind, so a
@@ -87,10 +100,19 @@ class PipelinePausedError extends Error {
   }
 }
 
-/** Stable corpus fingerprint — resume only when the corpus is unchanged. */
+/** Stable corpus fingerprint — resume only when the corpus is unchanged.
+ *  Content-addressed (sha256 over sorted file ids + the full text): a
+ *  same-length edit produces a DIFFERENT fingerprint, so stale durable units
+ *  can never be resumed against a changed corpus. (Length-based fingerprints
+ *  had exactly that hole.) */
 export function corpusFingerprint(session: { files?: { gridfsId: { toString(): string } }[]; text?: string }): string {
-  const fileIds = (session.files ?? []).map(f => f.gridfsId.toString())
-  return `${fileIds.join(',')}|${session.text?.length ?? 0}`
+  const fileIds = (session.files ?? []).map(f => f.gridfsId.toString()).sort()
+  const hash = createHash('sha256')
+  hash.update('files:')
+  for (const id of fileIds) hash.update(id).update('\u0000')
+  hash.update('text:')
+  hash.update(session.text ?? '')
+  return hash.digest('hex')
 }
 
 async function runIndex(code: string): Promise<void> {
@@ -200,6 +222,15 @@ async function runIndex(code: string): Promise<void> {
     } else {
       // ── Fresh index: wipe stale units, extract, chunk.
       await deleteRagChunks(code)
+      // A changed corpus earns a fresh recovery budget (M11): previous
+      // deterministic failures must not dead-letter an unrelated revision.
+      await StoredSession.updateOne({ code }, {
+        $set: {
+          'aiStats.recoveryAttempts': 0,
+          'aiStats.deadLetteredAt': null,
+          'aiStats.pausedAt': null,
+        },
+      }).catch(() => {})
 
       failedFiles = []
       workChunks = []
@@ -466,12 +497,38 @@ async function runIndex(code: string): Promise<void> {
 
     if (providerRelated) {
       // Transient/resource pause — completed batches stay durable; recovery
-      // re-kicks and resumes from pending units.
+      // re-kicks and resumes from pending units. Status stays 'pending' with
+      // a pausedAt marker: 'failed' would strand the session permanently
+      // (M1) even though the job is expected to resume.
       logger.warn({ err, code }, '[rag] index paused')
-    } else {
-      logger.error({ err, code }, '[rag] index job failed')
+      await StoredSession.updateOne({ code }, {
+        $set: {
+          aiStatus: 'pending',
+          'aiStats.pausedAt': new Date(),
+          'aiStats.lastAttemptAt': new Date(),
+        },
+      }).catch(() => {})
+      return
     }
-    await StoredSession.updateOne({ code }, { $set: { aiStatus: 'failed' } }).catch(() => {})
+
+    // Deterministic failure: count it and dead-letter after the cap so the
+    // recovery cycle stops re-kicking an un-indexable corpus forever (M11).
+    logger.error({ err, code }, '[rag] index job failed')
+    const updated = await StoredSession.findOneAndUpdate(
+      { code },
+      {
+        $inc: { 'aiStats.recoveryAttempts': 1 },
+        $set: { aiStatus: 'failed', 'aiStats.lastAttemptAt': new Date() },
+      },
+      { new: true, projection: { 'aiStats.recoveryAttempts': 1 } },
+    ).lean().catch(() => null)
+    const attempts = updated?.aiStats?.recoveryAttempts ?? 0
+    if (attempts >= MAX_RECOVERY_ATTEMPTS) {
+      await StoredSession.updateOne({ code }, {
+        $set: { 'aiStats.deadLetteredAt': new Date() },
+      }).catch(() => {})
+      logger.error({ code, attempts }, '[rag] index job dead-lettered (max recovery attempts)')
+    }
   }
 }
 
@@ -538,16 +595,28 @@ async function finalizeReady(
 }
 
 /** Startup/periodic recovery: resume jobs that died or were paused mid-run.
- *  With durable work units a resume skips extraction/OCR/chunking entirely. */
+ *  With durable work units a resume skips extraction/OCR/chunking entirely.
+ *  Pending (paused) jobs are always re-kicked; deterministically FAILED jobs
+ *  get bounded retries with exponential backoff, then stay dead-lettered so
+ *  an un-indexable corpus can't spin the recovery cycle forever (M11). */
 export async function recoverPendingIndexes(): Promise<void> {
   if (!CONFIG.RAG_ENABLED || !CONFIG.MONGODB_URI) return
   try {
-    const pending = await StoredSession.find({
+    const candidates = await StoredSession.find({
       aiStatus: { $in: ['pending', 'failed'] },
       expiresAt: { $gt: new Date() },
-    }).select('code').lean()
-    for (const s of pending) {
-      logger.info({ code: s.code }, '[rag] recovering index job')
+    }).select('code aiStatus aiStats').lean()
+    const now = Date.now()
+    for (const s of candidates) {
+      if (s.aiStatus === 'failed') {
+        const attempts = s.aiStats?.recoveryAttempts ?? 0
+        if (s.aiStats?.deadLetteredAt || attempts >= MAX_RECOVERY_ATTEMPTS) {
+          continue // dead-lettered — no more automatic retries
+        }
+        const last = s.aiStats?.lastAttemptAt ? new Date(s.aiStats.lastAttemptAt).getTime() : 0
+        if (last && now - last < recoveryBackoffMs(attempts)) continue
+      }
+      logger.info({ code: s.code, aiStatus: s.aiStatus }, '[rag] recovering index job')
       void indexSession(s.code)
     }
   } catch (err) {

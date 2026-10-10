@@ -1,4 +1,5 @@
 import { embedWithFailover, ACTIVE_GENERATION_ID } from './embedding/orchestrator'
+import { EmbeddingError } from './embedding/provider'
 
 // ── Compat shim ──────────────────────────────────────────────────────────────
 // Embedding flows through the orchestrator (rag/embedding/*). This module
@@ -13,6 +14,12 @@ export async function embedTexts(texts: string[]): Promise<number[][]> {
 }
 
 export async function embedQuery(text: string): Promise<number[]> {
-  const [vec] = await embedTexts([text])
+  const vectors = await embedTexts([text])
+  const vec = vectors[0]
+  // Guard the destructure: an empty provider response must throw a typed,
+  // classifier-friendly error — not return `undefined` typed as number[].
+  if (!vec || vec.length === 0) {
+    throw new EmbeddingError('provider', 'embedTexts returned no vector for the query')
+  }
   return vec
 }

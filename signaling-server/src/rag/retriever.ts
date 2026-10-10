@@ -78,8 +78,28 @@ export function dropSessionIndex(code: string): void {
   clearAnswerCache(code)
 }
 
+/** LRU touch on hit (mirrors answerCache.get): re-insert so the oldest
+ *  inserted entry is genuinely the least recently USED, not the first ever
+ *  built (M13). */
 export function getSessionIndex(code: string): SessionIndex | undefined {
-  return indexCache.get(code)
+  const hit = indexCache.get(code)
+  if (hit) {
+    indexCache.delete(code)
+    indexCache.set(code, hit)
+  }
+  return hit
+}
+
+/** L2-normalize in place. Vectors must be comparable via a raw dot product;
+ *  remote providers don't guarantee unit length, so normalize ONCE at index
+ *  build time (cheap) instead of recomputing norms on every query. */
+function l2Normalize(vec: Float32Array): Float32Array {
+  let sumSq = 0
+  for (let i = 0; i < vec.length; i++) sumSq += vec[i] * vec[i]
+  const norm = Math.sqrt(sumSq)
+  if (!Number.isFinite(norm) || norm === 0) return vec
+  for (let i = 0; i < vec.length; i++) vec[i] /= norm
+  return vec
 }
 
 export function putSessionIndex(
@@ -90,7 +110,8 @@ export function putSessionIndex(
   evictIfNeeded()
   const idx: SessionIndex = {
     chunks,
-    vectors: embeddings.map(e => Float32Array.from(e)),
+    // Unit-length vectors are the invariant `cosine` below relies on.
+    vectors: embeddings.map(e => l2Normalize(Float32Array.from(e))),
     minisearch: new MiniSearch<Chunk>({
       fields: ['text'],
       storeFields: ['name', 'page'],
@@ -108,7 +129,7 @@ export function putSessionIndex(
  *  the session's recorded serving generation, defaulting to the active local
  *  one for legacy corpora. */
 export async function ensureSessionIndex(code: string, expectedGen: string): Promise<SessionIndex> {
-  const cached = indexCache.get(code)
+  const cached = getSessionIndex(code)
   if (cached) return cached
   // Legacy chunks (pre durable-units deploy) carry no `st` field — they must
   // still load so the generation check below can trigger their transparent
@@ -173,11 +194,13 @@ async function retrieveDirect(code: string): Promise<RetrievalResult> {
   return { sources, context: parts.join(JOINER) }
 }
 
-// Exported for unit tests — pure ranking math.
+// Exported for unit tests — pure ranking math. Inputs MUST be unit-length
+// (putSessionIndex and the query path below guarantee it) — this is a raw
+// dot product by design, so adding new vector producers must normalize first.
 export function cosine(a: Float32Array, b: Float32Array): number {
   let dot = 0
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i]
-  return dot // both normalized
+  return dot
 }
 
 // Exported for unit tests — pure ranking math.
@@ -274,7 +297,12 @@ async function rerank(query: string, candidates: Chunk[]): Promise<{ chunk: Chun
 /** Build (or reuse) the keyword-only index for BM25-mode sessions. */
 async function ensureBm25Index(code: string): Promise<Bm25Index> {
   const cached = bm25Cache.get(code)
-  if (cached) return cached
+  if (cached) {
+    // LRU touch — same discipline as the vector index cache.
+    bm25Cache.delete(code)
+    bm25Cache.set(code, cached)
+    return cached
+  }
   const docs = await RagChunk.find({ code })
     .select('fileId name page idx text')
     .sort({ idx: 1 })
@@ -396,8 +424,10 @@ export async function retrieve(code: string, question: string): Promise<Retrieva
   // Leg 1: BM25
   const bmHits = idx.minisearch.search(question).slice(0, candLeg)
 
-  // Leg 2: semantic — embedded with the index's own generation.
-  const qvec = Float32Array.from(await embedQueryForGeneration(question, expectedGen))
+  // Leg 2: semantic — embedded with the index's own generation. The query is
+  // normalized here so it matches the unit-length vectors built at index time
+  // (remote providers don't guarantee norm 1).
+  const qvec = l2Normalize(Float32Array.from(await embedQueryForGeneration(question, expectedGen)))
   const cosScores: { chunkIdx: number; score: number }[] = []
   for (let i = 0; i < idx.vectors.length; i++) {
     cosScores.push({ chunkIdx: i, score: cosine(qvec, idx.vectors[i]) })
@@ -405,11 +435,15 @@ export async function retrieve(code: string, question: string): Promise<Retrieva
   cosScores.sort((a, b) => b.score - a.score)
   const vecHits = cosScores.slice(0, candLeg)
 
-  // Fuse
+  // Fuse — BM25 hits whose chunk id isn't found (chunkIdx −1) are dropped
+  // BEFORE fusion so they can't consume fusion slots or inflate scores.
+  const bmHitsResolved = bmHits
+    .map(h => ({ chunkIdx: idx.chunks.findIndex(c => c.idx === h.id), rank: h.score }))
+    .filter(h => h.chunkIdx >= 0)
   const fused = reciprocalFusion([
-    bmHits.map(h => ({ chunkIdx: idx.chunks.findIndex(c => c.idx === h.id), rank: h.score })),
+    bmHitsResolved,
     vecHits.map(h => ({ chunkIdx: h.chunkIdx, rank: h.score })),
-  ], fusionKeep).filter(f => f.chunkIdx >= 0)
+  ], fusionKeep)
 
   const candidates = fused.map(f => idx.chunks[f.chunkIdx])
 

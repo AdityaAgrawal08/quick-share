@@ -425,6 +425,17 @@ export const MarkdownView: React.FC<MarkdownViewProps> = ({ content }) => {
           {renderInline(pLines.join('\n'), `p-${i}`)}
         </p>
       )
+    } else {
+      // Guard: a line starting with '#' that is not a valid heading (e.g. `#hashtag`,
+      // `####`, `#1`) matches no branch above and fails the paragraph loop's
+      // `startsWith('#')` check, so nothing was consumed. Render it as a plain
+      // paragraph line and advance so the loop can never spin forever.
+      elements.push(
+        <p key={`p-${i}`} style={{ margin: 0, lineHeight: 1.55 }}>
+          {renderInline(lines[i], `p-${i}`)}
+        </p>
+      )
+      i++
     }
   }
 

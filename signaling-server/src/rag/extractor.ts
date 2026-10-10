@@ -19,6 +19,55 @@ import type { ExtractedDoc, ExtractedPage } from './types'
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'webp', 'bmp'])
 
+// ── Zip-bomb guard (M10) ─────────────────────────────────────────────────────
+// pptx/xlsx are zip archives whose central directory advertises the
+// uncompressed size of every entry. Check that budget BEFORE any full
+// materialization (adm-zip getData / ExcelJS load), otherwise a crafted
+// archive can expand to gigabytes inside the RSS-limited process.
+const MAX_ZIP_DECOMPRESSED_BYTES = 64 * 1024 * 1024 // 64MB total
+const MAX_ZIP_EXPANSION_RATIO = 200 // uncompressed ÷ compressed
+const ZIP_RATIO_CHECK_MIN_BYTES = 8 * 1024 * 1024 // don't flag tiny archives
+
+interface ZipEntryLike {
+  entryName?: string
+  header?: { size?: number; compressedSize?: number }
+}
+
+function looksLikeZip(buffer: Buffer): boolean {
+  return buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b // "PK"
+}
+
+/** Reject archives whose advertised decompressed size (or expansion ratio)
+ *  exceeds the budget. Throws — callers surface a per-file error. */
+function assertZipWithinBudget(zip: { getEntries(): ZipEntryLike[] }, kind: string): void {
+  let totalUncompressed = 0
+  let totalCompressed = 0
+  for (const e of zip.getEntries()) {
+    totalUncompressed += e.header?.size ?? 0
+    totalCompressed += e.header?.compressedSize ?? 0
+    if (totalUncompressed > MAX_ZIP_DECOMPRESSED_BYTES) {
+      throw new Error(`${kind}_zip_bomb_rejected:${totalUncompressed}_bytes_decompressed`)
+    }
+  }
+  if (
+    totalUncompressed >= ZIP_RATIO_CHECK_MIN_BYTES &&
+    totalCompressed > 0 &&
+    totalUncompressed / totalCompressed > MAX_ZIP_EXPANSION_RATIO
+  ) {
+    throw new Error(
+      `${kind}_zip_bomb_rejected:expansion_ratio_${Math.round(totalUncompressed / totalCompressed)}`,
+    )
+  }
+}
+
+/** Lazy adm-zip load (same RAM discipline as the other heavy parsers). */
+async function loadZip(buffer: Buffer): Promise<{ getEntries(): ZipEntryLike[] }> {
+  // @ts-ignore adm-zip lacks types in devDependencies
+  const AdmZipModule = await import('adm-zip')
+  const AdmZip = (AdmZipModule as any).default || AdmZipModule
+  return new AdmZip(buffer)
+}
+
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'markdown', 'json', 'xml', 'yml', 'yaml', 'csv', 'log',
   'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'py', 'rb', 'go', 'rs', 'java',
@@ -96,10 +145,9 @@ async function extractDocx(buffer: Buffer): Promise<ExtractedDoc> {
 
 async function extractPptx(buffer: Buffer): Promise<ExtractedDoc> {
   try {
-    // @ts-ignore adm-zip lacks types in devDependencies
-    const AdmZipModule = await import('adm-zip')
-    const AdmZip = (AdmZipModule as any).default || AdmZipModule
-    const zip = new AdmZip(buffer)
+    const zip = await loadZip(buffer)
+    // Budget check before any slide XML is decompressed (zip-bomb, M10).
+    assertZipWithinBudget(zip, 'pptx')
     const entries = zip.getEntries() as { entryName: string; getData: () => Buffer }[]
     const slideEntries = entries
       .filter(e => /^ppt\/slides\/slide\d+\.xml$/i.test(e.entryName))
@@ -122,7 +170,7 @@ async function extractPptx(buffer: Buffer): Promise<ExtractedDoc> {
     return { pages }
   } catch (err) {
     logger.warn({ err }, '[rag] PPTX extraction failed')
-    return { pages: [] }
+    return { pages: [], error: err instanceof Error ? err.message : 'pptx extraction failed' }
   }
 }
 
@@ -151,6 +199,12 @@ function sheetToText(sheet: import('exceljs').Worksheet): string {
 }
 
 async function extractXlsx(buffer: Buffer): Promise<ExtractedDoc> {
+  // Budget check BEFORE ExcelJS materializes every sheet (zip-bomb, M10).
+  // Legacy .xls is an OLE2 container, not a zip — leave it to ExcelJS.
+  if (looksLikeZip(buffer)) {
+    const zip = await loadZip(buffer)
+    assertZipWithinBudget(zip, 'xlsx')
+  }
   const wb = new Workbook()
   // ExcelJS type defs expect a legacy Buffer; cast to satisfy TypeScript
   await wb.xlsx.load(buffer as any)

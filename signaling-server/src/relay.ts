@@ -178,6 +178,17 @@ export function handleConnection(ws: WebSocket, _req: IncomingMessage): void {
 }
 
 async function handleJoin(ws: WebSocket, ctx: PeerContext, payload: JoinPayload): Promise<void> {
+  // H1: one join per socket. Without this guard every 'join' message ran
+  // addPeer again — allocating a fresh recipient UUID and overwriting
+  // ctx.peerId — so the socket's later 'close' removed only the newest peer
+  // while the previous ones lingered until session TTL (phantom recipients
+  // accumulating up to MAX_RECIPIENTS_PER_SESSION, each forcing the publisher
+  // to build another RTCPeerConnection).
+  if (ctx.code || ctx.role || ctx.peerId) {
+    sendTo(ws, { type: 'error', payload: 'already_joined' })
+    return
+  }
+
   if (!payload?.code || !payload?.role) {
     sendTo(ws, { type: 'error', payload: 'join requires { code, role }' })
     return
@@ -212,10 +223,24 @@ async function handleJoin(ws: WebSocket, ctx: PeerContext, payload: JoinPayload)
     }
 
     const providedPass = payload.password
-    if (!providedPass || !(await verifyPassword(providedPass, session.passwordHash))) {
+    const passwordOk = providedPass
+      ? await verifyPassword(providedPass, session.passwordHash)
+      : false
+
+    // H2: scrypt verification is async, so the socket can close while we
+    // await it. Bail out instead of binding a dead socket to the session —
+    // 'close' already fired while ctx was still empty, so a dead publisher
+    // would otherwise occupy the only publisher slot until the TTL expires.
+    if (ws.readyState !== WebSocket.OPEN) {
+      logger.debug({ code, ip }, 'WebSocket: socket closed during password verification')
+      return
+    }
+
+    if (!passwordOk) {
       recordFailure(ip)
       // Artificial delay to slow down automated brute force
       await new Promise(r => setTimeout(r, 500 + Math.random() * 1000))
+      if (ws.readyState !== WebSocket.OPEN) return
       sendTo(ws, { type: 'error', payload: 'invalid_password' })
       return
     }
