@@ -265,6 +265,12 @@ cd signaling-server && npm test
 
 ---
 
+## Design
+
+User journeys are mapped panel-by-panel in the UX storyboard: [`docs/storyboard.md`](docs/storyboard.md) — cloud share + AI Q&A, private E2EE + burn-on-read, live P2P transfer, and the failure path. Sketches live in `docs/storyboard/frames/`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
